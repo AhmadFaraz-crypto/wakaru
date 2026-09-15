@@ -1,9 +1,9 @@
 use swc_core::atoms::Atom;
 use swc_core::common::Mark;
 use swc_core::ecma::ast::{
-    ArrowExpr, AssignOp, AssignTarget, BindingIdent, Callee, ClassDecl, Expr, FnDecl, Function,
-    FunctionBody, Ident, MemberProp, ObjectPatProp, Pat, SimpleAssignTarget, Stmt, UpdateOp,
-    VarDeclOrExpr, VarDeclarator,
+    ArrowExpr, AssignOp, AssignTarget, BindingIdent, Callee, ClassDecl, ClassExpr, Constructor,
+    Expr, FnDecl, FnExpr, Function, FunctionBody, Ident, MemberProp, ObjectPatProp,
+    ParamOrTsParamProp, Pat, SimpleAssignTarget, Stmt, UpdateOp, VarDeclOrExpr, VarDeclarator,
 };
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
@@ -364,13 +364,43 @@ impl Visit for EscapeChecker {
         let rebinds = arrow_binds_sym(arrow, &self.to_sym);
         self.with_scope(rebinds, |s| arrow.visit_children_with(s));
     }
+
+    fn visit_constructor(&mut self, constructor: &Constructor) {
+        let rebinds = constructor_binds_sym(constructor, &self.to_sym);
+        self.with_scope(rebinds, |s| constructor.visit_children_with(s));
+    }
+
+    fn visit_fn_expr(&mut self, expr: &FnExpr) {
+        let rebinds = expr
+            .ident
+            .as_ref()
+            .is_some_and(|ident| ident.sym == self.to_sym)
+            || function_binds_sym(&expr.function, &self.to_sym);
+        self.with_scope(rebinds, |s| expr.visit_children_with(s));
+    }
+
+    fn visit_class_expr(&mut self, expr: &ClassExpr) {
+        let rebinds = expr
+            .ident
+            .as_ref()
+            .is_some_and(|ident| ident.sym == self.to_sym);
+        self.with_scope(rebinds, |s| expr.visit_children_with(s));
+    }
 }
 
 fn function_binds_sym(func: &Function, sym: &Atom) -> bool {
-    if func.params.iter().any(|param| pat_binds_sym(&param.pat, sym)) {
+    if func
+        .params
+        .iter()
+        .any(|param| pat_binds_sym(&param.pat, sym))
+    {
         return true;
     }
-    let mut collector = ScopeBindingCollector { sym: sym.clone(), found: false };
+    let mut collector = ScopeBindingCollector {
+        sym: sym.clone(),
+        found: false,
+        block_depth: 0,
+    };
     if let Some(body) = &func.body {
         body.visit_with(&mut collector);
     }
@@ -381,20 +411,52 @@ fn arrow_binds_sym(arrow: &ArrowExpr, sym: &Atom) -> bool {
     if arrow.params.iter().any(|param| pat_binds_sym(param, sym)) {
         return true;
     }
-    let mut collector = ScopeBindingCollector { sym: sym.clone(), found: false };
+    let mut collector = ScopeBindingCollector {
+        sym: sym.clone(),
+        found: false,
+        block_depth: 0,
+    };
     arrow.body.visit_with(&mut collector);
+    collector.found
+}
+
+fn constructor_binds_sym(constructor: &Constructor, sym: &Atom) -> bool {
+    if constructor.params.iter().any(|param| match param {
+        ParamOrTsParamProp::Param(param) => pat_binds_sym(&param.pat, sym),
+        ParamOrTsParamProp::TsParamProp(_) => false,
+    }) {
+        return true;
+    }
+    let mut collector = ScopeBindingCollector {
+        sym: sym.clone(),
+        found: false,
+        block_depth: 0,
+    };
+    if let Some(body) = &constructor.body {
+        body.visit_with(&mut collector);
+    }
     collector.found
 }
 
 struct ScopeBindingCollector {
     sym: Atom,
     found: bool,
+    block_depth: usize,
 }
 
 impl Visit for ScopeBindingCollector {
     fn visit_function(&mut self, _func: &Function) {}
 
     fn visit_arrow_expr(&mut self, _arrow: &ArrowExpr) {}
+
+    fn visit_block_stmt(&mut self, block: &swc_core::ecma::ast::BlockStmt) {
+        if self.block_depth > 0 {
+            return;
+        }
+        self.block_depth += 1;
+        block.visit_children_with(self);
+        self.block_depth -= 1;
+    }
 
     fn visit_var_declarator(&mut self, decl: &VarDeclarator) {
         if pat_binds_sym(&decl.name, &self.sym) {
@@ -415,10 +477,16 @@ impl Visit for ScopeBindingCollector {
     }
 
     fn visit_catch_clause(&mut self, clause: &swc_core::ecma::ast::CatchClause) {
-        if clause.param.as_ref().is_some_and(|param| pat_binds_sym(param, &self.sym)) {
+        if clause
+            .param
+            .as_ref()
+            .is_some_and(|param| pat_binds_sym(param, &self.sym))
+        {
             self.found = true;
         }
+        self.block_depth += 1;
         clause.body.visit_with(self);
+        self.block_depth -= 1;
     }
 }
 
@@ -468,5 +536,35 @@ impl VisitMut for IdentReplacer {
             return;
         }
         arrow.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_constructor(&mut self, constructor: &mut Constructor) {
+        if constructor_binds_sym(constructor, &self.to.0) {
+            return;
+        }
+        constructor.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_fn_expr(&mut self, expr: &mut FnExpr) {
+        if expr
+            .ident
+            .as_ref()
+            .is_some_and(|ident| ident.sym == self.to.0)
+            || function_binds_sym(&expr.function, &self.to.0)
+        {
+            return;
+        }
+        expr.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_class_expr(&mut self, expr: &mut ClassExpr) {
+        if expr
+            .ident
+            .as_ref()
+            .is_some_and(|ident| ident.sym == self.to.0)
+        {
+            return;
+        }
+        expr.visit_mut_children_with(self);
     }
 }
