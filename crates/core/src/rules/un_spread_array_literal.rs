@@ -30,7 +30,7 @@ impl VisitMut for UnSpreadArrayLiteral {
 fn inline_spread_array_args(args: &mut Vec<ExprOrSpread>) {
     let mut needs_inline = false;
     for arg in args.iter() {
-        if arg.spread.is_some() && matches!(arg.expr.as_ref(), Expr::Array(_)) {
+        if arg.spread.is_some() && is_transparent_array_literal(arg.expr.as_ref()) {
             needs_inline = true;
             break;
         }
@@ -43,7 +43,7 @@ fn inline_spread_array_args(args: &mut Vec<ExprOrSpread>) {
     let old = std::mem::take(args);
     for arg in old {
         if arg.spread.is_some() {
-            if let Expr::Array(arr) = *arg.expr {
+            if let Expr::Array(arr) = strip_transparent_types_owned(*arg.expr) {
                 // Inline each element of the array literal
                 for elem in arr.elems {
                     match elem {
@@ -79,5 +79,35 @@ fn inline_spread_array_args(args: &mut Vec<ExprOrSpread>) {
             }
         }
         args.push(arg);
+    }
+}
+
+fn is_transparent_array_literal(expr: &Expr) -> bool {
+    matches!(strip_transparent_types(expr), Expr::Array(_))
+}
+
+fn strip_transparent_types(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(paren) => strip_transparent_types(&paren.expr),
+        Expr::TsAs(wrapper) => strip_transparent_types(&wrapper.expr),
+        Expr::TsSatisfies(wrapper) => strip_transparent_types(&wrapper.expr),
+        Expr::TsNonNull(wrapper) => strip_transparent_types(&wrapper.expr),
+        Expr::TsTypeAssertion(wrapper) => strip_transparent_types(&wrapper.expr),
+        Expr::TsInstantiation(wrapper) => strip_transparent_types(&wrapper.expr),
+        Expr::TsConstAssertion(wrapper) => strip_transparent_types(&wrapper.expr),
+        _ => expr,
+    }
+}
+
+fn strip_transparent_types_owned(expr: Expr) -> Expr {
+    match expr {
+        Expr::Paren(paren) => strip_transparent_types_owned(*paren.expr),
+        Expr::TsAs(wrapper) => strip_transparent_types_owned(*wrapper.expr),
+        Expr::TsSatisfies(wrapper) => strip_transparent_types_owned(*wrapper.expr),
+        Expr::TsNonNull(wrapper) => strip_transparent_types_owned(*wrapper.expr),
+        Expr::TsTypeAssertion(wrapper) => strip_transparent_types_owned(*wrapper.expr),
+        Expr::TsInstantiation(wrapper) => strip_transparent_types_owned(*wrapper.expr),
+        Expr::TsConstAssertion(wrapper) => strip_transparent_types_owned(*wrapper.expr),
+        expr => expr,
     }
 }
