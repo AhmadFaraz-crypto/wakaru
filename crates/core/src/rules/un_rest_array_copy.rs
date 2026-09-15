@@ -1,9 +1,9 @@
 use swc_core::atoms::Atom;
 use swc_core::common::Mark;
 use swc_core::ecma::ast::{
-    ArrowExpr, AssignOp, AssignTarget, BindingIdent, Callee, Expr, Function, FunctionBody, Ident,
-    MemberProp, ObjectPatProp, Pat, SimpleAssignTarget, Stmt, UpdateOp, VarDeclOrExpr,
-    VarDeclarator,
+    ArrowExpr, AssignOp, AssignTarget, BindingIdent, Callee, ClassDecl, Expr, FnDecl, Function,
+    FunctionBody, Ident, MemberProp, ObjectPatProp, Pat, SimpleAssignTarget, Stmt, UpdateOp,
+    VarDeclOrExpr, VarDeclarator,
 };
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
@@ -356,16 +356,69 @@ impl Visit for EscapeChecker {
     }
 
     fn visit_function(&mut self, func: &Function) {
-        let rebinds = func
-            .params
-            .iter()
-            .any(|p| pat_binds_sym(&p.pat, &self.to_sym));
+        let rebinds = function_binds_sym(func, &self.to_sym);
         self.with_scope(rebinds, |s| func.visit_children_with(s));
     }
 
     fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
-        let rebinds = arrow.params.iter().any(|p| pat_binds_sym(p, &self.to_sym));
+        let rebinds = arrow_binds_sym(arrow, &self.to_sym);
         self.with_scope(rebinds, |s| arrow.visit_children_with(s));
+    }
+}
+
+fn function_binds_sym(func: &Function, sym: &Atom) -> bool {
+    if func.params.iter().any(|param| pat_binds_sym(&param.pat, sym)) {
+        return true;
+    }
+    let mut collector = ScopeBindingCollector { sym: sym.clone(), found: false };
+    if let Some(body) = &func.body {
+        body.visit_with(&mut collector);
+    }
+    collector.found
+}
+
+fn arrow_binds_sym(arrow: &ArrowExpr, sym: &Atom) -> bool {
+    if arrow.params.iter().any(|param| pat_binds_sym(param, sym)) {
+        return true;
+    }
+    let mut collector = ScopeBindingCollector { sym: sym.clone(), found: false };
+    arrow.body.visit_with(&mut collector);
+    collector.found
+}
+
+struct ScopeBindingCollector {
+    sym: Atom,
+    found: bool,
+}
+
+impl Visit for ScopeBindingCollector {
+    fn visit_function(&mut self, _func: &Function) {}
+
+    fn visit_arrow_expr(&mut self, _arrow: &ArrowExpr) {}
+
+    fn visit_var_declarator(&mut self, decl: &VarDeclarator) {
+        if pat_binds_sym(&decl.name, &self.sym) {
+            self.found = true;
+        }
+    }
+
+    fn visit_fn_decl(&mut self, decl: &FnDecl) {
+        if decl.ident.sym == self.sym {
+            self.found = true;
+        }
+    }
+
+    fn visit_class_decl(&mut self, decl: &ClassDecl) {
+        if decl.ident.sym == self.sym {
+            self.found = true;
+        }
+    }
+
+    fn visit_catch_clause(&mut self, clause: &swc_core::ecma::ast::CatchClause) {
+        if clause.param.as_ref().is_some_and(|param| pat_binds_sym(param, &self.sym)) {
+            self.found = true;
+        }
+        clause.body.visit_with(self);
     }
 }
 
@@ -404,18 +457,14 @@ impl VisitMut for IdentReplacer {
     }
 
     fn visit_mut_function(&mut self, func: &mut Function) {
-        if func
-            .params
-            .iter()
-            .any(|p| pat_binds_sym(&p.pat, &self.to.0))
-        {
+        if function_binds_sym(func, &self.to.0) {
             return; // to is rebound — inner references resolve to a different binding
         }
         func.visit_mut_children_with(self);
     }
 
     fn visit_mut_arrow_expr(&mut self, arrow: &mut ArrowExpr) {
-        if arrow.params.iter().any(|p| pat_binds_sym(p, &self.to.0)) {
+        if arrow_binds_sym(arrow, &self.to.0) {
             return;
         }
         arrow.visit_mut_children_with(self);
