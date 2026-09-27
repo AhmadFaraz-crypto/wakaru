@@ -1,7 +1,7 @@
 use swc_core::common::Mark;
 use swc_core::ecma::ast::{
     ArrowExpr, ArrowFunctionBody, EmptyStmt, Expr, ExprStmt, Function, IfStmt, ReturnStmt, Stmt,
-    UnaryExpr, UnaryOp,
+    SwitchStmt, UnaryExpr, UnaryOp,
 };
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
@@ -133,7 +133,54 @@ fn simplify_terminal_statement(
                 }
             }
         }
+        Stmt::Switch(SwitchStmt { cases, .. }) => {
+            simplify_terminal_switch(cases, preserve_value_return, unresolved_mark);
+        }
         _ => {}
+    }
+}
+
+fn simplify_terminal_switch(
+    cases: &mut [swc_core::ecma::ast::SwitchCase],
+    preserve_value_return: bool,
+    unresolved_mark: Mark,
+) {
+    for case in cases.iter_mut() {
+        if case.cons.is_empty() {
+            continue;
+        }
+        if case.cons.len() != 1 {
+            return;
+        }
+        let Stmt::Return(return_stmt) = &case.cons[0] else {
+            return;
+        };
+        if !is_redundant_return(
+            return_stmt.arg.as_deref(),
+            preserve_value_return,
+            unresolved_mark,
+        ) {
+            return;
+        }
+    }
+    for case in cases.iter_mut() {
+        if !case.cons.is_empty() {
+            case.cons[0] = Stmt::Empty(EmptyStmt {
+                span: swc_core::common::DUMMY_SP,
+            });
+        }
+    }
+}
+
+fn is_redundant_return(
+    arg: Option<&Expr>,
+    preserve_value_return: bool,
+    unresolved_mark: Mark,
+) -> bool {
+    match arg {
+        None => true,
+        Some(_expr) if preserve_value_return => false,
+        Some(expr) => is_unresolved_undefined(expr, unresolved_mark),
     }
 }
 
