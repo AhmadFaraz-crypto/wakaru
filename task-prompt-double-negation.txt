@@ -1,7 +1,0 @@
-Remove redundant double negation (`!!x` becomes `x`) wherever only the truthiness of a value is observed, without changing behavior.
-
-The operand of `!` is boolean-coerced in every position, so `!!` inside it is always redundant. Beyond that, boolean context begins at the tests of `if`, `while`, `do-while`, and `for` statements and the test of a conditional expression, and propagates from those roots into positions whose only contribution to the coerced result is their truthiness: both operands of `&&` and `||`, the two branches of a nested conditional, and the last operand of a comma sequence. Collapse repeated negations too (`!!!!x` becomes `x`). Within any such position, `!!x` becomes `x`.
-
-Never remove `!!` in a value position, where the boolean it produces is observable: an assignment right-hand side, a return value, a call argument, an array or object element, a non-final sequence operand, or a logical or conditional expression whose result is used as a value. For example `if (a && !!x)` becomes `if (a && x)`, but `const y = a && !!x` and `const y = !!x` are unchanged.
-
-Preserve evaluation order and side effects, and add regression tests.

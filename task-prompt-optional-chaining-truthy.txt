@@ -1,7 +1,0 @@
-Recover optional chaining from && checks when the expression is only being used as a truthy condition.
-
-For example, if (a && a.b) run(); should become if (a?.b) run();. The same idea should work in other conditional contexts.
-
-Be careful not to change expressions where the && result is used as an actual value, or where converting it to optional chaining could change the behavior. Cases such as const y = a && a.b, f() && f().b, a && a.b.c, or a && a.b && a.b.c should remain unchanged.
-
-Please make the rule handle the supported cases consistently and add regression tests for both the transformations and the cases that should be left alone.
