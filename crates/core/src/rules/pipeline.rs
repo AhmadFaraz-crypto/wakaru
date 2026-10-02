@@ -424,6 +424,10 @@ runner!(run_un_undefined_init, |ctx| UnUndefinedInit::new(
 runner!(run_merge_declaration_init, |ctx| MergeDeclarationInit::new(
     ctx.rewrite_level
 ));
+runner!(
+    run_fold_object_spread_assignment,
+    FoldObjectSpreadAssignment
+);
 runner!(run_var_decl_to_let_const, |ctx| {
     VarDeclToLetConst::new_with_level(ctx.rewrite_level)
 });
@@ -753,6 +757,12 @@ define_rule_registry! {
     // not disturb the assignment-form temps those rules rely on.
     ("MergeDeclarationInit", Cleanup, run_merge_declaration_init, standard_or_above, requires: [
         "SmartInline"
+    ]),
+    // Fold `x = { ...a }; x[k] = v;` into `x = { ...a, [k]: v }`. Runs after
+    // MergeDeclarationInit so a split `let x; x = { ... }` is already a single
+    // object-literal initializer to fold into.
+    ("FoldObjectSpreadAssignment", Cleanup, run_fold_object_spread_assignment, always_enabled, requires: [
+        "MergeDeclarationInit"
     ]),
     ("SmartRename", Cleanup, run_smart_rename, standard_or_above, requires: [
         "SmartInline"

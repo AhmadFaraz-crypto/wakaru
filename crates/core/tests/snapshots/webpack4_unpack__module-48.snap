@@ -817,10 +817,11 @@ function ze(e, t) {
     e.textContent = t;
 }
 function qe(e, t) {
-    const n = {};
-    n[e.toLowerCase()] = t.toLowerCase();
-    n[`Webkit${e}`] = `webkit${t}`;
-    n[`Moz${e}`] = `moz${t}`;
+    const n = {
+        [e.toLowerCase()]: t.toLowerCase(),
+        [`Webkit${e}`]: `webkit${t}`,
+        [`Moz${e}`]: `moz${t}`
+    };
     return n;
 }
 const Ue = {

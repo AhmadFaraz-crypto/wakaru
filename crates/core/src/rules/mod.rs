@@ -16,6 +16,7 @@ mod exponent;
 pub(crate) mod expr_utils;
 mod extract_inlined_function;
 mod flip_comparisons;
+mod fold_object_spread_assignment;
 pub(crate) mod helper_matcher;
 mod import_dedup;
 pub(crate) mod match_context;
@@ -176,6 +177,7 @@ pub use extract_inlined_function::{
     ExtractInlinedFunction, ExtractedFunctionNames, SharedExtractedFunctionNames,
 };
 pub use flip_comparisons::FlipComparisons;
+pub use fold_object_spread_assignment::FoldObjectSpreadAssignment;
 pub use import_dedup::ImportDedup;
 pub use merge_declaration_init::MergeDeclarationInit;
 pub use obj_method_shorthand::ObjMethodShorthand;

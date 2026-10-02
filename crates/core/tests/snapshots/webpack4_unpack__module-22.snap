@@ -93,14 +93,15 @@ ${e.stack}`;
     var C = i.f(t);
     var P = Object.create(s);
     M.cancel = o.u;
-    var task = ((e, t, n, r)=>{
+    var task = ((id, name, n, r)=>{
         let i;
         let a;
         n._deferredEnd = null;
-        i = {};
-        i[o.e] = true;
-        i.id = e;
-        i.name = t;
+        i = {
+            [o.e]: true,
+            id,
+            name
+        };
         a = {};
         a.done = a.done || {};
         a.done.get = ()=>{
