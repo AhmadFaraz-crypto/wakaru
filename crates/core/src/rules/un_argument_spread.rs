@@ -1,11 +1,9 @@
-use std::collections::HashSet;
-
-use swc_core::common::{Mark, Span, Spanned, DUMMY_SP};
+use swc_core::common::{Mark, DUMMY_SP};
 use swc_core::ecma::ast::{
     AssignExpr, AssignOp, AssignTarget, CallExpr, Callee, Expr, ExprOrSpread, ExprStmt, Ident, Lit,
     MemberExpr, MemberProp, Module, SimpleAssignTarget, Stmt,
 };
-use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
+use swc_core::ecma::visit::{VisitMut, VisitMutWith};
 
 use super::binding_facts::TempIsolation;
 use super::dead_decls::remove_consumed_uninitialized_decls;
@@ -168,32 +166,6 @@ fn try_convert_apply(
         },
         _ => return Err(call),
     };
-
-    let is_reflect_apply = matches!(
-        callee_member.obj.as_ref(),
-        Expr::Ident(id) if id.sym.as_ref() == "Reflect"
-    ) && matches!(&callee_member.prop, MemberProp::Ident(id) if id.sym.as_ref() == "apply");
-
-    if is_reflect_apply && call.args.len() == 3 {
-        if !matches!(
-            callee_member.obj.as_ref(),
-            Expr::Ident(id) if is_unresolved_ident(id, "Reflect", unresolved_mark)
-        ) {
-            return Err(call);
-        }
-        if let Some(new_expr) = try_convert_reflect_apply(
-            &call,
-            callee_member,
-            unresolved_mark,
-            stable_bindings,
-            with_depth,
-            top_level_direct_eval,
-            direct_eval_scopes,
-        ) {
-            return Ok(new_expr);
-        }
-        return Err(call);
-    }
 
     // Check that the property is `apply`
     match &callee_member.prop {
@@ -437,33 +409,13 @@ fn make_spread_call(call: CallExpr) -> Expr {
     // second arg becomes the spread argument
     let second_arg = args.remove(1).expr;
 
-    make_direct_spread_call_with_parts(span, ctxt, fn_expr, second_arg, type_args)
-}
-
-fn make_direct_spread_call(callee: Expr, arguments: Box<Expr>) -> Expr {
-    make_direct_spread_call_with_parts(
-        DUMMY_SP,
-        swc_core::common::SyntaxContext::empty(),
-        Box::new(callee),
-        arguments,
-        None,
-    )
-}
-
-fn make_direct_spread_call_with_parts(
-    span: swc_core::common::Span,
-    ctxt: swc_core::common::SyntaxContext,
-    callee: Box<Expr>,
-    arguments: Box<Expr>,
-    type_args: Option<Box<swc_core::ecma::ast::TsTypeParamInstantiation>>,
-) -> Expr {
     Expr::Call(CallExpr {
         span,
         ctxt,
-        callee: Callee::Expr(callee),
+        callee: Callee::Expr(fn_expr),
         args: vec![ExprOrSpread {
             spread: Some(DUMMY_SP),
-            expr: arguments,
+            expr: second_arg,
         }],
         type_args,
     })
