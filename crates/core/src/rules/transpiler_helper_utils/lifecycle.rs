@@ -2,11 +2,12 @@
 //! top-level callable dependency graph, and removal of helper declarations once
 //! all their call sites have been rewritten.
 
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::ecma::ast::{Decl, Expr, Module, ModuleItem, Pat, Stmt};
 
 use super::*;
+use crate::rules::helper_matcher::remove_unused_helper_declarations;
 
 /// Check which helper bindings still have references in the module body,
 /// excluding the declaration binding itself (VarDeclarator name / FnDecl ident).
@@ -18,24 +19,24 @@ pub(crate) fn helpers_with_remaining_refs(
     let helper_keys: HashSet<_> = helpers.keys().cloned().collect();
     remaining_refs_outside_declarations(module, &helper_keys, &helper_keys)
 }
+/// Remove the helpers in `helpers` that nothing outside the set references.
+/// A helper the module still references stays, and so does everything it
+/// references: its declaration is no longer one of the removed ones, so the
+/// references inside it count. That is why the check iterates until the set
+/// stops shrinking instead of judging every helper against the initial set.
 pub(crate) fn remove_helpers_without_remaining_refs(
     module: &mut Module,
     helpers: HashMap<BindingKey, TranspilerHelperKind>,
 ) {
-    let remaining = helpers_with_remaining_refs(module, &helpers);
-    let safe_to_remove: HashMap<BindingKey, TranspilerHelperKind> = helpers
-        .into_iter()
-        .filter(|(key, _)| !remaining.contains(key))
-        .collect();
-    if !safe_to_remove.is_empty() {
-        remove_helper_declarations(&mut module.body, &safe_to_remove);
-    }
+    let candidates = helpers.into_keys().collect();
+    let removable = remove_unused_helper_declarations(module, &candidates);
+    remove_import_specifiers_by_binding(&mut module.body, &removable);
 }
 pub(super) fn helper_dependencies_from_ref_graph(
     ref_graph: &HashMap<BindingKey, HashSet<BindingKey>>,
     helpers: &HashMap<BindingKey, TranspilerHelperKind>,
 ) -> HashMap<BindingKey, TranspilerHelperKind> {
-    let mut dependencies = HashSet::new();
+    let mut dependencies = HashSet::default();
     let mut stack: Vec<_> = helpers.keys().cloned().collect();
 
     while let Some(key) = stack.pop() {
@@ -58,7 +59,7 @@ pub(super) fn helper_dependencies_from_ref_graph(
 pub(super) fn collect_top_level_callable_ref_graph(
     module: &Module,
 ) -> HashMap<BindingKey, HashSet<BindingKey>> {
-    let mut candidates = HashSet::new();
+    let mut candidates = HashSet::default();
     for item in &module.body {
         match item {
             ModuleItem::Stmt(Stmt::Decl(Decl::Fn(fn_decl))) => {
@@ -81,7 +82,7 @@ pub(super) fn collect_top_level_callable_ref_graph(
         }
     }
 
-    let mut refs = HashMap::new();
+    let mut refs = HashMap::default();
     for item in &module.body {
         match item {
             ModuleItem::Stmt(Stmt::Decl(Decl::Fn(fn_decl))) => {

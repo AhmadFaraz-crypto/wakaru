@@ -353,6 +353,34 @@ var n = {
 }
 
 #[test]
+fn folds_an_earlier_lexical_temp() {
+    // Declared before every use in the same list, so the pattern's write is
+    // not in the TDZ and dropping it hides no ReferenceError.
+    let input = r#"
+let _n;
+let n = (_n = {}, _n.x = 1, _n);
+"#;
+    let expected = r#"
+let n = {
+    x: 1
+};
+"#;
+    assert_eq_normalized(&standard(input), expected.trim());
+}
+
+#[test]
+fn skips_a_parameter_temp() {
+    // Sloppy-mode `arguments` aliases the parameter, so its write is observable.
+    let input = r#"
+function make(_n) {
+    var n = (_n = {}, _n.x = 1, _n);
+    return [n, arguments[0]];
+}
+"#;
+    assert_eq_normalized(&standard(input), input.trim());
+}
+
+#[test]
 fn skips_a_directly_exported_temp() {
     // A direct export is observable without another identifier occurrence:
     // importers see `_n` become the same object as `n` after module evaluation.
@@ -557,4 +585,16 @@ function build() {
 }
 "#;
     assert_eq_normalized(&render(input), expected.trim());
+}
+
+#[test]
+fn skips_a_temp_shared_by_two_lowerings() {
+    // Each fold must account for every use of `_n`; with two sites neither
+    // rewrite holds all of them, so both stay and so does the declaration.
+    let input = r#"
+var _n;
+var a = (_n = {}, _n[k] = 1, _n);
+var b = (_n = {}, _n[j] = 2, _n);
+"#;
+    assert_eq_normalized(&standard(input), input.trim());
 }

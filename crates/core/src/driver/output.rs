@@ -12,7 +12,6 @@
 //! touches the filesystem. The CLI then performs a second, filesystem-level
 //! canonicalization pass to catch symlink escapes a lexical check cannot.
 
-use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Result};
@@ -46,7 +45,7 @@ pub fn safe_relative_module_path(filename: &str) -> Result<PathBuf> {
 /// `seen` stores the lowercased string representation of every path already
 /// claimed.  When a collision is detected the stem gets a numeric suffix:
 /// `foo.js` → `foo_2.js` → `foo_3.js` …
-pub fn deduplicate_path(path: &Path, seen: &mut HashSet<String>) -> PathBuf {
+pub fn deduplicate_path(path: &Path, seen: &mut std::collections::HashSet<String>) -> PathBuf {
     let key = path.to_string_lossy().to_lowercase();
     if seen.insert(key) {
         return path.to_path_buf();
@@ -72,6 +71,7 @@ pub fn deduplicate_path(path: &Path, seen: &mut HashSet<String>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn safe_relative_module_path_rejects_parent_components() {
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn deduplicate_path_appends_numeric_suffix_on_collision() {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let first = deduplicate_path(Path::new("src/index.js"), &mut seen);
         let second = deduplicate_path(Path::new("src/index.js"), &mut seen);
         let third = deduplicate_path(Path::new("src/index.js"), &mut seen);
@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn deduplicate_path_is_case_insensitive() {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let first = deduplicate_path(Path::new("src/Index.js"), &mut seen);
         let second = deduplicate_path(Path::new("src/index.js"), &mut seen);
 

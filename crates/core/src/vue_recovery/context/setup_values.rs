@@ -207,7 +207,7 @@ fn script_import_refs(expr: &Expr, imports: &HashMap<Atom, VueScriptImport>) -> 
     let mut collector = ScriptImportRefCollector {
         imports,
         declared: &declared,
-        refs: HashSet::new(),
+        refs: HashSet::default(),
     };
     expr.visit_with(&mut collector);
     collector.refs
@@ -221,7 +221,7 @@ pub(super) fn stmt_import_refs(
     let mut collector = ScriptImportRefCollector {
         imports,
         declared: &declared,
-        refs: HashSet::new(),
+        refs: HashSet::default(),
     };
     stmt.visit_with(&mut collector);
     collector.refs
@@ -231,7 +231,7 @@ pub(in crate::vue_recovery) fn stmt_ident_refs(stmt: &Stmt) -> HashSet<Atom> {
     let declared = declared_binding_idents(stmt);
     let mut collector = IdentRefCollector {
         declared: &declared,
-        refs: HashSet::new(),
+        refs: HashSet::default(),
     };
     stmt.visit_with(&mut collector);
     collector.refs
@@ -241,7 +241,7 @@ fn expr_ident_refs(expr: &Expr) -> HashSet<Atom> {
     let declared = declared_binding_idents(expr);
     let mut collector = IdentRefCollector {
         declared: &declared,
-        refs: HashSet::new(),
+        refs: HashSet::default(),
     };
     expr.visit_with(&mut collector);
     collector.refs
@@ -264,7 +264,7 @@ where
     N: VisitWith<DeclaredBindingIdents>,
 {
     let mut collector = DeclaredBindingIdents {
-        idents: HashSet::new(),
+        idents: HashSet::default(),
     };
     node.visit_with(&mut collector);
     collector.idents
@@ -666,7 +666,7 @@ fn computed_setup_prop_alias_exprs(
     stmts: &[Stmt],
     ctx: &VueRecoveryContext,
 ) -> HashMap<Atom, Expr> {
-    let mut aliases = HashMap::new();
+    let mut aliases = HashMap::default();
     for stmt in stmts {
         let Stmt::Decl(Decl::Var(var)) = stmt else {
             continue;
@@ -699,7 +699,7 @@ fn collect_computed_setup_prop_alias_var(
         return false;
     }
 
-    let mut next_aliases = HashMap::new();
+    let mut next_aliases = HashMap::default();
     for decl in &var.decls {
         let Pat::Object(object) = &decl.name else {
             return false;
@@ -723,7 +723,7 @@ fn collect_computed_setup_prop_aliases(
     object: &ObjectPat,
     aliases: &mut HashMap<Atom, Expr>,
 ) -> bool {
-    let mut next_aliases = HashMap::new();
+    let mut next_aliases = HashMap::default();
     for prop in &object.props {
         match prop {
             ObjectPatProp::KeyValue(key_value) => {
@@ -774,7 +774,7 @@ fn ident_binding_from_pat(pat: &Pat) -> Option<&Ident> {
 }
 
 fn computed_block_local_exprs(stmts: &[Stmt]) -> HashMap<Atom, Expr> {
-    let mut locals = HashMap::new();
+    let mut locals = HashMap::default();
     for stmt in stmts {
         let Stmt::Decl(Decl::Var(var)) = stmt else {
             continue;
@@ -800,7 +800,7 @@ fn computed_mutated_local_bindings(
     locals: &HashMap<Atom, Expr>,
 ) -> HashMap<Atom, Expr> {
     if locals.is_empty() {
-        return HashMap::new();
+        return HashMap::default();
     }
 
     let mut detector = ComputedLocalMutationDetector::new(locals.keys().cloned().collect());
@@ -838,7 +838,7 @@ impl ComputedLocalMutationDetector {
         Self {
             bindings,
             shadow_depths,
-            mutated: HashSet::new(),
+            mutated: HashSet::default(),
         }
     }
 
@@ -866,7 +866,7 @@ impl ComputedLocalMutationDetector {
     }
 
     fn shadowing_indices(&self, params: &[&Pat]) -> Vec<usize> {
-        let mut param_bindings = HashSet::new();
+        let mut param_bindings = HashSet::default();
         for param in params {
             collect_pat_bindings(param, &mut param_bindings);
         }
@@ -976,7 +976,7 @@ impl ComputedLocalRefCounter {
     }
 
     fn shadowing_indices(&self, params: &[&Pat]) -> Vec<usize> {
-        let mut param_bindings = HashSet::new();
+        let mut param_bindings = HashSet::default();
         for param in params {
             collect_pat_bindings(param, &mut param_bindings);
         }
@@ -1157,7 +1157,7 @@ impl VisitMut for ComputedLocalInliner {
 }
 
 fn arrow_scope_bindings(arrow: &swc_core::ecma::ast::ArrowExpr) -> HashSet<Atom> {
-    let mut bindings = HashSet::new();
+    let mut bindings = HashSet::default();
     for param in &arrow.params {
         collect_pat_bindings(param, &mut bindings);
     }
@@ -1166,7 +1166,7 @@ fn arrow_scope_bindings(arrow: &swc_core::ecma::ast::ArrowExpr) -> HashSet<Atom>
 }
 
 fn function_scope_bindings(function: &swc_core::ecma::ast::Function) -> HashSet<Atom> {
-    let mut bindings = HashSet::new();
+    let mut bindings = HashSet::default();
     for param in &function.params {
         collect_pat_bindings(&param.pat, &mut bindings);
     }
@@ -1220,7 +1220,7 @@ fn computed_if_return_chain_expr(
     ctx: &VueRecoveryContext,
 ) -> Result<Option<String>> {
     let mut branches = Vec::new();
-    let mut aliases = HashMap::new();
+    let mut aliases = HashMap::default();
 
     for stmt in stmts {
         match stmt {

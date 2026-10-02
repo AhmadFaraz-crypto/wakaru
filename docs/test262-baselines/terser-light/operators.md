@@ -23,13 +23,12 @@
 
 | Discovered | Runnable | Skipped | Unsupported | Rejected | Passed | Failed |
 |---:|---:|---:|---:|---:|---:|---:|
-| 2200 | 2200 | 0 | 108 | 83 | 2009 | 0 |
+| 2200 | 2200 | 0 | 108 | 74 | 2018 | 0 |
 
 ## Reasons
 
 | Status | Reason | Count |
 |---|---|---:|
-| rejected | swc-array-binding-elision | 9 |
 | rejected | transform-reject | 72 |
 | rejected | transform-runtime | 2 |
 | unsupported | node-vm-baseline | 93 |

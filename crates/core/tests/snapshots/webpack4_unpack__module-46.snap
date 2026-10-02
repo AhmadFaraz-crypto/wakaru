@@ -2,28 +2,32 @@
 source: crates/core/tests/webpack4_unpack.rs
 expression: code
 ---
+export let unstable_now;
+export let unstable_forceFrameRate;
 let r;
 let o;
 let i;
 let a;
-export let unstable_requestPaint;
+let u;
 if (typeof window === "undefined" || typeof MessageChannel !== "function") {
     let l = null;
     let c = null;
     const s = ()=>{
         if (l !== null) {
             try {
-                const e = exports.unstable_now();
+                const e = unstable_now();
                 l(true, e);
                 l = null;
-            } catch (e) {
+            } catch (error) {
                 setTimeout(s, 0);
-                throw e;
+                throw error;
             }
         }
     };
     const f = Date.now();
-    exports.unstable_now = ()=>Date.now() - f;
+    unstable_now = function() {
+        return Date.now() - f;
+    };
     r = (e)=>{
         if (l !== null) {
             setTimeout(r, 0, e);
@@ -39,9 +43,9 @@ if (typeof window === "undefined" || typeof MessageChannel !== "function") {
         clearTimeout(c);
     };
     a = ()=>false;
-    unstable_requestPaint = exports.unstable_forceFrameRate = ()=>{};
+    u = unstable_forceFrameRate = function() {};
 } else {
-    const { performance: d, Date: p, setTimeout: h, clearTimeout: m } = window;
+    const { performance, Date, setTimeout, clearTimeout } = window;
     if (typeof console !== "undefined") {
         const y = window.cancelAnimationFrame;
         if (typeof window.requestAnimationFrame !== "function") {
@@ -51,20 +55,24 @@ if (typeof window === "undefined" || typeof MessageChannel !== "function") {
             console.error("This browser doesn't support cancelAnimationFrame. Make sure that you load a polyfill in older browsers. https://fb.me/react-polyfills");
         }
     }
-    if (typeof d === "object" && typeof d.now === "function") {
-        exports.unstable_now = ()=>d.now();
+    if (typeof performance === "object" && typeof performance.now === "function") {
+        unstable_now = function() {
+            return performance.now();
+        };
     } else {
-        const v = p.now();
-        exports.unstable_now = ()=>p.now() - v;
+        const v = Date.now();
+        unstable_now = function() {
+            return Date.now() - v;
+        };
     }
     let b = false;
     let g = null;
     let w = -1;
     let E = 5;
     let x = 0;
-    a = ()=>exports.unstable_now() >= x;
-    unstable_requestPaint = ()=>{};
-    exports.unstable_forceFrameRate = (e)=>{
+    a = ()=>unstable_now() >= x;
+    u = function() {};
+    unstable_forceFrameRate = function(e) {
         if (e < 0 || e > 125) {
             console.error("forceFrameRate takes a positive int between 0 and 125, forcing framerates higher than 125 fps is not unsupported");
         } else {
@@ -75,7 +83,7 @@ if (typeof window === "undefined" || typeof MessageChannel !== "function") {
     const T = k.port2;
     k.port1.onmessage = ()=>{
         if (g !== null) {
-            const e = exports.unstable_now();
+            const e = unstable_now();
             x = e + E;
             try {
                 if (g(true, e)) {
@@ -84,9 +92,9 @@ if (typeof window === "undefined" || typeof MessageChannel !== "function") {
                     b = false;
                     g = null;
                 }
-            } catch (e) {
+            } catch (error) {
                 T.postMessage(null);
-                throw e;
+                throw error;
             }
         } else {
             b = false;
@@ -100,12 +108,12 @@ if (typeof window === "undefined" || typeof MessageChannel !== "function") {
         }
     };
     o = (e, n)=>{
-        w = h(()=>{
-            e(exports.unstable_now());
+        w = setTimeout(()=>{
+            e(unstable_now());
         }, n);
     };
     i = ()=>{
-        m(w);
+        clearTimeout(w);
         w = -1;
     };
 }
@@ -225,7 +233,7 @@ function z(e, n) {
                 N.callback = null;
                 M = N.priorityLevel;
                 const l = u(N.expirationTime <= n);
-                n = exports.unstable_now();
+                n = unstable_now();
                 if (typeof l === "function") {
                     N.callback = l;
                 } else if (N === O(_)) {
@@ -252,8 +260,8 @@ function z(e, n) {
         A = false;
     }
 }
-function q(e) {
-    switch(e){
+function q(priorityLevel) {
+    switch(priorityLevel){
         case 1:
             return -1;
         case 2:
@@ -266,24 +274,29 @@ function q(e) {
             return 5000;
     }
 }
+export const unstable_requestPaint = u;
 export const unstable_IdlePriority = 5;
 export const unstable_ImmediatePriority = 1;
 export const unstable_LowPriority = 4;
 export const unstable_NormalPriority = 3;
 export const unstable_Profiling = null;
 export const unstable_UserBlockingPriority = 2;
-export const unstable_cancelCallback = (e)=>{
+export const unstable_cancelCallback = function(e) {
     e.callback = null;
 };
-export const unstable_continueExecution = ()=>{
+export const unstable_continueExecution = function() {
     if (!(L || A)) {
         L = true;
         r(z);
     }
 };
-export const unstable_getCurrentPriorityLevel = ()=>M;
-export const unstable_getFirstCallbackNode = ()=>O(_);
-export const unstable_next = (e)=>{
+export const unstable_getCurrentPriorityLevel = function() {
+    return M;
+};
+export const unstable_getFirstCallbackNode = function() {
+    return O(_);
+};
+export const unstable_next = function(e) {
     switch(M){
         case 1:
         case 2:
@@ -301,8 +314,8 @@ export const unstable_next = (e)=>{
         M = n;
     }
 };
-export const unstable_pauseExecution = ()=>{};
-export const unstable_runWithPriority = (e, t)=>{
+export const unstable_pauseExecution = function() {};
+export const unstable_runWithPriority = function(e, t) {
     switch(e){
         case 1:
         case 2:
@@ -321,52 +334,52 @@ export const unstable_runWithPriority = (e, t)=>{
         M = n;
     }
 };
-export const unstable_scheduleCallback = (e, callback, a)=>{
-    const u = exports.unstable_now();
+export const unstable_scheduleCallback = function(priorityLevel, callback, a) {
+    const u = unstable_now();
     if (typeof a === "object" && a !== null) {
-        var l = a.delay;
-        l = typeof l === "number" && l > 0 ? u + l : u;
-        a = typeof a.timeout === "number" ? a.timeout : q(e);
+        var startTime = a.delay;
+        startTime = typeof startTime === "number" && startTime > 0 ? u + startTime : u;
+        a = typeof a.timeout === "number" ? a.timeout : q(priorityLevel);
     } else {
-        a = q(e);
-        l = u;
+        a = q(priorityLevel);
+        startTime = u;
     }
-    e = {
+    priorityLevel = {
         id: R++,
         callback,
-        priorityLevel: e,
-        startTime: l,
-        expirationTime: a = l + a,
+        priorityLevel,
+        startTime,
+        expirationTime: a = startTime + a,
         sortIndex: -1
     };
-    if (l > u) {
-        e.sortIndex = l;
-        S(j, e);
-        if (O(_) === null && e === O(j)) {
+    if (startTime > u) {
+        priorityLevel.sortIndex = startTime;
+        S(j, priorityLevel);
+        if (O(_) === null && priorityLevel === O(j)) {
             if (I) {
                 i();
             } else {
                 I = true;
             }
-            o(F, l - u);
+            o(F, startTime - u);
         }
     } else {
-        e.sortIndex = a;
-        S(_, e);
+        priorityLevel.sortIndex = a;
+        S(_, priorityLevel);
         if (!(L || A)) {
             L = true;
             r(z);
         }
     }
-    return e;
+    return priorityLevel;
 };
-export const unstable_shouldYield = ()=>{
-    const e = exports.unstable_now();
+export const unstable_shouldYield = function() {
+    const e = unstable_now();
     D(e);
     const n = O(_);
     return n !== N && N !== null && n !== null && n.callback !== null && n.startTime <= e && n.expirationTime < N.expirationTime || a();
 };
-export const unstable_wrapCallback = (e)=>{
+export const unstable_wrapCallback = function(e) {
     const t = M;
     return function() {
         const n = M;

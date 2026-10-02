@@ -7,6 +7,7 @@
 )]
 
 pub(crate) mod analysis;
+pub mod collections;
 pub(crate) mod commonjs_default_object_composition;
 pub mod driver;
 pub mod facts;
@@ -36,7 +37,9 @@ pub use facts::{
     collect_module_facts, ExportFact, ExportKind, HelperExportFact, HelperKind, ImportFact,
     ImportKind, ModuleFacts, ModuleFactsMap, TypeScriptHelperExportFact, TypeScriptHelperKind,
 };
-pub use output_validate::{validate_output_modules, OutputFinding, OutputFindingKind};
+pub use output_validate::{
+    validate_output_modules, validate_output_modules_with_inputs, OutputFinding, OutputFindingKind,
+};
 pub use rules::{
     apply_rules, rule_descriptors, rule_names, RewriteAssumptions, RewriteLevel, RewritePolicy,
     RuleDescriptor, RulePipelineOptions, RuleStage,

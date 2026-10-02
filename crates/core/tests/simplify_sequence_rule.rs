@@ -443,402 +443,23 @@ for (let x of (a(), b(), c())) {
 }
 
 #[test]
-fn drops_pure_literal_no_op_statements() {
-    // Numeric, boolean, and null literals as statements are dead code
+fn preserves_elision_only_array_assignment_pattern() {
+    // `[,] = f()` advances the iterator once, so the statement is observable
+    // even though it binds nothing. swc_ecma_parser 45.1.2 keeps the trailing
+    // elision in assignment patterns (earlier versions parsed it as `[] = f()`);
+    // this pins that the pattern reaches the rule intact and survives it.
     let input = r#"
-a(), 0, b();
-0;
-false;
-null;
-"use strict";
+[,] = f();
+[, ,] = f();
+[a, ,] = f();
 "#;
     let expected = r#"
-a();
-b();
-"use strict";
+[,] = f();
+[, ,] = f();
+[a, ,] = f();
 "#;
-    let output = apply(input);
-    assert_eq_normalized(&output, expected);
-}
-
-#[test]
-fn preserves_identifier_read_statements() {
-    let input = r#"
-missing;
-(value);
-"#;
-    let expected = r#"
-missing;
-value;
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, expected);
-}
-
-#[test]
-fn preserves_tdz_identifier_read_before_lexical_declaration() {
-    let input = r#"
-{
-  x;
-  let x;
-}
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, input);
-}
-
-#[test]
-fn preserves_typeof_resolved_binding_read() {
-    // `typeof` can throw for lexical bindings while they are in TDZ. Even when
-    // the expression looks like a no-op, dropping it can remove an observable
-    // ReferenceError from a closure created in a for-of TDZ environment.
-    let input = r#"
-let x;
-function probe() {
-  typeof x;
-}
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, input);
-}
-
-#[test]
-fn preserves_this_read_statement() {
-    let input = r#"
-class C extends Base {
-  constructor() {
-    (() => {
-      this;
-    })();
-  }
-}
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, input);
-}
-
-#[test]
-fn drops_safe_identifier_read_statements() {
-    let input = r#"
-undefined;
-let value;
-value;
-"#;
-    let expected = r#"
-let value;
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, expected);
-}
-
-#[test]
-fn preserves_import_binding_read_statement_inside_function() {
-    let input = r#"
-import { x as y } from './self.js';
-assert.throws(ReferenceError, function() {
-  y;
-});
-export const x = 23;
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, input);
-}
-
-#[test]
-fn preserves_import_binding_reads_nested_in_void_expressions() {
-    let input = r#"
-import { x as y } from './self.js';
-assert.throws(ReferenceError, function() {
-  void y;
-});
-void (0, y);
-void [y];
-export const x = 23;
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, input);
-}
-
-#[test]
-fn preserves_tdz_read_nested_in_void_expression() {
-    let input = r#"
-{
-  void x;
-  let x;
-}
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, input);
-}
-
-#[test]
-fn preserves_tdz_read_in_nested_block_before_outer_declaration() {
-    let input = r#"
-{
-  {
-    void x;
-  }
-  let x;
-}
-let initialized;
-{
-  void initialized;
-}
-"#;
-    let expected = r#"
-{
-  {
-    void x;
-  }
-  let x;
-}
-let initialized;
-{
-}
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, expected);
-}
-
-#[test]
-fn preserves_outer_lexical_read_in_hoisted_function_called_before_initialization() {
-    let input = r#"
-f();
-let x;
-function f() {
-  void x;
-}
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, input);
-}
-
-#[test]
-fn function_like_bodies_conservatively_preserve_outer_lexical_reads() {
-    let input = r#"
-let outer;
-const arrow = () => {
-  void outer;
-};
-const expression = function() {
-  void outer;
-};
-const object = {
-  method() {
-    void outer;
-  },
-  get value() {
-    void outer;
-    return 1;
-  },
-  set value(next) {
-    void outer;
-  }
-};
-class C {
-  constructor() {
-    void outer;
-  }
-  method() {
-    void outer;
-  }
-  get value() {
-    void outer;
-    return 1;
-  }
-  set value(next) {
-    void outer;
-  }
-}
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, input);
-}
-
-#[test]
-fn function_body_still_drops_initialized_shadowing_lexical_read() {
-    let input = r#"
-let value;
-function f() {
-  let value;
-  void value;
-}
-"#;
-    let expected = r#"
-let value;
-function f() {
-  let value;
-}
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, expected);
-}
-
-#[test]
-fn drops_safe_void_literal_no_op_statement() {
-    let input = r#"
-void 0;
-void 1;
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, "");
-}
-
-#[test]
-fn drops_stable_builtin_member_reads_but_keeps_computed_key_reads() {
-    let input = r#"
-void Math.min;
-void Math[missing];
-"#;
-    let expected = r#"
-void Math[missing];
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, expected);
-}
-
-#[test]
-fn drops_void_wrapped_closures_without_executing_their_reads() {
-    let input = r#"
-let helper;
-void (() => helper);
-void function() { helper; };
-"#;
-    let expected = r#"
-let helper;
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, expected);
-}
-
-#[test]
-fn preserves_require_binding_read_statement_for_later_esm_recovery() {
-    let input = r#"
-var a = require("./dep.js");
-a;
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, input);
-}
-
-#[test]
-fn preserves_new_expression_statement_with_spread_argument() {
-    let input = r#"
-var iter = {};
-assert.throws(Test262Error, function() {
-  new function() {}(...iter);
-});
-"#;
-    let output = apply_minimal(input);
-    assert_eq_normalized(&output, input);
-}
-
-#[test]
-fn preserves_object_literal_computed_key_coercion() {
-    let input = r#"
-({
-  get [badKey]() {}
-});
-({
-  set [badKey](_) {}
-});
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, input);
-}
-
-#[test]
-fn preserves_object_literal_shorthand_lookup() {
-    let input = r#"
-({ unresolvable });
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, input);
-}
-
-#[test]
-fn preserves_binary_coercion_no_op_statement() {
-    let input = r#"
-var badKey = Object.create(null);
-function probe() {
-  badKey + "";
-}
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, input);
-}
-
-#[test]
-fn preserves_bigint_operator_throw_statements() {
-    let input = r#"
-1n + 1;
-1n / 0n;
-1n % 0n;
-1n >>> 1n;
-+1n;
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, input);
-}
-
-#[test]
-fn preserves_in_and_instanceof_throw_statements() {
-    let input = r#"
-"x" in true;
-true instanceof true;
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, input);
-}
-
-#[test]
-fn preserves_function_expression_statement() {
-    // A function expression as a statement should not be removed even though
-    // it's technically side-effect-free (issue #150: webcrack output wrapper)
-    let input = r#"
-(function anonymous(arg) {
-  (function () {
-    var foo = 1;
-    console.log(foo);
-  })();
-})
-"#;
-    let expected = r#"
-(function anonymous(arg) {
-  (function () {
-    var foo = 1;
-    console.log(foo);
-  })();
-})
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, expected);
-}
-
-#[test]
-fn preserves_arrow_function_expression_statement() {
-    let input = r#"
-() => { console.log(1); };
-doSomething();
-"#;
-    let expected = r#"
-() => { console.log(1); };
-doSomething();
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, expected);
-}
-
-#[test]
-fn preserves_class_expression_statement() {
-    let input = r#"
-(class {
-  static [name] = value;
-});
-doSomething();
-"#;
-    let output = apply(input);
-    assert_eq_normalized(&output, input);
+    assert_eq_normalized(&apply(input), expected);
+    assert_eq_normalized(&apply_minimal(input), expected);
 }
 
 #[test]
@@ -855,4 +476,163 @@ a.b = c;
 "#;
     let output = apply(input);
     assert_eq_normalized(&output, expected);
+}
+
+// Babel loose `for-of` packs Map entry unpack into the inner for-init:
+// `for (var a, r = n.value, s = (r[0], r[1]), l = helper(s); !(a = l()).done;)`
+// Sequence prefixes must not run before earlier declarators in the same list.
+
+#[test]
+fn for_var_init_sequence_prefix_does_not_read_earlier_declarator_before_init() {
+    let input = r#"
+function walk(n, helper) {
+  for (var a, r = n.value, s = (r[0], r[1]), l = helper(s); !(a = l()).done;);
+}
+"#;
+    let expected = r#"
+function walk(n, helper) {
+  var a, r = n.value;
+  r[0];
+  for (var s = r[1], l = helper(s); !(a = l()).done;);
+}
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn for_var_init_independent_sequence_prefix_keeps_prior_initializer_order() {
+    // A call can observe any earlier `var` through effects or a closure even
+    // when its argument AST does not directly reference that binding.
+    let input = r#"
+function run(log) {
+  for (var a = log("init"), b = (log("prefix"), 1); false;);
+}
+"#;
+    let expected = r#"
+function run(log) {
+  var a = log("init");
+  log("prefix");
+  for (var b = 1; false;);
+}
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn for_let_init_independent_later_prefix_keeps_prior_initializer_order() {
+    // A lexical declarator cannot be flushed out of the loop, so keep the
+    // later sequence intact rather than moving its effects before `a`.
+    let input = r#"
+function run(log) {
+  for (let a = log("init"), b = (log("prefix"), 1); false;);
+}
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, input);
+}
+
+#[test]
+fn for_let_init_sequence_prefix_that_reads_earlier_decl_stays_unsplit() {
+    // Lexical for-init bindings cannot be hoisted out of the loop.
+    let input = r#"
+for (let r = n.value, s = (r[0], r[1]); r < 10; r++) {}
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, input);
+}
+
+#[test]
+fn for_const_init_sequence_prefix_that_reads_earlier_decl_stays_unsplit() {
+    // Same fail-closed as `let`: do not pull const declarators out of the `for`.
+    let input = r#"
+for (const r = n.value, s = (r[0], r[1]); false; ) {}
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, input);
+}
+
+#[test]
+fn for_let_init_sequence_prefix_self_reference_stays_in_tdz() {
+    let input = r#"
+let x = 0;
+for (let x = (x, 1); false;);
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, input);
+}
+
+#[test]
+fn for_const_init_sequence_prefix_later_reference_stays_in_tdz() {
+    let input = r#"
+const later = 0;
+for (const x = (later, 1), later = 2; false;);
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, input);
+}
+
+#[test]
+fn for_let_init_shadowed_header_name_does_not_trigger_tdz_guard() {
+    // Resolver identity distinguishes the IIFE parameter from the loop binding.
+    let input = r#"
+for (let x = ((function(x) { use(x); })(0), 1); false;);
+"#;
+    let expected = r#"
+(function(x) { use(x); })(0);
+for (let x = 1; false;);
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn for_var_init_function_iife_prefix_keeps_expression_context() {
+    // Lifted function-callee IIFE must stay an expression, not `function(){}()`.
+    let input = r#"
+function run() {
+  for (var x = 0, y = ((function () {})(), 1); false;);
+}
+"#;
+    let expected = r#"
+function run() {
+  var x = 0;
+  (function() {})();
+  for (var y = 1; false;);
+}
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn for_var_init_object_headed_prefix_keeps_expression_context() {
+    // Lifted object-headed call chains must keep expression context.
+    let input = r#"
+function run(k, h) {
+  for (var x = 0, y = ({ [k()]: h }[k()](), 1); false;);
+}
+"#;
+    let expected = r#"
+function run(k, h) {
+  var x = 0;
+  ({ [k()]: h })[k()]();
+  for (var y = 1; false;);
+}
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn for_var_init_string_prefix_does_not_become_directive() {
+    // A leading string statement can become a directive; leave this init unsplit.
+    let input = r#"
+function run() {
+  for (var x = ("use strict", 1); false;);
+}
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, input);
 }

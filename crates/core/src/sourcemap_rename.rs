@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 use std::io::BufReader;
 use std::path::{Component, Path, PathBuf};
 
@@ -144,12 +144,12 @@ fn collect_sourcemap_renames(
         start_pos,
         source_lines: &source_lines,
         unresolved_mark,
-        votes: HashMap::new(),
+        votes: HashMap::default(),
     };
     module.visit_with(&mut voter);
 
     // Phase 2: group winning names by claimant type.
-    let mut claimants: HashMap<Atom, (Vec<BindingId>, Vec<BindingId>)> = HashMap::new();
+    let mut claimants: HashMap<Atom, (Vec<BindingId>, Vec<BindingId>)> = HashMap::default();
 
     for (binding_id, vote_map) in &voter.votes {
         let Some(winner) = plurality_winner(vote_map) else {
@@ -213,7 +213,7 @@ fn plurality_winner(votes: &HashMap<Atom, usize>) -> Option<Atom> {
 
 /// Collect the BindingId of every binding declared at the top level of the module.
 fn collect_module_level_bindings(module: &Module) -> HashSet<BindingId> {
-    let mut ids = HashSet::new();
+    let mut ids = HashSet::default();
     for item in &module.body {
         match item {
             ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
@@ -293,7 +293,11 @@ impl Visit for NameVoter<'_> {
     }
 
     // Property keys are not bindings — skip them.
-    fn visit_prop_name(&mut self, _: &PropName) {}
+    fn visit_prop_name(&mut self, prop: &PropName) {
+        if let PropName::Computed(computed) = prop {
+            computed.visit_with(self);
+        }
+    }
 
     fn visit_member_prop(&mut self, prop: &MemberProp) {
         if let MemberProp::Computed(c) = prop {

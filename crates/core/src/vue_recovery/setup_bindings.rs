@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use anyhow::Result;
 use swc_core::atoms::Atom;
@@ -63,7 +63,7 @@ pub(super) fn setup_ref_declarations(
     expr_refs.extend(setup_script_binding_refs(ctx));
     let template_refs = &template_usage.static_ref_names;
     let render_value_refs = render_value_member_refs(render, ctx);
-    let mut declared = HashSet::new();
+    let mut declared = HashSet::default();
     let mut declarations = Vec::new();
 
     let mut bindings = ctx.setup_ref_script_bindings.clone();
@@ -105,12 +105,12 @@ fn render_value_member_refs(render: RenderSource<'_>, ctx: &VueRecoveryContext) 
         .map(|binding| binding.binding.clone())
         .collect::<HashSet<_>>();
     if candidates.is_empty() {
-        return HashSet::new();
+        return HashSet::default();
     }
 
     let mut collector = ValueMemberRefCollector {
         candidates: &candidates,
-        refs: HashSet::new(),
+        refs: HashSet::default(),
     };
     match render {
         RenderSource::Function {

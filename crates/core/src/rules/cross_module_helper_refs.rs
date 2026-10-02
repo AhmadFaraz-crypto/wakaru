@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::ecma::ast::{
@@ -165,7 +165,7 @@ pub(crate) fn collect_cross_module_ts_helper_refs(
     kind: TypeScriptHelperKind,
 ) -> CrossModuleTsHelperRefs {
     let mut refs = CrossModuleTsHelperRefs::default();
-    let mut namespace_factories: HashMap<BindingKey, HashSet<String>> = HashMap::new();
+    let mut namespace_factories: HashMap<BindingKey, HashSet<String>> = HashMap::default();
 
     for item in &module.body {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {

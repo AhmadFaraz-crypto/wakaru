@@ -6,7 +6,7 @@
 //! id is non-zero. The matchers live here so neither version's unpacker owns
 //! the other's syntax.
 
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::common::{Mark, SyntaxContext, DUMMY_SP};
@@ -19,9 +19,11 @@ use swc_core::ecma::ast::{
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use super::emit_esm::{dedup_filename, FilenameDedupStyle};
-use crate::analysis::binding_uses::{BindingId, BindingUseIndex};
+use crate::analysis::binding_uses::{BindingId, BindingUseIndex, UseKind};
 use crate::module_path::relative_import_specifier;
-use crate::rules::rename_utils::{collect_module_names, rename_bindings_in_module, BindingRename};
+use crate::rules::rename_utils::{
+    collect_free_reference_names, collect_module_names, rename_bindings_in_module, BindingRename,
+};
 use crate::utils::paren::{strip_parens, strip_parens_mut};
 
 const JAVASCRIPT_LIKE_EXTENSIONS: &[&str] = &["js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts"];
@@ -84,7 +86,7 @@ pub(super) fn webpack_module_filename(module_id: &str) -> String {
 pub(super) fn unique_webpack_module_filenames<'a>(
     module_ids: impl IntoIterator<Item = &'a str>,
 ) -> Vec<String> {
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     module_ids
         .into_iter()
         .map(|module_id| {
@@ -367,7 +369,11 @@ pub(super) fn localize_reused_runtime_parameter(
     }
 
     let mut candidate = module.clone();
+    // Names the invented local must not take: everything the module declares
+    // and every name it references as a global. A local spelled like a free
+    // reference would capture that reference after printing.
     let mut used_names = collect_module_names(&candidate);
+    used_names.extend(collect_free_reference_names(&candidate, unresolved_mark));
     let local_name = fresh_runtime_value_name(parameter, &mut used_names);
     let local = Ident::new(local_name.clone(), DUMMY_SP, target.1);
 
@@ -398,6 +404,11 @@ pub(super) fn localize_reused_runtime_parameter(
         return false;
     }
     candidate.body = rebuilt;
+    if kind == FactoryRuntimeParameter::Exports
+        && !commonjs_alias_chains_have_stable_default(&mut candidate, target, unresolved_mark)
+    {
+        return false;
+    }
 
     rename_bindings_in_module(
         &mut candidate,
@@ -410,9 +421,67 @@ pub(super) fn localize_reused_runtime_parameter(
     if remaining.use_count(target) != 0 || remaining.has_declaration(target) {
         return false;
     }
+    // The parameter references resolved as the synthetic module's unresolved
+    // binding, and the rename keeps that context. The localized `var` is a
+    // real module-local binding; the driver re-resolves the prepared module at
+    // the Phase 1 handoff, which gives it a local context before any rule
+    // classifies identifiers by `unresolved_mark`.
 
     *module = candidate;
     true
+}
+
+// Only admit a new CommonJS alias bridge when the later ESM pass can prove
+// its default identity. Complex initializers or mutable defaults would bypass
+// that proof and could lose property writes or leave free module references.
+fn commonjs_alias_chains_have_stable_default(
+    module: &mut Module,
+    target: &BindingId,
+    unresolved_mark: Mark,
+) -> bool {
+    let mut values = Vec::new();
+    for item in &mut module.body {
+        let ModuleItem::Stmt(Stmt::Expr(statement)) = item else {
+            continue;
+        };
+        if let Some(initializer) = commonjs_exports_alias_chain_initializer_mut(
+            &mut statement.expr,
+            FactoryRuntimeParameter::Exports,
+            target,
+            unresolved_mark,
+        ) {
+            let Expr::Ident(value) = strip_parens(initializer) else {
+                return false;
+            };
+            values.push((value.sym.clone(), value.ctxt));
+        }
+    }
+    if values.is_empty() {
+        return true;
+    }
+    let uses = BindingUseIndex::collect(module);
+    if values
+        .iter()
+        .any(|value| !uses.has_declaration(value) || uses.has_direct_write(value))
+    {
+        return false;
+    }
+    let module_id = (
+        Atom::from("module"),
+        SyntaxContext::empty().apply_mark(unresolved_mark),
+    );
+    let mut writes = 0;
+    for site in uses.use_sites(&module_id) {
+        match &site.kind {
+            UseKind::StaticMemberRead(property) if property.as_ref() == "exports" => {}
+            UseKind::StaticMemberWrite(property) if property.as_ref() == "exports" => writes += 1,
+            UseKind::TypeofOperand => {}
+            _ => return false,
+        }
+    }
+    let mut eval = crate::rules::eval_utils::DirectEvalPresence::default();
+    module.visit_with(&mut eval);
+    writes == 1 && !has_hoisted_function_capture(module, &module_id) && !eval.found
 }
 
 fn fresh_runtime_value_name(parameter: &Atom, used_names: &mut HashSet<Atom>) -> Atom {
@@ -422,7 +491,7 @@ fn fresh_runtime_value_name(parameter: &Atom, used_names: &mut HashSet<Atom>) ->
     }
     let mut suffix = 2usize;
     loop {
-        let candidate = Atom::from(format!("_{parameter}{suffix}"));
+        let candidate = Atom::from(format!("_{parameter}_{suffix}"));
         if used_names.insert(candidate.clone()) {
             return candidate;
         }
@@ -524,6 +593,16 @@ fn lift_first_runtime_parameter_write(
             None
         }
         ModuleItem::Stmt(Stmt::Expr(expr_stmt)) => {
+            if let Some(replacement) = lift_commonjs_exports_alias_chain(
+                &mut expr_stmt.expr,
+                kind,
+                target,
+                unresolved_mark,
+                local,
+                module_ids,
+            ) {
+                return Some(replacement);
+            }
             if let Some(split) = split_mid_sequence_parameter_assignment(
                 &mut expr_stmt.expr,
                 kind,
@@ -604,6 +683,126 @@ fn lift_first_runtime_parameter_write(
         }
         _ => None,
     }
+}
+
+fn lift_commonjs_exports_alias_chain(
+    expr: &mut Box<Expr>,
+    kind: FactoryRuntimeParameter,
+    target: &BindingId,
+    unresolved_mark: Mark,
+    local: &Ident,
+    module_ids: &ReusedLoaderModuleIds<'_>,
+) -> Option<Vec<ModuleItem>> {
+    if let Some(initializer) =
+        commonjs_exports_alias_chain_initializer_mut(expr, kind, target, unresolved_mark)
+    {
+        let normalized = canonicalize_parameter_initializer(
+            initializer.clone(),
+            kind,
+            target,
+            unresolved_mark,
+            module_ids,
+        )?;
+        *initializer = normalized;
+        return Some(vec![
+            var_binding_declaration_item(local.clone()),
+            expr_item(expr.clone()),
+        ]);
+    }
+
+    let Expr::Seq(sequence) = strip_parens_mut(expr) else {
+        return None;
+    };
+    let mut boundary_index = None;
+    for (index, candidate) in sequence.exprs.iter_mut().enumerate() {
+        let Some(initializer) =
+            commonjs_exports_alias_chain_initializer_mut(candidate, kind, target, unresolved_mark)
+        else {
+            continue;
+        };
+        let normalized = canonicalize_parameter_initializer(
+            initializer.clone(),
+            kind,
+            target,
+            unresolved_mark,
+            module_ids,
+        )?;
+        *initializer = normalized;
+        boundary_index = Some(index);
+        break;
+    }
+    let index = boundary_index?;
+    if !sequence.exprs[..index].iter_mut().all(|prefix| {
+        canonicalize_immediate_expression(prefix, kind, target, unresolved_mark, module_ids)
+    }) {
+        return None;
+    }
+
+    let mut replacement = sequence.exprs[..index]
+        .iter()
+        .cloned()
+        .map(expr_item)
+        .collect::<Vec<_>>();
+    replacement.push(var_binding_declaration_item(local.clone()));
+    replacement.push(expr_item(sequence.exprs[index].clone()));
+    let suffix = sequence.exprs[index + 1..].to_vec();
+    match suffix.len() {
+        0 => {}
+        1 => replacement.push(expr_item(
+            suffix.into_iter().next().expect("single sequence suffix"),
+        )),
+        _ => replacement.push(expr_item(Box::new(Expr::Seq(SeqExpr {
+            span: sequence.span,
+            exprs: suffix,
+        })))),
+    }
+    Some(replacement)
+}
+
+/// Match the exact right-to-left CommonJS bridge used by Ajv and similar
+/// packages: `module.exports = exportsParam = value`.
+///
+/// The outer runtime assignment must remain in place: evaluating its left-hand
+/// reference before `value` is part of JavaScript assignment order. We only
+/// hoist an uninitialized local declaration, then the binding-wide rename below
+/// turns the inner factory-parameter write into a write to that local without
+/// reordering either assignment.
+fn commonjs_exports_alias_chain_initializer_mut<'a>(
+    expr: &'a mut Box<Expr>,
+    kind: FactoryRuntimeParameter,
+    target: &BindingId,
+    unresolved_mark: Mark,
+) -> Option<&'a mut Box<Expr>> {
+    if kind != FactoryRuntimeParameter::Exports {
+        return None;
+    }
+    let Expr::Assign(outer) = strip_parens_mut(expr) else {
+        return None;
+    };
+    if outer.op != AssignOp::Assign
+        || !is_unresolved_module_exports_target(&outer.left, unresolved_mark)
+    {
+        return None;
+    }
+    let Expr::Assign(inner) = strip_parens_mut(&mut outer.right) else {
+        return None;
+    };
+    if inner.op != AssignOp::Assign
+        || !simple_assignment_ident(&inner.left)
+            .is_some_and(|ident| ident.sym == target.0 && ident.ctxt == target.1)
+    {
+        return None;
+    }
+    Some(&mut inner.right)
+}
+
+fn is_unresolved_module_exports_target(target: &AssignTarget, unresolved_mark: Mark) -> bool {
+    let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = target else {
+        return false;
+    };
+    matches!(member.obj.as_ref(), Expr::Ident(module)
+        if module.sym.as_ref() == "module" && module.ctxt.outer() == unresolved_mark)
+        && matches!(&member.prop, MemberProp::Ident(exports) if exports.sym.as_ref() == "exports")
 }
 
 fn take_leading_parameter_assignment(
@@ -1188,6 +1387,21 @@ fn var_binding_item(local: Ident, initializer: Box<Expr>) -> ModuleItem {
     })
 }
 
+fn var_binding_declaration_item(local: Ident) -> ModuleItem {
+    var_decl_item(VarDecl {
+        span: DUMMY_SP,
+        ctxt: SyntaxContext::empty(),
+        kind: VarDeclKind::Var,
+        declare: false,
+        decls: vec![VarDeclarator {
+            span: DUMMY_SP,
+            name: Pat::Ident(BindingIdent::from(local)),
+            init: None,
+            definite: false,
+        }],
+    })
+}
+
 fn expr_item(expr: Box<Expr>) -> ModuleItem {
     ModuleItem::Stmt(Stmt::Expr(ExprStmt {
         span: DUMMY_SP,
@@ -1246,7 +1460,7 @@ fn fresh_dependency_name(used_names: &mut HashSet<Atom>) -> Atom {
     }
     let mut suffix = 2usize;
     loop {
-        let candidate = Atom::from(format!("_dependency{suffix}"));
+        let candidate = Atom::from(format!("_dependency_{suffix}"));
         if used_names.insert(candidate.clone()) {
             return candidate;
         }
@@ -1472,4 +1686,24 @@ pub(super) fn numeric_id_from_expr(expr: &Expr) -> Option<usize> {
         return None;
     }
     Some(value as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_names_use_delimited_suffixes() {
+        let mut runtime_names = HashSet::from_iter([Atom::from("_value")]);
+        assert_eq!(
+            fresh_runtime_value_name(&Atom::from("value"), &mut runtime_names),
+            "_value_2"
+        );
+
+        let mut dependency_names = HashSet::from_iter([Atom::from("_dependency")]);
+        assert_eq!(
+            fresh_dependency_name(&mut dependency_names),
+            "_dependency_2"
+        );
+    }
 }

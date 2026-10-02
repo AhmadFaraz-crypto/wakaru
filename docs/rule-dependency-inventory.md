@@ -55,11 +55,45 @@ UnWebpackInterop (pass 1, soft) ────────────────
                                        UnWebpackInterop2
 ```
 
+UnAssignmentMerging owns safe chained-assignment normalization, including
+pure `void <number>` values when RemoveVoid cannot introduce `undefined`.
+Its CommonJS receiver checks allow static stores on one `module.exports`
+object while retaining chains that would need a receiver or value capture.
+UnEsm does not duplicate this splitter. It recovers a remaining top-level
+named-export chain as one operation: a repeatable value (identifier,
+primitive literal, `void <number>`) is stored per target; a function or
+arrow expression, or a `require("literal")` call, is evaluated once into a
+fresh `var` named after the innermost free export name, and every target,
+including a `module.exports` slot or resolved local head, stores that
+binding, so recovered exports stay snapshots. Creating a function runs no
+code, and the require form takes the same provider-ordering deviation as the
+single `exports.name = require(...)` recovery (`import_hoisting_eagerness`),
+so no module-wide receiver analysis is needed. A call rooted, through static
+keys, at a provider binding (a top-level `require("literal")` declarator or a
+static member of one, declared once and never written) with repeatable
+arguments other than the wrapper bindings takes the same stored path at the
+chain's own position (`chain_receiver_reference_order`); the binding-use walk
+that qualifies provider bindings runs only when such a chain is present. Any
+other effectful value stays whole.
+`module.exports = exports.default = value` becomes the default-export mirror
+pair. The normalization skips a module with direct eval or `with`, because
+the recovered exports become module bindings. A chain UnEsm cannot recover
+this way (an effectful non-function value, inside control flow or an
+initializer, a non-static key or the `exports` key, a `module.exports.default`
+mirror, several targets beside a default, or other target kinds) keeps the
+whole module at the CommonJS boundary before import/export classification.
+The coupled form
+`module.exports = exports = value` is not a named-export chain (its inner
+target is the `exports` binding) and keeps its separate whole-module
+recovery. A single static export followed only by resolved local assignments
+stays on the existing classification path, preserving enum and decorator
+recovery.
+
 Other hard chains (consumer directly matches the producer's output shape):
 
 ```
-UnClassCallCheck ───┬→ UnEs6Class ──→ UnClassFields
-UnPossibleConstructorReturn ↗
+UnPossibleConstructorReturn → UnEs6Class ──→ UnClassFields
+UnPrototypeClass ───────────→ UnClassCallCheck2
 ArgRest ────────────→ UnRestArrayCopy
 ArrowFunction ──────→ ArrowReturn
 UnWebpackDefineGetters → UnWebpackObjectGetters
@@ -69,6 +103,7 @@ UnOptionalChaining ─┘
 UnToConsumableArray ┐
 UnArgumentSpread ───┼→ UnSpreadArrayLiteral
 UnArrayConcatSpread ┘
+UnParameters → UnArrayConcatSpreadRest → UnSpreadArrayLiteral2 → UnEs6Class
 FlipComparisons ──┐
 RemoveVoid ───────┼→ UnParameters
 UnConditionals ───┤
@@ -106,15 +141,24 @@ rationale, or level gating appear.
   than duplicating that logic. Level-gated to `standard` (assumption
   `set_computed_properties`).
 - **SimplifySequence** — runs first among the rules that assume flat input;
-  nearly everything downstream assumes flat statement lists. Drops provably side-effect-free bare expressions
-  (guarded by `unresolved_mark` for call purity). Test pitfall: a bare
-  literal statement (`65536;`) is dropped as dead — use `const x = 65536;`.
+  nearly everything downstream assumes flat statement lists. It keeps every
+  split statement, including one that does nothing: an expression that was
+  already dead in the input stays dead in the output. A rule that would leave
+  a bare value behind when it removes a statement must drop that value
+  itself, where it can tell the value came from its own rewrite.
 - **FlipComparisons** — normalizes literals to the right-hand side.
   UnParameters pattern-matches `arg === undefined` with the literal on the
   right.
 - **RemoveVoid** — conditional execution: `should_run()` bails if the module
-  declares a local `undefined` binding. UnParameters, UnOptionalChaining, and
-  UnUndefinedInit all match the `undefined` identifier, not `void 0`.
+  declares a local `undefined` binding, or contains `with` or a direct `eval`
+  that could bind the name (the module-wide skip in
+  [Rewrite assumptions](rewrite-assumptions.md#dynamic-scope-limits); a known
+  eval source string blocks only when it mentions the name).
+  UnParameters, UnOptionalChaining, and UnUndefinedInit all match the
+  `undefined` identifier, not `void 0`, so a skipped module keeps `void 0` and
+  those rules see nothing to recover.
+- **UnInfinity** — conditional execution: `should_run()` bails on the same
+  conditions as RemoveVoid, for a local `Infinity` binding.
 - **UnIndirectCall** — level-gated by shape: `minimal` removes only
   indirect-call wrappers around direct identifier callees (`(0, fn)()` →
   `fn()`), excluding `eval` and calls inside `with`. Member callees and
@@ -136,8 +180,13 @@ rationale, or level gating appear.
   [helper-detection.md](helper-detection.md).
 - **UnObjectRest** — heuristic: a backward scan absorbs property accesses
   into the rest pattern; needs flat statements and dot notation.
-- **UnClassCallCheck / UnPossibleConstructorReturn** — remove guard calls and
-  return indirection so UnEs6Class sees clean constructor bodies.
+- **UnClassCallCheck / UnPossibleConstructorReturn** — UnPossibleConstructorReturn
+  removes return indirection so UnEs6Class sees constructor bodies.
+  UnClassCallCheck removes a classCallCheck call only when it already sits in
+  class syntax, so UnClassFields sees field initializers first. Plain
+  functions keep the no-`new` throw. UnClassCallCheck2
+  runs after UnPrototypeClass and strips guards that class recovery copied
+  into a constructor.
 
 ### Structural restoration
 
@@ -161,9 +210,39 @@ rationale, or level gating appear.
   `minimal` and `standard` preserve literal receivers.
 - **UnEsmoduleFlag** — removes `__esModule` flag statements; confirmed UnEsm
   prerequisite (export classification noise).
-- **UnAssignmentMerging** — splits `a = b = val`; confirmed UnEsm
-  prerequisite: `exports.foo = exports.bar = val` must be split before named
-  export detection. Also feeds UnVariableMerging.
+- **UnAssignmentMerging** — splits `a = b = val` into one statement per
+  target, innermost first (`b = val; a = val;`), which is the order the
+  chained form commits its writes (own setters, a throwing `const` write).
+  Splitting also moves each target's reference evaluation next to its write,
+  so a target is accepted only when that evaluation can neither throw nor
+  change between the writes: a plain identifier, or a member rooted at the
+  CommonJS wrapper bindings `module`, `exports`, `require`, with identifier,
+  private-name, or string/number literal keys. Receivers containing another
+  member read (`module.exports.x`, `exports.box.flag`) keep the chain: an inner
+  write may replace the intermediate object even with ordinary data properties.
+  Everything else keeps the chain at every level: a local root may be in TDZ
+  (`root.x = inner = 1; let root = {}` throws before `inner` is written) or be
+  reassigned by an inner setter, `this` throws before `super()` in a derived
+  constructor, an undeclared global root throws, computed keys may run code,
+  call receivers reorder calls. The value is evaluated once per split
+  statement, so an identifier value (other than `undefined`) is accepted only
+  when no write can change it: identifier targets must be resolved bindings
+  or CommonJS names, and CommonJS-rooted member targets rely on
+  `commonjs_exports_data_properties` (a setter on the module's own `exports`
+  could reassign the value; accepted, not proven). An undeclared global
+  identifier target may be a global-object accessor and splits only with a
+  literal value. (The webpack unpacker's localized reused parameter,
+  `var _publicValue`, now carries a non-unresolved context for this reason.) The remaining chains (`t.prototype.a = t.prototype.b = fn`,
+  `o[A] = o[B] = true`, TypeScript's `ns.A = ns.B = void 0` on a local
+  namespace object) are source form, not minifier output: swc's
+  `merge_sequential_expr` (and terser's `collapse_vars`, from memory) only
+  build a chain whose inner target is an identifier, and TypeScript
+  synthesizes the `exports` chain against an object it owns. A `standard`
+  same-root extension under a new setter assumption was considered and not
+  taken for that reason (2026-09-06). Confirmed UnEsm prerequisite:
+  `exports.foo = exports.bar = val` must be split before named export
+  detection, and UnEsm's coupled `module.exports = helper = val` recovery
+  re-merges the innermost-first pair. Also feeds UnVariableMerging.
 - **UnVariableMergingDeclsOnly vs UnVariableMerging** — the decls-only subset
   runs early as a confirmed UnEsm prerequisite (one declarator per statement
   so CJS imports classify); the full pass stays later because its for-loop
@@ -182,17 +261,41 @@ rationale, or level gating appear.
   helper-dependent recovery so helper body scanners see canonical
   `Object.freeze(...)` / `Object.defineProperty(...)` calls. `standard+`
   only: relies on `stable_builtins`, rejects `var` aliases with use-before-init,
-  writes (including `++`/`delete`), redeclarations, or dynamic-scope constructs
-  instead of proving full var→const convertibility.
+  writes (including `++`/`delete`), or redeclarations instead of proving full
+  var→const convertibility, and skips the whole module for every declaration
+  kind when a `with` or direct `eval` is present (the dynamic-scope skip).
 - **UnArgumentSpread** — `standard+`. Pattern subtleties:
   `fn.apply(null, args)` and `obj.fn.apply(obj, args)` are safe;
   `obj.fn.apply(null, args)` is *intentionally skipped* — rewriting it to
   `fn(...args)` is not semantics-preserving without cross-module proof that
   the member is a plain imported function (candidate fact reader).
-- **UnArrayConcatSpread** — `standard+`: `[a].concat(b)` → `[a, ...b]` is not
-  strictly equivalent for scalars, strings, patched `concat`, or
-  `Symbol.isConcatSpreadable`; the useful generated shape is
-  `[fixed].concat(args)`.
+  A memoized receiver `(t = expr).fn.apply(t, args)` becomes
+  `expr.fn(...args)` only when `TempIsolation` accepts dropping the write
+  (every use of `t` is in that call); otherwise `(t = expr)` stays on the
+  callee object. A temp reused by two sites therefore keeps both writes.
+- **UnTemplateLiteral** — level gating is per path, not per rule (the rule is
+  always enabled because tagged-template helper recovery is provenance-checked
+  and runs at every level). The `+`-chain path (`string_coercion_hint`) and the
+  `.concat`-chain path (`concat_coercion_order`) are `standard+` for arbitrary
+  substitutions; at `minimal` both rewrite only when every substitution is a
+  primitive by syntax. The plus-chain path was deliberately kept at `standard`
+  rather than demoted to `aggressive`: Babel loose and TypeScript ≤ 4.4 lower
+  templates to plain concatenation, and the private fixtures recover ~3,000
+  templates through it.
+- **UnArrayConcatSpread** — array-literal arguments flatten at every level.
+  An arbitrary concat argument becomes a spread only at `aggressive`, under
+  `concat_arguments_are_arrays`; scalars, strings, and general iterables do
+  not share concat's spread semantics. At `standard`, the later
+  **UnArrayConcatSpreadRest** pass admits only existing rest parameters,
+  canonical Babel/TypeScript `arguments`-copy arrays, and bindings initialized
+  with a hole-free array literal, and only when every use after initialization
+  is an intrinsic-concat operand (an argument of an Array receiver, or the
+  receiver of its own `.concat`). Calls to functions whose whole body returns
+  a hole-free array literal count as Arrays when every use of the function is
+  a direct call. It runs before
+  UnEs6Class, followed by a second UnSpreadArrayLiteral pass, so a proven
+  `[this].concat(args)` can expose `Base.call.apply(Base, [this, ...args])`
+  without restoring the unsafe general heuristic.
 - **UnNullishCoalescing** — pattern-level gating: strict null checks
   (`x === null || x === undefined`) run at all levels; loose
   `x != null ? x : y` requires `standard+` (assumes `no_document_all`);
@@ -208,7 +311,8 @@ rationale, or level gating appear.
   (`_obj.method == null ? undefined : _obj.method(arg)` → `obj?.method?.(arg)`)
   require `aggressive` (assumes stable property reads). Shares
   structural-equality helpers with UnNullishCoalescing. Must run before
-  UnConditionals.
+  UnConditionals, which turns the statement form `x == null || x.m()` into
+  an `if`; that form goes through the same ternary matchers and gates.
 
 ### Bundler artifacts and module system
 
@@ -226,11 +330,31 @@ rationale, or level gating appear.
   CommonJS live getters (`get: () => dep.member`) become source re-exports
   only when `dep` is a resolver-proven top-level literal `require()` binding
   and every use is a static member read; writes, dynamic reads, and escapes
-  preserve the getter form.
+  preserve the getter form. Static named CommonJS writes inside control-flow
+  statements that run during module activation become module-scoped live ESM
+  bindings; reads and later writes to the same property follow that binding.
+  A write found only in a function, constructor, or instance field does not
+  trigger recovery. Bare receiver uses, dynamic keys, receiver replacement,
+  unsupported writes, direct eval/`with`, self-require, pre-existing ESM
+  exports, or another CommonJS member access that would survive conversion
+  preserve the whole CommonJS boundary. The synthesized declarations use
+  fresh resolver contexts and collision-free emitted names, and precede
+  VarDeclToLetConst so that rule decides their final declaration kind.
+  A leading statement-level `exports.name = void 0` or unresolved
+  `undefined` sentinel is omitted once recovery creates the same uninitialized
+  binding, provided its prefix contains only directives, imports, hoisted
+  function declarations, statically classified require declarations, and
+  other sentinels. Later or effectful initializers remain.
+  Ordinary `exports.public = local` assignments keep CommonJS snapshot
+  semantics when `local` has any direct or deferred write: UnEsm captures its
+  value at the assignment instead of emitting a live export alias. A proven
+  `Object.defineProperty` or webpack getter remains live.
 - **UnIife** — two passes; the second catches IIFEs created by SmartInline.
   Exposes class IIFEs for UnEs6Class and enum IIFEs for UnEnum. Gating:
   param cleanup and literal hoisting are `standard+`; `.call()` unwrapping on
-  arrows runs at all levels.
+  arrows runs at all levels. Positional argument/parameter pairing stops at
+  the first spread argument: its runtime length makes later syntactic
+  positions unknown, so only arguments before it are extracted or renamed.
 
 ### Complex pattern restoration
 
@@ -239,12 +363,34 @@ rationale, or level gating appear.
   to statements; switch recovery is limited to strict equality over one
   identifier with literal cases. The second pass is the final pipeline rule:
   SmartInline, ArrowFunction/ArrowReturn, and UnReturn expose conditionals
-  the first pass could not see.
+  the first pass could not see. Only the second pass (and its counterpart in
+  the unpack cleanup tail) also converts actions nested under `&&`, `||`, or
+  a ternary, such as `a && (b ? f() : g())`: UnEs6Class matches the inlined
+  `_inherits` tail `t && (Object.setPrototypeOf ? ... : ...)` in that
+  expression form, so the first pass must leave it alone.
 - **UnParameters** — needs the shapes produced by FlipComparisons,
   RemoveVoid, UnConditionals, and UnCurlyBraces. Pattern A
   (`if (arg === undefined) arg = val`) runs at all levels; `arguments[i]`
   reconstruction, object-alias defaults, and destructured-alias folding are
-  `standard+`. Pitfall: `stmts_reference_ident` matches by *emitted name*,
+  `standard+`. Pattern A bails when the function or a nested arrow can
+  observe the `arguments` mapping that a simple parameter list keeps
+  (`arguments.length` and literal tail indexes are fine; other uses and direct
+  `eval` are not), so a TypeScript rest-parameter copy loop blocks the first
+  pass and UnParameters2 recovers the default after ArgRest has replaced the
+  loop. Guards convert in ascending parameter order within the first 15
+  statements; a guard that follows other statements converts only when the
+  default is side-effect-free (literals, function values, `this`, identifier
+  reads, structures of those; property reads at `standard+`), no skipped
+  statement or hoisted function declaration mentions the parameter, and every
+  value the default reads is stable across the skipped statements: a parameter
+  it reads must not be written there (directly, by `++`, or by a closure
+  created there), and an outer binding, global, or property read requires the
+  skipped statements to be inert declarations (`var _this = this;`, `let t;`,
+  and at `standard+` object destructuring declarations). A parameter read or
+  written before its guard (ws `ping`, commander `_prepareUserArgs`) keeps the
+  guard, and so does `seed = 1; if (a === void 0) a = seed;`.
+  `Function.length` still drops to the first default's index; that arity
+  change is accepted. Pitfall: `stmts_reference_ident` matches by *emitted name*,
   ignoring SyntaxContext — intentional (prevents invalid parameter lists
   after rewriting) but can make folds bail when an alias was inlined to a
   short parameter name.
@@ -253,7 +399,9 @@ rationale, or level gating appear.
   TypeScript CommonJS publication form using the resolver-proven free `exports`
   binding. Split declarations are accepted only when intervening code touches
   neither the local nor public binding, and recovery is rejected when later
-  code references the same public `exports` member. Local and exported enum
+  code references the same public `exports` member, or when anything besides
+  the IIFE argument writes or redeclares the local (the live
+  `export { Local as Public }` would leak the write). Local and exported enum
   recovery both require literal values: computed member initializers are
   preserved because an object-literal rewrite can otherwise duplicate
   evaluation or observe the enum before publication. Numeric forward/reverse
@@ -269,8 +417,18 @@ rationale, or level gating appear.
 - **UnJsx** — detects pragma imports via `unresolved_mark`. Dynamic-tag alias
   synthesis (creating `const Component = expr` for non-identifier tags)
   requires `aggressive`, or `standard` with strong JSX shape evidence.
-- **UnEs6Class** — needs UnClassCallCheck, UnPossibleConstructorReturn, and
-  UnIife (class IIFE wrappers). Static *method* assignment recovery is part
+- **UnEs6Class** — needs UnPossibleConstructorReturn and
+  UnIife (class IIFE wrappers). It clones constructor bodies, so a
+  classCallCheck statement inside the constructor survives recovery and is
+  removed by UnClassCallCheck2 once the result is class syntax. A guard that
+  names the inner constructor (the second argument of a helper call or IIFE,
+  or the `instanceof` operand of a guard inlined as an `if` with Babel's
+  message) is removed at commit time so that reference does not reject
+  recovery. A class whose minifier spliced the wrapper body into the
+  enclosing statement list (`e = function e() {…}; …; var n = e`) is rebuilt
+  as that IIFE first, only when the constructor and methods temporaries are
+  referenced nowhere outside the run; a rebuild that does not convert is
+  discarded. Static *method* assignment recovery is part
   of class restoration; static *data field* recovery
   (`Ctor.x = value` → `static x = value`) requires `standard+` and is
   skipped for derived classes — inherited static setters make assignment
@@ -286,6 +444,22 @@ rationale, or level gating appear.
   `__esModule` patterns UnEsm needs for getter detection). Recovery exposes
   new shapes for the late UnObjectRest, UnArgumentSpread, and
   UnWebpackInterop passes.
+  Both it and UnRegenerator rebuild control flow through
+  `rules/state_machine.rs`: try regions nest (a region inside another
+  region's try, catch, or finally part is rebuilt inside that part), and
+  `if (!test) goto END; body; update; goto HEAD` runs become `for` loops in
+  every flattened label range, including try parts and folded branches. Loop
+  recovery is label-aware: statements at or after the back-edge target that
+  precede the guard are the loop head and move into the body ahead of an
+  `if (test) break;` (Terser splits a `sent()` consumer from its guard, which
+  puts the awaited `next()` there), and a folded branch only rebuilds loops
+  whose back-edge target lies strictly inside the branch, so a loop's own
+  exit guard is never folded into an `if` around it. A bare back-edge with
+  no exit guard is a `for (;;)` loop over the statements since its target,
+  including a back-edge to label 0 (a loop at the top of the function). An
+  early `return` nested in a branch (`if (c) return [2, value]`) decodes in
+  place, since the value-return opcode carries no label semantics. A decode
+  that still leaves a jump opcode fails closed and keeps the machine.
 
 ### Modernization
 
@@ -297,19 +471,45 @@ rationale, or level gating appear.
   that is later written ships a runtime `TypeError`.
 - **ArgRest → UnRestArrayCopy** — hard chain: UnRestArrayCopy detects the
   Babel copy loop for rest params that ArgRest just created. ArgRest is
-  `standard+`.
+  `standard+`. Nested arrows read the enclosing function's `arguments`, so
+  they are checked and rewritten with the body; nested regular functions and
+  class constructors have their own `arguments` and are skipped (a constructor
+  is a separate AST node, not a `Function`). A parameter initializer that
+  mentions `arguments` blocks the rewrite. The fresh rest name is `args`, or
+  `args_1`, `args_2`, ... when the body or parameter list already spells that
+  identifier anywhere (a declaration or a reference to an outer binding),
+  since printed code has no `SyntaxContext` to keep them apart. A reused copy
+  binding gets the same check: if another binding shares its name, choose an
+  unused suffix and rename only the copy binding and its resolved references
+  before removing the loop. This applies to functions and constructors.
 - **ObjMethodShorthand / ArrowFunction** — both consult the shared
   constructor-sensitive value analysis before replacing ordinary function
   values with non-constructible method or arrow syntax. The analysis recognizes
-  `new`, `Reflect.construct`, `extends`, `instanceof`, and `.prototype`, then
-  propagates requirements backward through exact static-member aliases. Plain
-  binding aliases also carry member suffixes (`alias = namespace; new alias.C()`
+  `new`, `Reflect.construct`, `extends`, `instanceof`, `.prototype`, and the
+  first argument of a proven `createClass` helper (runtime-path import,
+  same-module helper body, or unresolved `_createClass`), then propagates
+  requirements backward through exact static-member aliases. Plain binding
+  aliases also carry member suffixes (`alias = namespace; new alias.C()`
   protects `namespace.C`) without recursively extending cyclic member paths.
   Both the use-site marking and the alias graph walk the same value wrapper
   shapes the converters protect syntactically — parentheses, sequence results,
   conditional/logical branches, assignment results, and `.bind` targets — so
   `new (cond ? f : g)()` and `bound = f.bind(x); new bound()` protect the
-  underlying bindings. Aliases are also recorded for logical assignments
+  underlying bindings. The alias graph also follows an immediately invoked
+  synchronous function or arrow, including `(0, f)()`, `.call`, and `.apply`,
+  to every value its own `return` statements can produce, so
+  `Name = (function () { return ctor; })()` protects `ctor`. ArrowFunction
+  protects the same IIFE shapes syntactically: when the IIFE's result is
+  constructor-sensitive, a function expression it returns directly stays
+  ordinary, while the callee itself and functions nested in it may still
+  convert. After the fixpoint, each sensitive member key is copied once onto
+  the member aliases of its root binding (`Word = ns.Word = extend({...});
+  new Word.init()` protects `ns.Word.init`); those copies are not propagated
+  further. ObjMethodShorthand also checks an inline object argument of a call
+  against the call result's keys and the receiver's key
+  (`call_result_exposes_argument_properties`): `Word = extend({ init })`
+  checks `Word.init`, and `Lib.mixin({ make })` checks `Lib.make`.
+  Aliases are also recorded for logical assignments
   (`cached ||= ctor`) and object-destructuring bindings (`const { C } = ns`,
   including renames, nested patterns, defaults, and rest bindings). A shared
   pattern-default walker keeps the analysis and both mutators aligned for
@@ -317,12 +517,30 @@ rationale, or level gating appear.
   defaults and destructured object-literal values stay ordinary functions.
   Logical-assignment object values receive the same contextual member keys as
   plain assignments.
+  ArrowFunction also pairs arguments of literal function/arrow callees with
+  simple resolved parameters when no spread obscures their positions. Inline
+  function arguments passed to constructor-sensitive parameters stay ordinary
+  functions; unrelated callback arguments remain eligible for arrow recovery.
   ObjMethodShorthand is always enabled; its other eligibility checks remain
-  unchanged.
+  unchanged. It also never converts a `constructor` key, without consulting
+  the analysis: class-system helpers (`extend(Base, { constructor })`) return
+  that property as the class, and `new this.constructor()` reads it from a
+  prototype object, so its construction is usually invisible to the module.
+- **Function-to-class callability guards** — IIFE return aliases are recorded
+  for both variable initializers and later plain assignments, and so are plain
+  identifier aliases (`var a = Foo`). A constructor passed through any of these
+  to a binding used with `.call`/`.apply` remains an ordinary function until
+  that call is consumed by a proven rewrite. In multi-module unpack, exports
+  another module still calls are seeded as required roots from
+  `CallRequiredPlan` (see fact-system.md).
 - **ArrowFunction → ArrowReturn** — hard chain. ArrowFunction is `standard+`
   even though it checks known blockers (`this`, `arguments`, named function
   expressions, `new.target`, and ordinary-function values required by `new`,
-  `Reflect.construct`, `extends`, `instanceof`, or `.prototype` observation).
+  `Reflect.construct`, `extends`, `instanceof`, `.prototype` observation, or
+  a `createClass` helper's first argument).
+  The `this`/`arguments`/`new.target`/direct-eval checks cover parameter
+  initializers and destructuring defaults as well as the body; both run in
+  the function's own activation.
   Arrows lack `prototype` and cannot be constructed, so broad conversion is not
   a `minimal`-safe transform.
 - **UnForOf** — `standard+`. TypeScript/Babel/SWC helper recovery is
@@ -334,10 +552,28 @@ rationale, or level gating appear.
   compares candidate-local uses with the module-wide binding index so it bails
   if the iterator/result bindings escape any enclosing block or the iterator is
   used in the loop body.
+  `for await` recovery (`rules/un_for_await.rs`) runs from the same statement
+  walk and depends on three earlier rules: `UnRegenerator`/`UnAsyncAwait`
+  must have restored `await` in the loop head (the protocol test is
+  `!(step = await it.next()).done`), `UnVariableMerging` must have hoisted
+  the loop-head declarators into statements, and `UnConditionals` must have
+  turned the Terser `a && b && (await c())` close guard into an `if`. The
+  adapter callee gates the rewrite: Babel/SWC `_asyncIterator`
+  (`TranspilerHelperKind::AsyncIterator`), tslib `__asyncValues`
+  (`TsHelperKind::AsyncValues`), or esbuild's `__forAwait` matched by shape.
+  Dependency-aware helper cleanup (`AsyncFromSyncIterator`, `__knownSymbol`)
+  runs before the tslib inline cleanup so the adapter is still declared when
+  the reference graph is walked. A lexical element that shares a printed
+  name with the iterable is renamed inside the loop (`for (const e of e)`
+  would evaluate the iterable in the element's TDZ); this applies to every
+  for-of recovery path, not only `for await`.
 - **UnUndefinedInit** — needs RemoveVoid; feeds VarDeclToLetConst.
 - **UnPrototypeClass** — runs before ArrowFunction so Closure Compiler's
   single-declarator anonymous function initializers remain available for class
-  recovery. It also accepts ordinary function declarations. Nested candidates
+  recovery. It also accepts ordinary function declarations. A constructor sharing
+  an enclosing function parameter name stays in prototype form: replacing its
+  function declaration with a lexical class would make the body invalid. This
+  guard applies to the direct function body, not independently nested scopes. Nested candidates
   must have reached `const` through VarDeclToLetConst; module-level Closure
   variables are handled in place. Function-variable candidates with exact-binding
   pre-references (including references captured by earlier closures), multiple
@@ -376,7 +612,11 @@ rationale, or level gating appear.
   `stable_builtins`); index-based destructuring grouping (`obj[0]`, `obj[1]`
   → array destructuring) is `aggressive`.
 - **MergeDeclarationInit** — runs after SmartInline and UnDestructuring so their
-  assignment-form temporaries remain available. After all statement-list and
+  assignment-form temporaries remain available. Adjacent top-level anonymous
+  class assignments can merge when class creation has no user-code execution
+  and the class does not reference the outer binding. This exposes an immutable
+  initializer for UnExportRename2 without relaxing export write guards.
+  After all statement-list and
   narrow top-level merges, it performs one module-wide resolved-write pass and
   promotes only the merged `let` bindings with no remaining direct write or
   relevant direct-eval source. The batched pass closes the ordering gap after

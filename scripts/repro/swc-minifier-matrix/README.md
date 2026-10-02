@@ -20,8 +20,9 @@ Rows marked `no` or `info-miss` are investigation findings and do not make the
 script exit non-zero. The script exits non-zero only when SWC or Wakaru cannot
 run.
 
-The matrix installs `@swc/core@1` under `target/repro-tools/swc-minifier/`.
-Set `WAKARU` to test a specific binary:
+The matrix installs the `@swc/core` release pinned in `lib/runner.mjs`
+(`SWC_CORE_VERSION`) in the shared repro tool cache (`docs/testing.md`). Set
+`WAKARU` to test a specific binary:
 
 ```powershell
 $env:WAKARU = "$PWD\target\debug\wakaru.exe"
@@ -32,9 +33,27 @@ Rows are grouped by distinct lowered output per snippet. The grouping key only
 normalizes CRLF to LF and trims leading/trailing whitespace, so exact minifier
 shape is preserved while duplicate tool outputs are collapsed.
 
-Some rows are informational. Constant folding and full inlining can erase the
-original structure, so those rows document what Wakaru currently emits rather
-than implying a reversible source recovery is expected.
+The `babel-<version>-class-*` rows lower ES classes with Babel `preset-env`
+(IE 11) first, then minify Babel's output with each SWC profile. SWC inlines
+the single-use `_createClass`, `_defineProperties`, and `_classCallCheck`
+helpers into the class, which is the shape these rows track. The helper
+bodies (for example, whether `_defineProperties` routes keys through
+`_toPropertyKey`) come from `@babel/helpers` and the class plugin, not from
+core. The shared tool installer resolves each pinned Babel release's
+dependencies as of its publish date, so each row lowers with that release's
+own helpers and plugins.
+
+The class rows skip the `inline-iife` profile. It turns every other compress
+default off, so constant folding and dead-code removal never finish the
+`_createClass` expansion (`if (protoProps) _defineProperties(...)` stays). SWC's
+default compress options fold that half-inlined shape away (the `all` profile).
+
+Some rows are informational (`informational: true`). Constant folding and full
+inlining can erase the original structure, so those rows document what Wakaru
+currently emits rather than implying a reversible source recovery is expected.
+They report `info-yes` or `info-miss` and stay out of the recovery rate either
+way; `collect-stats.mjs` records their count as `info`. An execution
+divergence on an informational row still reports `no`.
 
 ## Promoting Findings
 

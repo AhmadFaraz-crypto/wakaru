@@ -5,7 +5,7 @@ use swc_core::common::{sync::Lrc, FileName, Mark, SourceMap, SyntaxContext, GLOB
 use swc_core::ecma::ast::{BindingIdent, Decl, EsVersion, Function, ModuleItem, Pat, Stmt};
 use swc_core::ecma::parser::{lexer::Lexer, EsSyntax, Parser, StringInput, Syntax};
 use swc_core::ecma::transforms::base::resolver;
-use swc_core::ecma::visit::VisitMutWith;
+use swc_core::ecma::visit::{Visit, VisitMutWith, VisitWith};
 use wakaru_core::{rules::UnParameters, RewriteLevel};
 
 fn apply(input: &str) -> String {
@@ -1570,6 +1570,94 @@ function greet() {
     );
 }
 
+#[test]
+fn placeholder_param_declaration_and_references_share_one_context() {
+    // No body declaration names the second argument, so the rule invents
+    // `_param_1`. Both reads must resolve to the one parameter it declares:
+    // a reference with a different context would be invisible to every later
+    // `(sym, ctxt)`-keyed pass, and a rename of the parameter would leave it
+    // behind as a free name.
+    let input = r#"
+function foo(a) {
+  use(arguments.length > 1 ? arguments[1] : void 0);
+  use(arguments.length > 1 ? arguments[1] : void 0);
+  return a;
+}
+"#;
+    let expected = r#"
+function foo(a, _param_1) {
+  use(_param_1);
+  use(_param_1);
+  return a;
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+
+    let ctxts = ident_contexts_after_rule(input, "_param_1");
+    assert_eq!(
+        ctxts.len(),
+        3,
+        "one declaration and two references: {ctxts:?}"
+    );
+    assert!(
+        ctxts.iter().all(|ctxt| *ctxt == ctxts[0]),
+        "declaration and references must share one context: {ctxts:?}"
+    );
+    assert_ne!(ctxts[0], SyntaxContext::empty());
+}
+
+fn ident_contexts_after_rule(input: &str, name: &str) -> Vec<SyntaxContext> {
+    struct Contexts<'a> {
+        name: &'a str,
+        found: Vec<SyntaxContext>,
+    }
+    impl Visit for Contexts<'_> {
+        fn visit_ident(&mut self, ident: &swc_core::ecma::ast::Ident) {
+            if ident.sym == self.name {
+                self.found.push(ident.ctxt);
+            }
+        }
+    }
+
+    GLOBALS.set(&Default::default(), || {
+        let mut module = parse_and_resolve(input);
+        let unresolved_mark = module.1;
+        module.0.visit_mut_with(&mut UnParameters::new(
+            unresolved_mark,
+            RewriteLevel::Standard,
+        ));
+        let mut contexts = Contexts {
+            name,
+            found: Vec::new(),
+        };
+        module.0.visit_with(&mut contexts);
+        contexts.found
+    })
+}
+
+fn parse_and_resolve(input: &str) -> (swc_core::ecma::ast::Module, Mark) {
+    let cm: Lrc<SourceMap> = Default::default();
+    let fm = cm.new_source_file(
+        FileName::Custom("fixture.js".to_string()).into(),
+        input.to_string(),
+    );
+    let lexer = Lexer::new(
+        Syntax::Es(EsSyntax {
+            jsx: true,
+            ..Default::default()
+        }),
+        EsVersion::latest(),
+        StringInput::from(&*fm),
+        None,
+    );
+    let mut parser = Parser::new_from(lexer);
+    let mut module = parser.parse_module().expect("input should parse");
+    let unresolved_mark = Mark::new();
+    let top_level_mark = Mark::new();
+    module.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, false));
+    (module, unresolved_mark)
+}
+
 fn recovered_first_param_context(input: &str) -> (SyntaxContext, SyntaxContext) {
     GLOBALS.set(&Default::default(), || {
         let cm: Lrc<SourceMap> = Default::default();
@@ -1633,4 +1721,568 @@ fn first_param_context(function: &Function) -> SyntaxContext {
         panic!("expected identifier parameter");
     };
     id.ctxt
+}
+
+// --- defaults change `arguments` mapping and prologue order ---
+
+#[test]
+fn guard_stays_when_function_reads_mapped_arguments() {
+    // With a simple parameter list, `a = 2` also writes `arguments[0]`.
+    // A default parameter unmaps `arguments`, so `f(1)` would return 1.
+    let input = r#"
+function f(a) {
+  if (a === void 0) { a = 3; }
+  a = 2;
+  return arguments[0];
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+    assert_eq_normalized(&apply_with_level(input, RewriteLevel::Minimal), input);
+}
+
+#[test]
+fn guard_stays_when_nested_arrow_reads_mapped_arguments() {
+    let input = r#"
+function f(a) {
+  if (a === void 0) { a = 3; }
+  var g = () => arguments[0];
+  return g();
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn guard_stays_when_arguments_escapes() {
+    let input = r#"
+function f(a) {
+  if (a === void 0) { a = 3; }
+  return Array.prototype.slice.call(arguments);
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn guard_stays_when_direct_eval_may_read_arguments() {
+    let input = r#"
+function f(a) {
+  if (a === void 0) { a = 3; }
+  return eval(source);
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn tail_arguments_reads_do_not_block_default() {
+    // `arguments.length` and slots past the parameter list are never mapped.
+    let input = r#"
+function f(a) {
+  if (a === void 0) { a = 3; }
+  return [a, arguments.length, arguments[1]];
+}
+"#;
+    let expected = r#"
+function f(a = 3) {
+  return [a, arguments.length, arguments[1]];
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn nested_function_arguments_do_not_block_default() {
+    let input = r#"
+function f(a) {
+  if (a === void 0) { a = 3; }
+  return function() { return arguments[0]; };
+}
+"#;
+    let expected = r#"
+function f(a = 3) {
+  return function() { return arguments[0]; };
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn guard_after_observable_statement_stays() {
+    // `console.log(a)` runs before the guard and sees `undefined`; a default
+    // would run first and it would see 3.
+    let input = r#"
+function f(a) {
+  console.log(a);
+  if (a === void 0) { a = 3; }
+  return a;
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+    assert_eq_normalized(&apply_with_level(input, RewriteLevel::Minimal), input);
+}
+
+#[test]
+fn guards_out_of_parameter_order_convert_only_the_prefix() {
+    // Defaults evaluate in parameter order, so `a`'s impure default cannot
+    // move ahead of `b`'s once `b`'s guard has been converted.
+    let input = r#"
+function f(a, b) {
+  if (b === void 0) { b = g(); }
+  if (a === void 0) { a = h(); }
+  return a + b;
+}
+"#;
+    let expected = r#"
+function f(a, b = g()) {
+  if (a === void 0) { a = h(); }
+  return a + b;
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn arrow_guard_after_observable_statement_stays() {
+    let input = r#"
+const f = (a) => {
+  console.log(a);
+  if (a === void 0) { a = 3; }
+  return a;
+};
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+// --- hoisting a pure default past statements that cannot observe it ---
+
+#[test]
+fn pure_default_hoists_past_unrelated_prologue_statements() {
+    // TypeScript emits `var _this = this;` and hoisted declarations ahead of
+    // the guards; none of them mention `n`, and `[]` has no effects.
+    let input = r#"
+function f(e, n) {
+  var self = this;
+  let t;
+  if (!e) return;
+  if (n === void 0) { n = []; }
+  return [self, t, e, n];
+}
+"#;
+    let expected = r#"
+function f(e, n = []) {
+  var self = this;
+  let t;
+  if (!e) return;
+  return [self, t, e, n];
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+    assert_eq_normalized(&apply_with_level(input, RewriteLevel::Minimal), expected);
+}
+
+#[test]
+fn guard_stays_when_param_is_written_before_it() {
+    // ws-style: `K = undefined` runs before the guard, so the guard re-defaults
+    // a value the body cleared. A default parameter would not.
+    let input = r#"
+function f(q, K, _) {
+  if (typeof q === "function") {
+    _ = q;
+    q = K = undefined;
+  }
+  if (K === void 0) { K = !this._isServer; }
+  return [q, K, _];
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn guard_stays_when_param_is_read_before_it() {
+    let input = r#"
+function f(a) {
+  const seen = a;
+  if (a === void 0) { a = 3; }
+  return [seen, a];
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn guard_stays_when_closure_created_before_it_mentions_param() {
+    let input = r#"
+function f(a) {
+  const read = () => a;
+  if (a === void 0) { a = 3; }
+  return read;
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn guard_stays_when_hoisted_function_declaration_mentions_param() {
+    // `g` is hoisted, so `g()` before the guard may write `a`.
+    let input = r#"
+function f(a) {
+  g();
+  if (a === void 0) { a = 3; }
+  return a;
+  function g() { a = 5; }
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn impure_default_does_not_hoist_past_other_statements() {
+    let input = r#"
+function f(a) {
+  log("start");
+  if (a === void 0) { a = compute(); }
+  return a;
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn member_read_default_hoists_only_at_standard() {
+    // `this._isServer` is a property read: `pure_getters` at standard.
+    let input = r#"
+function f(a) {
+  let t;
+  if (a === void 0) { a = !this._isServer; }
+  return [t, a];
+}
+"#;
+    let expected = r#"
+function f(a = !this._isServer) {
+  let t;
+  return [t, a];
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+    assert_eq_normalized(&apply_with_level(input, RewriteLevel::Minimal), input);
+}
+
+#[test]
+fn object_literal_default_hoists_past_other_param_normalization() {
+    let input = r#"
+function f(a, b) {
+  if (typeof a === "string") { a = a.toUpperCase(); } else if (a === void 0) { a = "X"; }
+  if (b === void 0) { b = { parse: true }; }
+  return [a, b];
+}
+"#;
+    let expected = r#"
+function f(a, b = { parse: true }) {
+  if (typeof a === "string") { a = a.toUpperCase(); } else if (a === void 0) { a = "X"; }
+  return [a, b];
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn arrow_pure_default_hoists_past_unrelated_statement() {
+    let input = r#"
+const f = (a, b) => {
+  if (!a) return;
+  if (b === void 0) { b = false; }
+  return [a, b];
+};
+"#;
+    let expected = r#"
+const f = (a, b = false) => {
+  if (!a) return;
+  return [a, b];
+};
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+// --- the hoisted default must read the same values ---
+
+#[test]
+fn guard_stays_when_a_param_the_default_reads_is_written_before_it() {
+    // `seed = 1` runs before the guard, so the guard assigns 1. A default
+    // `a = seed` would read the call-time 0.
+    let input = r#"
+function f(seed, a) {
+  seed = 1;
+  if (a === void 0) { a = seed; }
+  return a;
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+    assert_eq_normalized(&apply_with_level(input, RewriteLevel::Minimal), input);
+}
+
+#[test]
+fn default_reading_an_untouched_param_hoists_past_unrelated_statement() {
+    let input = r#"
+function f(a, b) {
+  let t;
+  if (!a) return;
+  if (b === void 0) { b = a; }
+  return [t, b];
+}
+"#;
+    let expected = r#"
+function f(a, b = a) {
+  let t;
+  if (!a) return;
+  return [t, b];
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn guard_stays_when_default_reads_outer_binding_past_a_call() {
+    // `tick()` may write the module-level `counter` the default reads.
+    let input = r#"
+let counter = 0;
+function tick() { counter++; }
+function f(a) {
+  tick();
+  if (a === void 0) { a = counter; }
+  return a;
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn default_reading_outer_binding_hoists_past_inert_declarations() {
+    let input = r#"
+const defaults = { x: 1 };
+function f(a) {
+  var self = this;
+  let t;
+  if (a === void 0) { a = defaults; }
+  return [self, t, a];
+}
+"#;
+    let expected = r#"
+const defaults = { x: 1 };
+function f(a = defaults) {
+  var self = this;
+  let t;
+  return [self, t, a];
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+    assert_eq_normalized(&apply_with_level(input, RewriteLevel::Minimal), expected);
+}
+
+#[test]
+fn guard_stays_when_property_read_default_follows_a_property_write() {
+    let input = r#"
+function f(a) {
+  this.flag = true;
+  if (a === void 0) { a = !this.flag; }
+  return a;
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn guard_stays_when_global_read_default_follows_a_call() {
+    let input = r#"
+function f(a) {
+  configure();
+  if (a === void 0) { a = globalConfig; }
+  return a;
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn closure_default_hoists_past_a_call() {
+    // The arrow reads `counter` when it is called, not when the default runs.
+    let input = r#"
+let counter = 0;
+function f(a) {
+  tick();
+  if (a === void 0) { a = () => counter; }
+  return a;
+}
+"#;
+    let expected = r#"
+let counter = 0;
+function f(a = () => counter) {
+  tick();
+  return a;
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn guard_stays_when_closure_before_it_may_write_the_default_dependency() {
+    let input = r#"
+function f(seed, a) {
+  const bump = () => { seed = 1; };
+  if (a === void 0) { a = seed; }
+  return [bump, a];
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn guard_stays_when_default_dependency_is_updated_before_it() {
+    let input = r#"
+function f(count, a) {
+  count++;
+  if (a === void 0) { a = count; }
+  return a;
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn default_reading_outer_binding_hoists_past_object_destructuring_at_standard() {
+    // `let { top, left } = rect;` only reads properties (`pure_getters`).
+    let input = r#"
+const Vs = { x: 0.2 };
+function f(rect, a) {
+  let { top, left } = rect;
+  if (a === void 0) { a = Vs; }
+  return [top, left, a];
+}
+"#;
+    // At standard the later destructured-parameter fold also consumes the
+    // declaration; at minimal the destructuring statement is not inert.
+    let expected = r#"
+const Vs = { x: 0.2 };
+function f({ top, left }, a = Vs) {
+  return [top, left, a];
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+    assert_eq_normalized(&apply_with_level(input, RewriteLevel::Minimal), input);
+}
+
+#[test]
+fn throwing_default_does_not_hoist_past_an_early_return() {
+    // `+1n` throws a TypeError. Hoisted, it would run on the `skip` path that
+    // returned before reaching the guard.
+    let input = r#"
+function f(skip, a) {
+  if (skip) return 1;
+  if (a === void 0) { a = +1n; }
+  return a;
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn negated_bigint_default_still_hoists() {
+    let input = r#"
+function f(skip, a) {
+  if (skip) return 1;
+  if (a === void 0) { a = -1n; }
+  return a;
+}
+"#;
+    let expected = r#"
+function f(skip, a = -1n) {
+  if (skip) return 1;
+  return a;
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn object_property_short_alias_rename_avoids_computed_key_capture() {
+    // `type` is read in a computed key after the destructuring; renaming `n`
+    // to `type` would make that key read the parameter instead.
+    let input = r#"
+function reducer(t = {}) {
+  var n = t.type;
+  return { [type]: n };
+}
+"#;
+    let expected = r#"
+function reducer({ type: n } = {}) {
+  return {
+    [type]: n
+  };
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn property_alias_read_by_a_later_param_default_stays_in_body() {
+    // `n = e.currentTarget` reads the parameter the fold would replace with a
+    // destructuring pattern; a default cannot see the body, so `e` would dangle.
+    let input = r#"
+function capture(e, t, n = e.currentTarget) {
+  let r = e.nativeEvent;
+  return use(r, t, n);
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn destructuring_alias_read_by_a_later_param_default_stays_in_body() {
+    let input = r#"
+function capture(e, t, n = e.currentTarget) {
+  let { nativeEvent } = e;
+  return use(nativeEvent, t, n);
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn array_index_alias_read_by_a_later_param_default_stays_in_body() {
+    let input = r#"
+function capture(e, n = e.length) {
+  let first = e[0];
+  let second = e[1];
+  return use(first, second, n);
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn arrow_destructuring_alias_read_by_a_later_param_default_stays_in_body() {
+    let input = r#"
+const capture = (e, t, n = e.currentTarget) => {
+  let { nativeEvent } = e;
+  return use(nativeEvent, t, n);
+};
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn reassignment_default_on_a_binding_read_by_a_later_param_default_stays_in_body() {
+    // Babel 7.8 reassignment default on a destructured binding. The sibling
+    // default reads `_ref$outer` before the body reassignment runs, so the
+    // default cannot move into the pattern, and folding the property read into
+    // a nested pattern would remove the binding that default reads.
+    let input = r#"
+function nested({ outer: _ref$outer } = {}, mode = _ref$outer.mode) {
+  _ref$outer = _ref$outer === undefined ? {} : _ref$outer;
+  let _ref$outer$value = _ref$outer.value;
+  let value = _ref$outer$value === undefined ? fallbackValue : _ref$outer$value;
+  return use(value, mode);
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
 }

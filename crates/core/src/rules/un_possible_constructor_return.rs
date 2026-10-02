@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use crate::collections::HashMap;
 
 use swc_core::common::util::take::Take;
 use swc_core::ecma::ast::{Callee, Expr, Module};

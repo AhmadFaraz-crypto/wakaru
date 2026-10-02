@@ -3,5 +3,6 @@ source: crates/core/tests/un_sliced_to_array_rule.rs
 assertion_line: 66
 expression: output
 ---
-const _ref = expr;
+import _slicedToArray from "@babel/runtime/helpers/esm/slicedToArray";
+const _ref = _slicedToArray(expr, 3);
 const x = _ref[0];

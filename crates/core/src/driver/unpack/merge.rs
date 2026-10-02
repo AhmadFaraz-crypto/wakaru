@@ -5,7 +5,7 @@
 //! renames sibling outputs, and numeric `require(<id>)` / async-chunk
 //! references are rewritten when the target id is unambiguous across inputs.
 
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -153,18 +153,8 @@ impl MultiSourceModule {
         self
     }
 
-    pub(super) fn with_cross_chunk_rewrite(mut self, enabled: bool) -> Self {
-        self.allow_cross_chunk_rewrite = enabled;
-        self
-    }
-
     pub(super) fn with_detector_failure(mut self, failure: Option<DetectedModuleFailure>) -> Self {
         self.detector_failure = failure;
-        if failure.is_some() {
-            // An opaque factory cannot safely participate as either caller or
-            // provider in synthesized cross-chunk edges.
-            self.allow_cross_chunk_rewrite = false;
-        }
         self
     }
 
@@ -315,7 +305,7 @@ pub(super) fn prepare_multi_source_modules(
         .collect::<Vec<_>>();
     apply_public_path_reservations(&mut modules, &public_paths.facade);
     assign_unique_module_filenames(&mut modules, public_paths);
-    let mut filename_maps = HashMap::<PreparedInputId, HashMap<String, String>>::new();
+    let mut filename_maps = HashMap::<PreparedInputId, HashMap<String, String>>::default();
     for (module, original_filename) in modules.iter().zip(&original_filenames) {
         if let Some(input) = module.input {
             filename_maps
@@ -344,7 +334,10 @@ pub(super) fn prepare_multi_source_modules(
         .zip(original_filenames)
         .map(|(module, original_filename)| {
             let reserved_public_path = public_paths.module_holds_reserved_path(&module);
-            let numeric_rewrite = if has_rewrites && module.allow_cross_chunk_rewrite {
+            let numeric_rewrite = if has_rewrites
+                && module.allow_cross_chunk_rewrite
+                && module.detector_failure.is_none()
+            {
                 Some(NumericRewriteModuleContext {
                     input_group: module.input_group,
                     module_filename: module.module.filename.clone(),
@@ -510,7 +503,7 @@ fn chunk_filename_matches_id(filename: &str, chunk_id: usize) -> bool {
 }
 
 fn unique_numeric_module_id_map(modules: &[MultiSourceModule]) -> HashMap<usize, String> {
-    let mut counts: HashMap<usize, (usize, String)> = HashMap::new();
+    let mut counts: HashMap<usize, (usize, Option<String>)> = HashMap::default();
     for module in modules {
         if !module.allow_cross_chunk_rewrite {
             continue;
@@ -518,23 +511,31 @@ fn unique_numeric_module_id_map(modules: &[MultiSourceModule]) -> HashMap<usize,
         let Ok(id) = module.module.id.parse::<usize>() else {
             continue;
         };
-        let entry = counts
-            .entry(id)
-            .or_insert((0, module.module.filename.clone()));
+        // Opaque factories still occupy their IDs. Counting them prevents a
+        // healthy same-numbered module in another input from capturing a
+        // deliberately unresolved reference, without excluding healthy siblings.
+        let filename = module
+            .detector_failure
+            .is_none()
+            .then(|| module.module.filename.clone());
+        let entry = counts.entry(id).or_default();
         entry.0 += 1;
-        entry.1 = module.module.filename.clone();
+        entry.1 = filename;
     }
 
     counts
         .into_iter()
-        .filter_map(|(key, (count, filename))| (count == 1).then_some((key, filename)))
+        .filter_map(|(key, entry)| match entry {
+            (1, Some(filename)) => Some((key, filename)),
+            _ => None,
+        })
         .collect()
 }
 
 fn unique_numeric_chunk_module_id_map(
     modules: &[MultiSourceModule],
 ) -> HashMap<(String, usize, usize), String> {
-    let mut counts: HashMap<(String, usize, usize), (usize, String)> = HashMap::new();
+    let mut counts: HashMap<(String, usize, usize), (usize, Option<String>)> = HashMap::default();
     for module in modules {
         if !module.allow_cross_chunk_rewrite || module.chunk_ids.is_empty() {
             continue;
@@ -546,17 +547,25 @@ fn unique_numeric_chunk_module_id_map(
             if !chunk_filename_matches_id(&module.input_filename, *chunk_id) {
                 continue;
             }
+            // Use the same occupied-ID rule for explicit async chunk edges.
+            let filename = module
+                .detector_failure
+                .is_none()
+                .then(|| module.module.filename.clone());
             let entry = counts
                 .entry((module.input_group.clone(), *chunk_id, id))
-                .or_insert((0, module.module.filename.clone()));
+                .or_default();
             entry.0 += 1;
-            entry.1 = module.module.filename.clone();
+            entry.1 = filename;
         }
     }
 
     counts
         .into_iter()
-        .filter_map(|(key, (count, filename))| (count == 1).then_some((key, filename)))
+        .filter_map(|(key, entry)| match entry {
+            (1, Some(filename)) => Some((key, filename)),
+            _ => None,
+        })
         .collect()
 }
 
@@ -904,8 +913,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn opaque_numeric_ids_remain_reserved_without_disabling_healthy_siblings() {
+        let detected = |id: &str, filename: &str, input: &str| {
+            MultiSourceModule::detected(
+                UnpackedModule {
+                    id: id.into(),
+                    filename: filename.into(),
+                    ..Default::default()
+                },
+                HashSet::from_iter([7]),
+                input.into(),
+                true,
+            )
+        };
+        for duplicate in [false, true] {
+            let mut modules = vec![
+                detected("100", "module-100.js", "7.js"),
+                detected("200", "module-200.js", "7.js").with_detector_failure(Some(
+                    DetectedModuleFailure::WebpackRuntimeParameterReuse,
+                )),
+            ];
+            if duplicate {
+                modules.push(detected("200", "module-other.js", "7.bundle.js"));
+            }
+            let (prepared, plan) =
+                prepare_multi_source_modules(modules, &PlannedPublicPaths::default());
+            assert_eq!(
+                plan.plain_id_to_filename.get(&100).map(String::as_str),
+                Some("module-100.js")
+            );
+            assert!(!plan.plain_id_to_filename.contains_key(&200));
+            assert!(plan
+                .chunk_id_to_filename
+                .keys()
+                .any(|(_, _, id)| *id == 100));
+            assert!(!plan
+                .chunk_id_to_filename
+                .keys()
+                .any(|(_, _, id)| *id == 200));
+            assert!(prepared[0].numeric_rewrite.is_some());
+            assert!(prepared[1].numeric_rewrite.is_none());
+        }
+    }
+
+    #[test]
     fn detected_modules_share_chunk_id_storage() {
-        let chunk_ids = Arc::new(HashSet::from([7, 11, 13]));
+        let chunk_ids = Arc::new(HashSet::from_iter([7, 11, 13]));
         let first = MultiSourceModule::detected(
             UnpackedModule::default(),
             chunk_ids.clone(),
@@ -927,7 +980,7 @@ mod tests {
         let module = MultiSourceModule::detected_with_ast_from_input(
             UnpackedModule::default(),
             None,
-            HashSet::new(),
+            HashSet::default(),
             "input.js".to_string(),
             Some(PreparedInputId::from_index(0)),
             "precomputed-group".to_string(),
@@ -973,7 +1026,7 @@ mod tests {
                     filename: "module-20.js".to_string(),
                     ..Default::default()
                 },
-                HashSet::new(),
+                HashSet::default(),
                 "entry.js".to_string(),
                 true,
             ),
@@ -985,7 +1038,7 @@ mod tests {
                     filename: "module-999.js".to_string(),
                     ..Default::default()
                 },
-                HashSet::new(),
+                HashSet::default(),
                 "chunk.js".to_string(),
                 true,
             ),

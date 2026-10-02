@@ -23,13 +23,12 @@
 
 | Discovered | Runnable | Skipped | Unsupported | Rejected | Passed | Failed |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1034 | 1034 | 0 | 0 | 84 | 950 | 0 |
+| 1034 | 1034 | 0 | 0 | 66 | 968 | 0 |
 
 ## Reasons
 
 | Status | Reason | Count |
 |---|---|---:|
-| rejected | swc-array-binding-elision | 18 |
 | rejected | transform-reject | 10 |
 | rejected | transform-runtime | 6 |
 | rejected | transform-runtime-inferred-name | 50 |

@@ -1,27 +1,39 @@
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use swc_core::atoms::Atom;
+use swc_core::common::util::take::Take;
 use swc_core::common::{SyntaxContext, DUMMY_SP};
 use swc_core::ecma::ast::{
     ArrowExpr, ArrowFunctionBody, BindingIdent, CallExpr, Callee, CatchClause, ClassDecl,
-    Constructor, Decl, Expr, ExprOrSpread, FnDecl, Function, FunctionBody, GetterProp, Ident, Lit,
-    MemberProp, MethodProp, ObjectPatProp, Param, ParamOrTsParamProp, Pat, SetterProp, Stmt,
-    ThisExpr, VarDecl, VarDeclKind, VarDeclarator,
+    Constructor, Decl, Expr, ExprOrSpread, ExprStmt, FnDecl, Function, FunctionBody, GetterProp,
+    Ident, Lit, MemberProp, MethodProp, Module, ObjectPatProp, Param, ParamOrTsParamProp, Pat,
+    SetterProp, Stmt, ThisExpr, UnaryOp, VarDecl, VarDeclKind, VarDeclarator,
 };
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use crate::analysis::binding_uses::BindingUseIndex;
+use crate::analysis::purity::is_pure_init;
+use crate::utils::paren::strip_parens;
 
-use super::eval_utils::{js_source_mentions_binding, DirectEvalAnalyzer};
+use super::eval_utils::{js_source_mentions_binding, module_has_with_stmt, DirectEvalAnalyzer};
+use super::rename_utils::{rename_bindings, BindingRename, BindingRenamer};
 use super::RewriteLevel;
 
 pub struct UnIife {
     level: RewriteLevel,
+    /// A `with` statement anywhere in the module: param renames and literal
+    /// extraction rebind names the `with` object could supply at runtime, so
+    /// they are skipped module-wide (docs/rewrite-assumptions.md). Direct eval
+    /// is handled per IIFE body by `plan_param_rewrites`.
+    with_statement_present: bool,
 }
 
 impl UnIife {
     pub fn new(level: RewriteLevel) -> Self {
-        Self { level }
+        Self {
+            level,
+            with_statement_present: false,
+        }
     }
 }
 
@@ -32,6 +44,16 @@ impl Default for UnIife {
 }
 
 impl VisitMut for UnIife {
+    fn visit_mut_module(&mut self, module: &mut Module) {
+        self.with_statement_present = module_has_with_stmt(module);
+        module.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_expr_stmt(&mut self, stmt: &mut ExprStmt) {
+        stmt.visit_mut_children_with(self);
+        drop_discarded_iife_prefix(stmt);
+    }
+
     fn visit_mut_expr(&mut self, expr: &mut Expr) {
         expr.visit_mut_children_with(self);
 
@@ -41,9 +63,31 @@ impl VisitMut for UnIife {
                 *expr = *inner;
                 return;
             }
-            process_iife(call_expr, self.level);
+            process_iife(call_expr, self.level, self.with_statement_present);
         }
     }
+}
+
+/// `!function () {}();` and `void function () {}();` → `(function () {})();`.
+/// The statement discards the result, and neither operator has an effect of
+/// its own. `+`, `-`, and `~` run ToNumber, which can call `valueOf`.
+fn drop_discarded_iife_prefix(stmt: &mut ExprStmt) {
+    let Expr::Unary(unary) = stmt.expr.as_mut() else {
+        return;
+    };
+    if !matches!(unary.op, UnaryOp::Bang | UnaryOp::Void) {
+        return;
+    }
+    let Expr::Call(call) = strip_parens(&unary.arg) else {
+        return;
+    };
+    let Callee::Expr(callee) = &call.callee else {
+        return;
+    };
+    if !matches!(strip_parens(callee), Expr::Fn(_) | Expr::Arrow(_)) {
+        return;
+    }
+    stmt.expr = unary.arg.take();
 }
 
 /// Simplifies `(() => expr)()` to `expr` (zero-param arrow with expression body, called with no args).
@@ -81,27 +125,35 @@ fn try_simplify_arrow_expr_iife(call: &CallExpr) -> Option<Box<Expr>> {
     }
 }
 
-fn process_iife(call: &mut CallExpr, level: RewriteLevel) {
+fn process_iife(call: &mut CallExpr, level: RewriteLevel, with_statement_present: bool) {
     // `arrow.call(thisArg, args...)` → `arrow(args...)`. Arrow functions ignore
     // a `.call` `thisArg` (their `this` is always lexical), so the thisArg is
     // dead weight and the resulting arrow IIFE can go through the normal path.
     try_unwrap_dot_call_on_arrow(call);
 
-    if level < RewriteLevel::Standard {
+    if level < RewriteLevel::Standard || with_statement_present {
         return;
     }
 
     if let Callee::Expr(callee_expr) = &mut call.callee {
         match callee_expr.as_mut() {
             Expr::Fn(fn_expr) => {
-                process_fn_iife(&mut fn_expr.function, &mut call.args);
+                process_fn_iife(
+                    &mut fn_expr.function,
+                    &mut call.args,
+                    fn_expr.ident.as_ref(),
+                );
             }
             Expr::Arrow(arrow_expr) => {
                 process_arrow_iife(arrow_expr, &mut call.args);
             }
             Expr::Paren(paren) => match paren.expr.as_mut() {
                 Expr::Fn(fn_expr) => {
-                    process_fn_iife(&mut fn_expr.function, &mut call.args);
+                    process_fn_iife(
+                        &mut fn_expr.function,
+                        &mut call.args,
+                        fn_expr.ident.as_ref(),
+                    );
                 }
                 Expr::Arrow(arrow_expr) => {
                     process_arrow_iife(arrow_expr, &mut call.args);
@@ -146,6 +198,11 @@ fn try_unwrap_dot_call_on_arrow(call: &mut CallExpr) -> bool {
     if call.args.is_empty() || call.args[0].spread.is_some() {
         return false;
     }
+    // The arrow ignores the thisArg value, but the call still evaluates it.
+    // Dropping it is only safe when that evaluation has no effect.
+    if !this_arg_is_effect_free(&call.args[0].expr) {
+        return false;
+    }
 
     // Take the arrow base out of the Member expr without cloning the body.
     let placeholder = Box::new(Expr::This(ThisExpr { span: DUMMY_SP }));
@@ -161,7 +218,23 @@ fn try_unwrap_dot_call_on_arrow(call: &mut CallExpr) -> bool {
     true
 }
 
-fn process_fn_iife(function: &mut Function, args: &mut Vec<ExprOrSpread>) {
+/// `this`, `void 0`, and the inert values `is_pure_init` accepts (literals,
+/// identifier reads, function and arrow expressions).
+fn this_arg_is_effect_free(expr: &Expr) -> bool {
+    match strip_parens(expr) {
+        Expr::This(_) => true,
+        Expr::Unary(unary) if unary.op == UnaryOp::Void => {
+            matches!(strip_parens(&unary.arg), Expr::Lit(_))
+        }
+        expr => is_pure_init(expr),
+    }
+}
+
+fn process_fn_iife(
+    function: &mut Function,
+    args: &mut Vec<ExprOrSpread>,
+    fn_expr_name: Option<&Ident>,
+) {
     let Some(body) = &mut function.body else {
         return;
     };
@@ -169,7 +242,49 @@ fn process_fn_iife(function: &mut Function, args: &mut Vec<ExprOrSpread>) {
         return;
     }
     let preserve_arg_list = body_uses_own_arguments(body);
-    process_params_and_args(&mut function.params, args, body, preserve_arg_list);
+    process_params_and_args(
+        &mut function.params,
+        args,
+        body,
+        preserve_arg_list,
+        fn_expr_name,
+    );
+}
+
+/// Named function expressions bind their name inside the function. Any use of
+/// that binding in the body or in parameter initializers — call / `new` /
+/// `.call` / escape / `typeof` — or a known eval source that mentions the
+/// printed name, means a later invocation can pass a different argument.
+/// Literal extraction would freeze the IIFE snapshot.
+fn named_fn_expr_is_reused(
+    fn_expr_name: Option<&Ident>,
+    params: &[Param],
+    body: &FunctionBody,
+    param_value_refs: &ParamValueRefs,
+) -> bool {
+    let Some(name) = fn_expr_name else {
+        return false;
+    };
+    let binding = (name.sym.clone(), name.ctxt);
+    // Defaults and computed pattern keys see the name with the same binding
+    // identity as the body. `b = o` can re-enter after the IIFE snapshot.
+    if param_value_refs.refs.contains(&binding) {
+        return true;
+    }
+    let binding_uses = BindingUseIndex::collect_stmts(&body.stmts);
+    if binding_uses.use_count(&binding) > 0 {
+        return true;
+    }
+    let mut eval_analyzer = DirectEvalAnalyzer::default();
+    params.visit_with(&mut eval_analyzer);
+    for stmt in &body.stmts {
+        stmt.visit_with(&mut eval_analyzer);
+    }
+    !eval_analyzer.unknown_direct_eval
+        && eval_analyzer
+            .known_direct_eval_sources
+            .iter()
+            .any(|source| js_source_mentions_binding(source, &name.sym))
 }
 
 fn process_arrow_iife(arrow: &mut ArrowExpr, args: &mut Vec<ExprOrSpread>) {
@@ -196,19 +311,24 @@ fn process_params_and_args(
     args: &mut Vec<ExprOrSpread>,
     body: &mut FunctionBody,
     preserve_arg_list: bool,
+    fn_expr_name: Option<&Ident>,
 ) {
-    let plan = plan_param_rewrites(params.len(), args, body, preserve_arg_list, true, |i| {
-        pat_ident(&params[i].pat).map(|id| (id.sym.clone(), id.ctxt))
-    });
+    let param_value_refs = collect_param_value_refs(params);
+    // Re-entry uses the same fail-closed path as an observable `arguments`
+    // object: keep the parameter so later calls can still pass a value.
+    let preserve_arg_list =
+        preserve_arg_list || named_fn_expr_is_reused(fn_expr_name, params, body, &param_value_refs);
+    let plan = plan_param_rewrites(
+        params.len(),
+        args,
+        body,
+        &param_value_refs,
+        preserve_arg_list,
+        true,
+        |i| pat_ident(&params[i].pat).map(|id| (id.sym.clone(), id.ctxt)),
+    );
 
-    // Apply renames in place: param keeps its own ctxt, only the sym changes.
-    for (i, _, new_sym, _) in &plan.renames {
-        if let Pat::Ident(bi) = &mut params[*i].pat {
-            bi.id.sym = new_sym.clone();
-        }
-    }
-
-    apply_body_rewrites(body, &plan);
+    apply_rename_rewrites(params, body, &plan);
 
     // Process literal inserts: collect indices to remove, then drop params/args
     // in reverse-index order.
@@ -230,17 +350,18 @@ fn process_arrow_params_and_args(
     body: &mut FunctionBody,
     preserve_arg_list: bool,
 ) {
-    let plan = plan_param_rewrites(params.len(), args, body, preserve_arg_list, false, |i| {
-        pat_ident(&params[i]).map(|id| (id.sym.clone(), id.ctxt))
-    });
+    let param_value_refs = collect_param_value_refs(params);
+    let plan = plan_param_rewrites(
+        params.len(),
+        args,
+        body,
+        &param_value_refs,
+        preserve_arg_list,
+        false,
+        |i| pat_ident(&params[i]).map(|id| (id.sym.clone(), id.ctxt)),
+    );
 
-    for (i, _, new_sym, _) in &plan.renames {
-        if let Pat::Ident(bi) = &mut params[*i] {
-            bi.id.sym = new_sym.clone();
-        }
-    }
-
-    apply_body_rewrites(body, &plan);
+    apply_rename_rewrites(params, body, &plan);
 
     let mut to_remove: Vec<usize> = plan.literal_inserts.iter().map(|(i, ..)| *i).collect();
     to_remove.sort();
@@ -278,6 +399,7 @@ fn plan_param_rewrites<F>(
     param_count: usize,
     args: &[ExprOrSpread],
     body: &FunctionBody,
+    param_value_refs: &ParamValueRefs,
     preserve_arg_list: bool,
     params_map_arguments: bool,
     param_at: F,
@@ -308,7 +430,7 @@ where
     // binding that holds the value of the last duplicate. Per-index renames
     // rebind body uses to the first occurrence, and literal extraction emits
     // colliding lexical declarations.
-    let mut seen_params = HashSet::new();
+    let mut seen_params = HashSet::default();
     for i in 0..param_count {
         if let Some(binding) = param_at(i) {
             if !seen_params.insert(binding) {
@@ -321,6 +443,9 @@ where
     // suffix renames, but avoids producing a param name that is shadowed at a
     // nested use site after codegen.
     let mut taken_for_suffix: HashSet<Atom> = collect_all_binding_names(body);
+    // Renames also reach default expressions. Reserve all their names,
+    // including nested bindings and free references, before choosing a suffix.
+    taken_for_suffix.extend(param_value_refs.names.iter().cloned());
     for i in 0..param_count {
         if let Some((sym, _)) = param_at(i) {
             taken_for_suffix.insert(sym);
@@ -328,6 +453,12 @@ where
     }
     let binding_uses = BindingUseIndex::collect_stmts(&body.stmts);
     for (i, arg) in args.iter().enumerate().take(param_count) {
+        // A spread argument has a runtime length, so from this position on the
+        // syntactic argument index no longer identifies the parameter it
+        // initializes. Stop positional reasoning here.
+        if arg.spread.is_some() {
+            break;
+        }
         let Some((param_sym, param_ctxt)) = param_at(i) else {
             continue;
         };
@@ -344,10 +475,14 @@ where
 
         match arg.expr.as_ref() {
             Expr::Ident(ident) => {
-                if ident.sym.len() <= 1 || ident.sym == param_sym {
+                // A one- or two-char arg is a minified name itself: the param
+                // would only gain a `_1` suffix, and a renamed param is no
+                // longer a minified name that later naming rules replace.
+                if ident.sym.len() <= 2 || ident.sym == param_sym {
                     continue;
                 }
-                if ident.sym.as_ref() == "undefined" {
+                // These globals name values, not roles.
+                if matches!(ident.sym.as_ref(), "undefined" | "NaN" | "Infinity") {
                     continue;
                 }
                 // Keep identifier args as parameters. Dropping the param would
@@ -369,11 +504,14 @@ where
             // A body declaration with the parameter's resolved binding ID is a
             // same-binding `var`/function redeclaration. Removing the parameter
             // and inserting a lexical declaration would either create an early
-            // error or change the redeclaration semantics.
+            // error or change the redeclaration semantics. A sibling parameter
+            // default or pattern that reads the parameter cannot see a body
+            // declaration at all, so the parameter must stay.
             Expr::Lit(lit)
                 if !preserve_arg_list
                     && !eval_observes_mapped_arguments
-                    && !binding_uses.has_declaration(&param_binding) =>
+                    && !binding_uses.has_declaration(&param_binding)
+                    && !param_value_refs.refs.contains(&param_binding) =>
             {
                 let kind = if binding_uses.has_direct_write(&param_binding) {
                     VarDeclKind::Let
@@ -390,15 +528,53 @@ where
     plan
 }
 
-fn apply_body_rewrites(body: &mut FunctionBody, plan: &RewritePlan) {
-    // Rename refs (sym only; keep ctxt so the inner binding stays distinct).
-    for (_, old_sym, new_sym, param_ctxt) in &plan.renames {
-        let mut renamer = RenameIdent {
-            old_sym: old_sym.clone(),
-            new_sym: new_sym.clone(),
-            target_ctxt: *param_ctxt,
-        };
-        body.visit_mut_with(&mut renamer);
+/// Rename every identifier of a planned parameter rename by `(sym, ctxt)`:
+/// the parameter binding itself, its reads in the body, and its reads inside
+/// sibling parameter defaults and patterns (`(e, t, r = t) => …`). Only the
+/// binding name changes; shorthand keys stay intact and the ctxt is kept.
+fn apply_rename_rewrites<P>(params: &mut P, body: &mut FunctionBody, plan: &RewritePlan)
+where
+    P: VisitMutWith<BindingRenamer>,
+{
+    let renames: Vec<BindingRename> = plan
+        .renames
+        .iter()
+        .map(|(_, old, new, ctxt)| BindingRename {
+            old: (old.clone(), *ctxt),
+            new: new.clone(),
+        })
+        .collect();
+    rename_bindings(params, &renames);
+    rename_bindings(body, &renames);
+}
+
+/// Bindings read inside the parameter list itself: default expressions and
+/// computed pattern keys. Binding positions are declarations, not reads.
+fn collect_param_value_refs<P>(params: &P) -> ParamValueRefs
+where
+    P: VisitWith<ParamValueRefs>,
+{
+    let mut collector = ParamValueRefs {
+        refs: HashSet::default(),
+        names: HashSet::default(),
+    };
+    params.visit_with(&mut collector);
+    collector
+}
+
+struct ParamValueRefs {
+    refs: HashSet<(Atom, SyntaxContext)>,
+    names: HashSet<Atom>,
+}
+
+impl Visit for ParamValueRefs {
+    fn visit_binding_ident(&mut self, binding: &BindingIdent) {
+        self.names.insert(binding.id.sym.clone());
+    }
+
+    fn visit_ident(&mut self, ident: &Ident) {
+        self.names.insert(ident.sym.clone());
+        self.refs.insert((ident.sym.clone(), ident.ctxt));
     }
 }
 
@@ -515,7 +691,7 @@ fn collect_all_binding_names(body: &FunctionBody) -> HashSet<Atom> {
     }
 
     let mut c = Collector {
-        names: HashSet::new(),
+        names: HashSet::default(),
     };
     body.visit_with(&mut c);
     c.names
@@ -542,22 +718,6 @@ fn make_literal_decl(name: Atom, binding_ctxt: SyntaxContext, lit: Lit, kind: Va
             definite: false,
         }],
     })))
-}
-
-struct RenameIdent {
-    old_sym: Atom,
-    new_sym: Atom,
-    /// Match by (sym, ctxt) so a same-named binding in a nested scope is not
-    /// rewritten when we rename the IIFE param to an arg-derived alias.
-    target_ctxt: SyntaxContext,
-}
-
-impl VisitMut for RenameIdent {
-    fn visit_mut_ident(&mut self, ident: &mut Ident) {
-        if ident.sym == self.old_sym && ident.ctxt == self.target_ctxt {
-            ident.sym = self.new_sym.clone();
-        }
-    }
 }
 
 fn body_uses_own_arguments(body: &FunctionBody) -> bool {

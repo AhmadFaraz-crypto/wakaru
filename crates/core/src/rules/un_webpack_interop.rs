@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::common::{Mark, SyntaxContext, DUMMY_SP};
@@ -77,13 +77,13 @@ impl VisitMut for UnWebpackInterop {
         let mut namespace_replacer = WebpackNamespaceReplacer {
             initial_ref_counts: &initial_ref_counts,
             module_bindings: &module_bindings,
-            removed_caches: HashSet::new(),
+            removed_caches: HashSet::default(),
             unresolved_mark: self.unresolved_mark,
         };
         module.visit_mut_with(&mut namespace_replacer);
         remove_unused_namespace_cache_decls(module, &namespace_replacer.removed_caches);
 
-        let mut candidates: HashMap<BindingKey, Ident> = HashMap::new();
+        let mut candidates: HashMap<BindingKey, Ident> = HashMap::default();
         for item in &module.body {
             let ModuleItem::Stmt(Stmt::Decl(swc_core::ecma::ast::Decl::Var(var))) = item else {
                 continue;
@@ -166,7 +166,7 @@ impl VisitMut for UnWebpackInterop {
 }
 
 fn collect_module_bindings(module: &Module, unresolved_mark: Mark) -> HashSet<BindingKey> {
-    let mut bindings = HashSet::new();
+    let mut bindings = HashSet::default();
     for item in &module.body {
         match item {
             ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
@@ -412,12 +412,16 @@ fn collect_binding_refs(module: &Module, targets: &HashSet<BindingKey>) -> HashS
 
         fn visit_binding_ident(&mut self, _: &BindingIdent) {}
 
-        fn visit_prop_name(&mut self, _: &swc_core::ecma::ast::PropName) {}
+        fn visit_prop_name(&mut self, prop: &swc_core::ecma::ast::PropName) {
+            if let swc_core::ecma::ast::PropName::Computed(computed) = prop {
+                computed.visit_with(self);
+            }
+        }
     }
 
     let mut collector = RefCollector {
         targets,
-        refs: HashSet::new(),
+        refs: HashSet::default(),
     };
     module.visit_with(&mut collector);
     collector.refs
@@ -442,11 +446,15 @@ fn collect_binding_ref_counts(module: &Module) -> HashMap<BindingKey, usize> {
 
         fn visit_binding_ident(&mut self, _: &BindingIdent) {}
 
-        fn visit_prop_name(&mut self, _: &swc_core::ecma::ast::PropName) {}
+        fn visit_prop_name(&mut self, prop: &swc_core::ecma::ast::PropName) {
+            if let swc_core::ecma::ast::PropName::Computed(computed) = prop {
+                computed.visit_with(self);
+            }
+        }
     }
 
     let mut counter = RefCounter {
-        refs: HashMap::new(),
+        refs: HashMap::default(),
     };
     module.visit_with(&mut counter);
     counter.refs
@@ -467,7 +475,11 @@ fn count_binding_refs_in_expr(expr: &Expr, target: &BindingKey) -> usize {
 
         fn visit_binding_ident(&mut self, _: &BindingIdent) {}
 
-        fn visit_prop_name(&mut self, _: &swc_core::ecma::ast::PropName) {}
+        fn visit_prop_name(&mut self, prop: &swc_core::ecma::ast::PropName) {
+            if let swc_core::ecma::ast::PropName::Computed(computed) = prop {
+                computed.visit_with(self);
+            }
+        }
     }
 
     let mut counter = RefCounter { target, refs: 0 };
@@ -624,7 +636,7 @@ fn build_shadow_avoidance_renames(
     to_inline: &mut HashMap<BindingKey, Ident>,
 ) -> Vec<BindingRename> {
     let mut used_names = collect_declared_names(module);
-    let mut base_renames: HashMap<BindingKey, Atom> = HashMap::new();
+    let mut base_renames: HashMap<BindingKey, Atom> = HashMap::default();
 
     for (getter, replacement) in to_inline.iter_mut() {
         if !binding_replacement_would_be_shadowed(module, getter, &replacement.sym) {
@@ -637,6 +649,15 @@ fn build_shadow_avoidance_renames(
             .or_insert_with(|| fresh_prefixed_name(&replacement.sym, &mut used_names))
             .clone();
         replacement.sym = new_name;
+    }
+
+    // The base binding is renamed module-wide, so every getter that reads a
+    // renamed base must follow it, not only the getters whose own use sites
+    // were shadowed. Replacements renamed above no longer carry the old key.
+    for replacement in to_inline.values_mut() {
+        if let Some(new_name) = base_renames.get(&binding_key(replacement)) {
+            replacement.sym = new_name.clone();
+        }
     }
 
     base_renames
@@ -658,7 +679,7 @@ fn collect_declared_names(module: &Module) -> HashSet<Atom> {
 
     let mut names = collect_module_names(module);
     let mut collector = Collector {
-        names: HashSet::new(),
+        names: HashSet::default(),
     };
     module.visit_with(&mut collector);
     names.extend(collector.names);
@@ -674,7 +695,7 @@ fn fresh_prefixed_name(name: &Atom, used_names: &mut HashSet<Atom>) -> Atom {
 
     let mut index = 2usize;
     loop {
-        let candidate = Atom::from(format!("_{name}{index}"));
+        let candidate = Atom::from(format!("_{name}_{index}"));
         if used_names.insert(candidate.clone()) {
             return candidate;
         }
@@ -765,7 +786,11 @@ impl Visit for GetterUsageCollector<'_> {
         self.mark_unsupported(ident);
     }
 
-    fn visit_prop_name(&mut self, _: &swc_core::ecma::ast::PropName) {}
+    fn visit_prop_name(&mut self, prop: &swc_core::ecma::ast::PropName) {
+        if let swc_core::ecma::ast::PropName::Computed(computed) = prop {
+            computed.visit_with(self);
+        }
+    }
 
     fn visit_member_prop(&mut self, prop: &MemberProp) {
         if let MemberProp::Computed(prop) = prop {
@@ -813,7 +838,11 @@ impl VisitMut for GetterReplacer<'_> {
         }
     }
 
-    fn visit_mut_prop_name(&mut self, _: &mut swc_core::ecma::ast::PropName) {}
+    fn visit_mut_prop_name(&mut self, prop: &mut swc_core::ecma::ast::PropName) {
+        if let swc_core::ecma::ast::PropName::Computed(computed) = prop {
+            computed.visit_mut_with(self);
+        }
+    }
 
     fn visit_mut_member_prop(&mut self, prop: &mut MemberProp) {
         if let MemberProp::Computed(prop) = prop {
@@ -862,7 +891,11 @@ impl VisitMut for WebpackNamespaceReplacer<'_> {
         }
     }
 
-    fn visit_mut_prop_name(&mut self, _: &mut swc_core::ecma::ast::PropName) {}
+    fn visit_mut_prop_name(&mut self, prop: &mut swc_core::ecma::ast::PropName) {
+        if let swc_core::ecma::ast::PropName::Computed(computed) = prop {
+            computed.visit_mut_with(self);
+        }
+    }
 }
 
 struct WebpackHasOwnReplacer {
@@ -944,4 +977,19 @@ fn object_prototype_has_own_property_call_callee(unresolved_mark: Mark) -> Calle
         prop: MemberProp::Ident(IdentName::new("call".into(), DUMMY_SP)),
     });
     Callee::Expr(Box::new(call))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefixed_name_uses_delimited_suffix() {
+        let mut used_names = HashSet::from_iter([Atom::from("_value")]);
+
+        assert_eq!(
+            fresh_prefixed_name(&Atom::from("value"), &mut used_names),
+            "_value_2"
+        );
+    }
 }

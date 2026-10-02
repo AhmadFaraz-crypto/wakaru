@@ -8,7 +8,9 @@ fn apply(input: &str) -> String {
 }
 
 fn apply_with_level(input: &str, level: RewriteLevel) -> String {
-    render_rule(input, |_| UnTypeConstructor::new(level))
+    render_rule(input, |unresolved_mark| {
+        UnTypeConstructor::new(unresolved_mark, level)
+    })
 }
 
 #[test]
@@ -55,7 +57,9 @@ const number = +x;
 const string = x + "";
 const holes = [,,,];
 "#;
-    let output = render_rule(input, |_| UnTypeConstructor::default());
+    let output = render_rule(input, |unresolved_mark| {
+        UnTypeConstructor::new(unresolved_mark, RewriteLevel::Standard)
+    });
     assert_eq_normalized(&output, input);
 }
 

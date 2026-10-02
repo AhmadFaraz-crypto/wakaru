@@ -338,3 +338,63 @@ console.log(_a);
         "spread require argument must not convert to an import:\n{output}"
     );
 }
+
+#[test]
+fn typescript_own_keys_factory_restores_namespace_import() {
+    let input = include_str!("fixtures/tslib-interop/generated/star.js");
+    let focused = common::render_rule(input, |_| wakaru_core::rules::UnInteropRequireWildcard);
+    assert!(!focused.contains("__importStar(require("), "{focused}");
+    let output = render(input);
+    assert!(!output.contains("__importStar"), "{output}");
+    assert!(!output.contains("__createBinding"), "{output}");
+    assert!(output.contains("import * as provider"), "{output}");
+}
+
+#[test]
+fn import_star_marker_requires_a_helper_body() {
+    let input = r#"
+var h = this && this.__importStar || (function() { return function(mod) { return custom(mod); }; })();
+var provider = h(require("./provider"));
+use(provider);
+"#;
+    assert!(render(input).contains("h(require("));
+}
+
+#[test]
+fn typescript_factory_preserves_shared_helper_dependencies() {
+    let input = format!(
+        "{}\nuse(__createBinding);",
+        include_str!("fixtures/tslib-interop/generated/star.js")
+    );
+    let output = render(&input);
+    assert!(!output.contains("__importStar"), "{output}");
+    assert!(output.contains("var __createBinding"), "{output}");
+}
+
+#[test]
+fn compressed_typescript_own_keys_factory_restores_namespace_import() {
+    for input in [
+        include_str!("fixtures/tslib-interop/generated/star-compressed.js"),
+        include_str!("fixtures/tslib-interop/generated/star-mangled.js"),
+    ] {
+        let focused = common::render_rule(input, |_| wakaru_core::rules::UnInteropRequireWildcard);
+        assert!(!focused.contains("this.__importStar"), "{focused}");
+        assert!(focused.contains("import * as"), "{focused}");
+        let output = render(input);
+        assert!(!output.contains("getOwnPropertyNames"), "{output}");
+    }
+}
+
+#[test]
+fn compressed_import_star_keeps_observable_factory_initialization() {
+    let input = include_str!("fixtures/tslib-interop/generated/star-compressed.js");
+    for input in [
+        format!("{input}\nuse(ownKeys);"),
+        format!("{input}\neval('ownKeys');"),
+        input.replace("ownKeys=function", "ownKeys=effect(),other=function"),
+        input.replace(",ownKeys;", ";let ownKeys;"),
+    ] {
+        let output = common::render_rule(&input, |_| wakaru_core::rules::UnInteropRequireWildcard);
+        assert!(output.contains("this.__importStar"), "{output}");
+    }
+}

@@ -21,7 +21,7 @@
 //! fails during module linking. Callable defaults require a positive property
 //! fact and do not use that absence inference.
 
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::common::{BytePos, Spanned, SyntaxContext, DUMMY_SP};
@@ -272,7 +272,7 @@ fn collect_existing_mutable_aliases(
     // fresh dummy-span binding and initializing the original mutable local at
     // its source position. Reuse that declaration instead of adding a second
     // capture or moving it across intervening effects.
-    let mut aliases = HashMap::new();
+    let mut aliases = HashMap::default();
     for (body_index, item) in module.body.iter().enumerate() {
         let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
             continue;

@@ -1,11 +1,12 @@
 mod common;
 
-use common::{assert_eq_normalized, normalize};
+use common::{assert_eq_normalized, inspect_rule_output, normalize};
 use swc_core::common::{sync::Lrc, FileName, Mark, SourceMap, GLOBALS};
+use swc_core::ecma::ast::{Expr, Ident, JSXElementName, Module};
 use swc_core::ecma::codegen::{text_writer::JsWriter, Config, Emitter};
 use swc_core::ecma::parser::{lexer::Lexer, EsSyntax, Parser, StringInput, Syntax};
 use swc_core::ecma::transforms::base::resolver;
-use swc_core::ecma::visit::VisitMutWith;
+use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 use wakaru_core::facts::{collect_module_facts, ModuleFacts, ModuleFactsMap};
 use wakaru_core::namespace_decomposition::run_namespace_decomposition;
 use wakaru_core::{apply_rules, RulePipelineOptions};
@@ -35,7 +36,7 @@ fn run_decomp(source: &str, facts: &ModuleFactsMap) -> String {
         let top_level_mark = Mark::new();
         module.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, false));
 
-        run_namespace_decomposition(&mut module, facts, None);
+        run_namespace_decomposition(&mut module, facts, None, unresolved_mark);
 
         let mut output = Vec::new();
         {
@@ -77,7 +78,7 @@ fn run_decomp_then_rename(source: &str, facts: &ModuleFactsMap) -> String {
         let top_level_mark = Mark::new();
         module.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, false));
 
-        run_namespace_decomposition(&mut module, facts, None);
+        run_namespace_decomposition(&mut module, facts, None, unresolved_mark);
         apply_rules(
             &mut module,
             unresolved_mark,
@@ -121,7 +122,7 @@ fn run_decomp_then_late_pipeline(source: &str, facts: &ModuleFactsMap) -> String
         let top_level_mark = Mark::new();
         module.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, false));
 
-        run_namespace_decomposition(&mut module, facts, None);
+        run_namespace_decomposition(&mut module, facts, None, unresolved_mark);
         apply_rules(
             &mut module,
             unresolved_mark,
@@ -281,6 +282,30 @@ function g(e) {
         !normalize(&output).contains("import u from"),
         "expected decomposition, got:\n{output}"
     );
+}
+
+#[test]
+fn free_reference_with_export_spelling_uses_alias() {
+    // `ready.run()` reads a global `ready`; importing the export as `ready`
+    // would capture it.
+    let target_facts = facts_for(
+        r#"
+export function ready() {}
+export function other() {}
+"#,
+    );
+    let mut facts = ModuleFactsMap::new();
+    facts.insert("./module-2.js", target_facts);
+
+    let input = r#"
+import * as r from "./module-2.js";
+ready.run(() => [r.ready(), r.other()]);
+"#;
+    let expected = r#"
+import { other, ready as ready_1 } from "./module-2.js";
+ready.run(() => [ready_1(), other()]);
+"#;
+    assert_eq_normalized(&run_decomp(input, &facts), expected);
 }
 
 #[test]
@@ -1181,4 +1206,71 @@ export const table = {
 };
 "#;
     assert_eq_normalized(&run_decomp(input, &facts), expected.trim());
+}
+
+#[test]
+fn rewritten_usages_keep_the_spans_of_their_property_names() {
+    // A wrapping `(0, r.x)` starts the member's span at `(`; the rewritten
+    // identifier takes the property's span so the output map stays on `x`.
+    struct Decompose<'a>(&'a ModuleFactsMap, Mark);
+    impl VisitMut for Decompose<'_> {
+        fn visit_mut_module(&mut self, module: &mut Module) {
+            run_namespace_decomposition(module, self.0, None, self.1);
+        }
+    }
+    struct Named(Vec<Ident>);
+    impl Visit for Named {
+        fn visit_expr(&mut self, expr: &Expr) {
+            if let Expr::Ident(ident) = expr {
+                self.0.push(ident.clone());
+            }
+            expr.visit_children_with(self);
+        }
+        fn visit_jsx_element_name(&mut self, name: &JSXElementName) {
+            if let JSXElementName::Ident(ident) = name {
+                self.0.push(ident.clone());
+            }
+        }
+    }
+
+    let target_facts = facts_for(
+        r#"
+export function createStore() {}
+export function Box() {}
+"#,
+    );
+    let mut facts = ModuleFactsMap::new();
+    facts.insert("./module-11.js", target_facts);
+
+    let input = r#"
+import * as r from "./module-11.js";
+const p = (0, r.createStore)(u);
+const x = <r.Box />;
+"#;
+    let spans: Vec<(String, Option<String>)> = inspect_rule_output(
+        input,
+        |unresolved_mark| Decompose(&facts, unresolved_mark),
+        |module, text| {
+            let mut named = Named(Vec::new());
+            module.visit_with(&mut named);
+            named
+                .0
+                .into_iter()
+                .filter(|ident| matches!(&*ident.sym, "createStore" | "Box"))
+                .map(|ident| {
+                    let start = text
+                        .starting_at(ident.span)
+                        .map(|rest| rest.chars().take(ident.sym.len()).collect());
+                    (ident.sym.to_string(), start)
+                })
+                .collect()
+        },
+    );
+    assert_eq!(
+        spans,
+        vec![
+            ("createStore".to_string(), Some("createStore".to_string())),
+            ("Box".to_string(), Some("Box".to_string())),
+        ]
+    );
 }

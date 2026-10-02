@@ -741,6 +741,187 @@ fn webpack4_reused_exports_parameter_preserves_the_runtime_export_lifetime() {
 }
 
 #[test]
+fn webpack5_localized_runtime_parameter_avoids_a_free_global_reference() {
+    // Same alias chain as the Ajv test, but the module also references a
+    // global spelled like the local the unpacker would invent (`_publicValue`).
+    // Introducing `let _publicValue` would capture that reference after
+    // printing, so the local must take the next free spelling.
+    let source = r#"
+(() => {
+  var modules = ({
+    0: ((context, publicValue) => {
+      Object.defineProperty(publicValue, "__esModule", { value: true });
+      publicValue.SchemaEnv = void 0;
+      class Ajv {}
+      _publicValue.track("ajv");
+      (publicValue.Ajv = Ajv,
+       context.exports = publicValue = Ajv,
+       context.exports.Ajv = Ajv,
+       Object.defineProperty(publicValue, "__esModule", { value: true }),
+       publicValue.default = Ajv);
+      globalThis.observed = publicValue.Ajv === Ajv;
+    })
+  });
+  var cache = {};
+  (function load(id) {
+    var module = cache[id] = { exports: {} };
+    modules[id](module, module.exports, load);
+    return module.exports;
+  })(0);
+})();
+"#;
+
+    let output = unpack(
+        source,
+        DecompileOptions {
+            filename: "webpack5-ajv-exports-alias-free-global.js".to_string(),
+            ..Default::default()
+        },
+    )
+    .expect("the alias chain should still unpack");
+
+    let module = output
+        .modules
+        .iter()
+        .find(|(filename, _)| filename == "module-0.js")
+        .map(|(_, code)| code)
+        .expect("expected recovered module");
+    assert!(
+        module.contains("_publicValue.track(\"ajv\")"),
+        "the free global reference must survive untouched:\n{module}"
+    );
+    assert!(
+        module.contains("let _publicValue_2;") && module.contains("_publicValue_2 = Ajv"),
+        "the invented local must not take the spelling of a free global:\n{module}"
+    );
+    assert!(
+        !module.contains("let _publicValue;"),
+        "no local may shadow the free `_publicValue` reference:\n{module}"
+    );
+}
+
+#[test]
+fn webpack5_reused_exports_parameter_in_commonjs_alias_chain_is_localized() {
+    // Ajv 8.20.0 authors this compatibility bridge before TypeScript and
+    // webpack lower/minify it: `module.exports = exports = Ajv`. The exports
+    // factory parameter has a CommonJS-object lifetime before the chain and a
+    // callable-local lifetime after it.
+    let source = r#"
+(() => {
+  var modules = ({
+    0: ((context, publicValue) => {
+      Object.defineProperty(publicValue, "__esModule", { value: true });
+      publicValue.SchemaEnv = void 0;
+      class Ajv {}
+      (publicValue.Ajv = Ajv,
+       context.exports = publicValue = Ajv,
+       context.exports.Ajv = Ajv,
+       Object.defineProperty(publicValue, "__esModule", { value: true }),
+       publicValue.default = Ajv);
+      globalThis.observed = publicValue.Ajv === Ajv;
+    })
+  });
+  var cache = {};
+  (function load(id) {
+    var module = cache[id] = { exports: {} };
+    modules[id](module, module.exports, load);
+    return module.exports;
+  })(0);
+})();
+"#;
+
+    let output = unpack(
+        source,
+        DecompileOptions {
+            filename: "webpack5-ajv-exports-alias.js".to_string(),
+            ..Default::default()
+        },
+    )
+    .expect("the Ajv-style exports alias chain should unpack");
+
+    assert_eq!(output.detected_formats, [BundleFormat::Webpack5]);
+    assert!(output.warnings.iter().all(|warning| {
+        warning.kind != wakaru_core::UnpackWarningKind::WebpackFactoryRecoveryFailed
+    }));
+    let module = output
+        .modules
+        .iter()
+        .find(|(filename, _)| filename == "module-0.js")
+        .map(|(_, code)| code)
+        .expect("expected recovered Ajv-style module");
+    assert!(module.contains("class Ajv"), "{module}");
+    assert!(
+        module.contains("let _publicValue;")
+            && module.contains("_publicValue = Ajv")
+            && !module.contains("\npublicValue")
+            && !module.contains("exports ="),
+        "the factory parameter's callable lifetime must be a local binding:\n{module}"
+    );
+    assert!(
+        module.contains(".Ajv ="),
+        "the callable property must survive:\n{module}"
+    );
+    assert!(module.contains("export default Ajv"), "{module}");
+    assert!(module.contains("export { Ajv"), "{module}");
+    assert_eq!(validate_output_modules(&output.modules), vec![]);
+}
+
+#[test]
+fn webpack5_unproven_commonjs_alias_default_keeps_the_wrapper() {
+    for (initializer, tail) in [
+        ("(effect(), Engine)", ""),
+        ("Engine", "Engine = replacement;"),
+        ("Engine", "context.exports = replacement;"),
+        ("Engine", "expose(context);"),
+        ("Engine", "eval(source);"),
+        ("Engine", "eval(0);"),
+        (
+            "Engine",
+            "function read() { return context.exports; } read();",
+        ),
+    ] {
+        let source = format!(
+            r#"
+(() => {{
+  var modules = ({{0: ((context, publicValue) => {{
+    Object.defineProperty(publicValue, "__esModule", {{value: true}});
+    class Engine {{}}
+    context.exports = publicValue = {initializer};
+    context.exports.Engine = Engine;
+    globalThis.observed = publicValue.Engine === Engine;
+    {tail}
+  }})}});
+  var cache = {{}};
+  (function load(id) {{
+    var module = cache[id] = {{exports: {{}}}};
+    modules[id](module, module.exports, load);
+    return module.exports;
+  }})(0);
+}})();
+"#
+        );
+        let output =
+            unpack(&source, DecompileOptions::default()).expect("preserve the original boundary");
+        assert!(
+            output.detected_formats.is_empty(),
+            "unproven default was extracted: {initializer}; {tail}: {:?}",
+            output.detected_formats
+        );
+        assert_eq!(output.modules.len(), 1);
+        assert!(
+            !output.modules[0].1.contains("export default"),
+            "{}",
+            output.modules[0].1
+        );
+        assert!(
+            output.modules[0].1.contains("publicValue.Engine"),
+            "{}",
+            output.modules[0].1
+        );
+    }
+}
+
+#[test]
 fn webpack5_reused_exports_and_loader_parameters_split_in_evaluation_order() {
     let source = r#"
 (() => {
@@ -2881,7 +3062,7 @@ fn webpack5_require_g_is_recovered_as_global() {
         "webpack require.g.process should not survive:\n{global}"
     );
     assert!(
-        global.contains("=>require.g"),
+        global.contains("function(require)") && global.contains("return require.g"),
         "inner parameter named require should not be rewritten:\n{global}"
     );
 }
@@ -2955,7 +3136,8 @@ fn webpack5_amd_and_module_decorators_are_recovered() {
         "webpack hmd/amdO helpers should not survive:\n{runtime_helpers}"
     );
     assert!(
-        runtime_helpers.contains("=>require.amdO"),
+        runtime_helpers.contains("function(require)")
+            && runtime_helpers.contains("return require.amdO"),
         "inner parameter named require should not be rewritten:\n{runtime_helpers}"
     );
 
@@ -3157,5 +3339,33 @@ fn webpack5_composition_fails_closed_on_mid_body_strict_directive() {
     assert!(
         consumer.contains("Object.assign(module.exports"),
         "a mid-body directive-lookalike is an extra statement:\n{consumer}"
+    );
+}
+
+#[test]
+fn webpack5_does_not_misdetect_method_object_without_require_lifecycle() {
+    // Regression: esbuild browser bundles contain vendor objects whose props
+    // are all functions (e.g. rxjs's Immediate polyfill). Once the outer IIFE
+    // is unwrapped, that body becomes a detection candidate — a real webpack5
+    // modules object must be backed by the proven require lifecycle
+    // (cache write + indexed invocation + returned exports); named-only
+    // property access must not count as webpack5 evidence.
+    let source = r#"
+(() => {
+    var handles = {};
+    var Immediate = {
+        setImmediate(cb) { handles[1] = cb; return 1; },
+        clearImmediate(handle) { delete handles[handle]; }
+    };
+    var id = Immediate.setImmediate(() => console.log("tick"));
+    Immediate.clearImmediate(id);
+    console.log("done");
+})();
+"#;
+    let output = unpack(source, DecompileOptions::default()).expect("unpack should succeed");
+    let names: Vec<_> = output.modules.iter().map(|(n, _)| n.clone()).collect();
+    assert!(
+        !names.iter().any(|n| n.starts_with("module-")),
+        "method-only object misdetected as a webpack5 modules object: {names:?}"
     );
 }

@@ -2,6 +2,8 @@
 
 This matrix generates async function, async arrow, async IIFE, double-await,
 try/catch/finally, loop control flow (with and without internal continue),
+`for await` (plain, early `return`, `break` inside `try/finally`, destructured
+element, nested sync `for…of`, inside `try/catch`, in an async arrow),
 destructuring/default, object-rest, nested async callback, and generator
 delegation snippets through Babel, TypeScript, SWC, and esbuild, then runs
 wakaru over each generated shape.
@@ -20,22 +22,44 @@ loop recovered as `for…of`). See `../lib/compare.mjs`.
 This replaced an earlier regex name-stripping normalizer that was lossy and
 **false-passed** unrecovered output: Terser-compressed regenerator state
 machines and Babel lazy-init helper artifacts were reported as recovered. Those
-now correctly show as `no`. Remaining `no` rows fall into three honest buckets:
+now correctly show as `no`. Remaining `no` rows fall into four honest buckets:
 
 - **state-machine** — wakaru leaves a Terser-compressed regenerator runtime intact.
 - **degraded** — a helper artifact leaks (`__rest` inlined, `const x = undefined`,
   `push.apply(...)` not recovered).
-- **control-flow** — complex `for await` plus `break` inside `try/finally`
-  remains native or lowered, or leaks generator state opcodes instead of being
-  reconstructed as one structured loop.
+- **control-flow** — every `for await` row through a regenerator machine
+  (Babel `regenerator` mode and preset-env) stays a machine. The decoder
+  rebuilds the loop and both try regions. The protocol's close guard
+  (`if (abrupt && it.return != null)`) sits in the try block nested inside
+  the `finally`, and it jumps forward to that block's `finally` label. The
+  regenerator decoder joins forward jumps only at the end of the machine,
+  so this jump stays an opcode and the decode fails closed. A `break` in the
+  loop adds a second block: it exits through an abrupt-completion opcode
+  inside the try region (`_context.a(3, N)`), which the decoder does not
+  structure either. One Terser shape of the swc `_ts_generator` machine
+  nests a yield opcode two ternaries deep in a single `return`, which also
+  stays a machine. The `__generator` machines (tsc-es5, swc-es5) join
+  forward jumps mid-machine and rebuild loops inside try regions, so their
+  `for await` rows recover, including the Terser variants.
+- **nested loop** — a sync `for…of` inside the recovered `for await` body
+  keeps its indexed form: the machine hoists the index and array temporaries
+  to the function scope and assigns them in place, a shape the for-of
+  recovery does not match.
+- **hoisted destructuring** — after regenerator recovery of the Babel 7.8 and
+  7.13 Terser rows, the destructuring stays in assignment form with
+  `_slicedToArray(temp = defaulted, n)` on an inline-assigned temp, and the
+  `input == null ? await load() : input` pick stays an `if`/`else` temp
+  assignment instead of folding to `??`. A destructured `for await` element
+  through a `__generator` machine (tsc-es5, swc-es5) binds the value
+  temporary and keeps the hoisted member reads (`id = _d.id`) in the body.
 
 The matrix's `error` count is separate from those Wakaru recovery failures.
-The current errors are producer/harness transform failures: Babel regenerator
-cannot process the added object-pattern/default rows in this plugin setup, and
-older async/regenerator combinations cannot lower the `for await` challenge.
-One failed producer transform also marks its two downstream Terser variants as
-`source not in batch`, so the reported error count grows by three per failed
-source transform. Wakaru is not invoked for those rows.
+It counts producer or harness transform failures, for which Wakaru is not
+invoked; one failed producer transform also marks its two downstream Terser
+variants as `source not in batch`, so the count grows by three per failed
+source transform. The Babel profiles carry the plugins their snippets need
+(see below), so a non-zero error count means a producer regression, not a
+known limitation.
 
 Some hoisted `let x; … x = await …` splits are folded back to `let x = await …`
 by the `MergeDeclarationInit` rule, while others intentionally remain split
@@ -52,6 +76,13 @@ The matrix also includes standalone source-through-Terser rows for both Terser
 variants, because some recoverable shapes only appear after compiler or source
 output is minified.
 
+Each `for await` row also rejects `asyncIterator` in the recovered output, so
+a recovered loop that leaves the adapter helper behind (`_asyncIterator`,
+`__forAwait`, `__asyncValues` all mention it) is reported as `no`. Where Terser
+inlines the single-use element (`size += _step.value.size`) the recovered loop
+binds the protocol's step name; the `async-for-await-arrow` row accepts that
+form through `expectedAny`.
+
 The `class-async-method` snippet also includes a dedicated Babel preset-env IE11
 profile. Its Terser compression+mangle variant reproduces Babel's lazy async
 class-method trampoline after minification, where the method descriptor value
@@ -59,10 +90,20 @@ becomes a comma-sequence assignment plus `.apply(this, arguments)` wrapper.
 
 Babel is run in two modes:
 
-- `async-generator`: `@babel/plugin-transform-async-to-generator` only, leaving
+- `async-generator`: `@babel/plugin-transform-async-to-generator`, leaving
   native generator syntax inside `_asyncToGenerator(...)`.
 - `regenerator`: async-to-generator plus `@babel/plugin-transform-regenerator`,
-  producing `regeneratorRuntime.wrap(...)` state-machine output.
+  producing `regeneratorRuntime.wrap(...)` state-machine output, with
+  `@babel/plugin-transform-destructuring` ahead of them because regenerator's
+  declaration hoisting has no case for patterns with defaults or rest.
+
+Both modes also run the async-generator-functions plugin
+(`@babel/plugin-proposal-async-generator-functions` for the 7.8 and 7.13
+profiles, `@babel/plugin-transform-async-generator-functions` from 7.28) ahead
+of async-to-generator, in preset-env order: it lowers `for await` to the
+`_asyncIterator` protocol while the enclosing function is still `async`.
+Without it, async-to-generator leaves `for await` inside a plain generator,
+which is not valid JavaScript and which Terser rejects.
 
 Rows are grouped by distinct lowered output per snippet. The grouping key only
 normalizes CRLF to LF and trims leading/trailing whitespace, so exact helper
@@ -97,5 +138,6 @@ These flags are shared by every matrix (they live in `../lib/runner.mjs`). The
 structural comparison and `--cluster` keys are produced by `wakaru debug
 normalize --rename`; see `../lib/compare.mjs`.
 
-The script installs transformer and minifier packages under
-`target/repro-tools/`, so those downloads are cached outside the source tree.
+The script installs transformer and minifier packages in the shared repro tool
+cache (`docs/testing.md`), so those downloads are cached outside the source
+tree.

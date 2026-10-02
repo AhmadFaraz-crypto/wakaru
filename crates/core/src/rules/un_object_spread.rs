@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::common::{Mark, DUMMY_SP};
@@ -17,13 +17,11 @@ use super::cross_module_helper_refs::{
     cross_module_member_helper_kind, cross_module_ts_member_helper,
 };
 use super::helper_matcher::{
-    binding_key, member_prop_name, remaining_refs_outside_declarations, remove_fn_decls_by_binding,
+    binding_key, member_prop_name, removable_without_remaining_refs, remove_fn_decls_by_binding,
     remove_var_declarators_by_binding, static_member_prop_name, var_declarator_binding_key,
     NumericRequireNamespaces,
 };
-use super::transpiler_helper_utils::{
-    tslib_member_helper_kind, BindingKey, LocalHelperContext, TranspilerHelperKind,
-};
+use super::transpiler_helper_utils::{BindingKey, LocalHelperContext, TranspilerHelperKind};
 
 use crate::utils::paren::strip_parens;
 
@@ -111,11 +109,18 @@ fn run_un_object_spread(
     module_facts: Option<&ModuleFactsMap>,
     current_filename: Option<&str>,
 ) {
+    // Spread recovery removes helper bindings and reads `Object` as the
+    // global; a `with` statement or a direct eval anywhere in the module can
+    // rebind either name, so the module is left as is
+    // (docs/rewrite-assumptions.md, dynamic-scope skip).
+    if super::eval_utils::has_dynamic_scope_construct(module) {
+        return;
+    }
     let esbuild_aliases = collect_esbuild_object_builtin_aliases(module, unresolved_mark);
     let esbuild_define_normal_prop_helpers = if esbuild_aliases.has_spread_values_signals() {
         collect_esbuild_define_normal_prop_helpers(module, &esbuild_aliases)
     } else {
-        HashSet::new()
+        HashSet::default()
     };
     let mut local_helpers: HashMap<BindingKey, TranspilerHelperKind> = local_helper_context
         .helpers()
@@ -177,7 +182,6 @@ fn run_un_object_spread(
             .map(|key| (key.clone(), TranspilerHelperKind::Extends)),
     );
     let swc_numeric_helper_namespaces = NumericRequireNamespaces::collect(module, unresolved_mark);
-    let tslib_namespaces = local_helper_context.tslib_namespaces();
     let has_inline_object_spread_call = has_inline_object_spread_call(
         module,
         &esbuild_aliases,
@@ -187,7 +191,8 @@ fn run_un_object_spread(
         && cross_module_ts_assign_refs.namespaces.is_empty()
         && swc_numeric_helper_namespaces.candidates.is_empty()
         && cross_module_helper_refs.namespaces.is_empty()
-        && tslib_namespaces.is_empty()
+        && local_helper_context.tslib_namespaces().is_empty()
+        && !local_helper_context.has_tslib_require_member_call(TranspilerHelperKind::Extends)
         && !has_inline_object_spread_call
     {
         return;
@@ -197,7 +202,7 @@ fn run_un_object_spread(
         cross_module_helper_namespaces: &cross_module_helper_refs.namespaces,
         cross_module_ts_assign_namespaces: &cross_module_ts_assign_refs.namespaces,
         swc_numeric_helper_namespaces: &swc_numeric_helper_namespaces.candidates,
-        tslib_namespaces,
+        local_helper_context,
         esbuild_aliases: &esbuild_aliases,
         esbuild_define_normal_prop_helpers: &esbuild_define_normal_prop_helpers,
     };
@@ -247,7 +252,7 @@ impl Default for UnObjectSpread<'_> {
 fn collect_uninitialized_object_spread_stubs(
     module: &Module,
 ) -> HashMap<BindingKey, TranspilerHelperKind> {
-    let mut helpers = HashMap::new();
+    let mut helpers = HashMap::default();
 
     for item in &module.body {
         let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
@@ -324,11 +329,7 @@ fn remove_unused_esbuild_object_builtin_aliases(
     if candidates.is_empty() {
         return;
     }
-    let remaining = remaining_refs_outside_declarations(module, &candidates, &candidates);
-    let removable: HashSet<_> = candidates
-        .into_iter()
-        .filter(|key| !remaining.contains(key))
-        .collect();
+    let removable = removable_without_remaining_refs(module, &candidates);
     if !removable.is_empty() {
         remove_var_declarators_by_binding(&mut module.body, &removable);
     }
@@ -338,12 +339,7 @@ fn remove_unused_helper_dependency_decls(module: &mut Module, candidates: &HashS
     if candidates.is_empty() {
         return;
     }
-    let remaining = remaining_refs_outside_declarations(module, candidates, candidates);
-    let removable: HashSet<_> = candidates
-        .iter()
-        .filter(|key| !remaining.contains(*key))
-        .cloned()
-        .collect();
+    let removable = removable_without_remaining_refs(module, candidates);
     if removable.is_empty() {
         return;
     }
@@ -357,10 +353,10 @@ fn collect_mangled_esbuild_object_spread_helpers(
     define_normal_prop_helpers: &HashSet<BindingKey>,
 ) -> HashMap<BindingKey, TranspilerHelperKind> {
     if !aliases.has_spread_values_signals() && !aliases.has_spread_props_signals() {
-        return HashMap::new();
+        return HashMap::default();
     }
 
-    let mut helpers = HashMap::new();
+    let mut helpers = HashMap::default();
     for item in &module.body {
         let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
             continue;
@@ -488,7 +484,7 @@ fn collect_esbuild_define_normal_prop_helpers(
     module: &Module,
     aliases: &EsbuildObjectBuiltinAliases,
 ) -> HashSet<BindingKey> {
-    let mut helpers = HashSet::new();
+    let mut helpers = HashSet::default();
     for item in &module.body {
         let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
             continue;
@@ -874,7 +870,7 @@ fn collect_cross_module_object_spread_helpers(
     module_facts: &ModuleFactsMap,
     current_filename: Option<&str>,
 ) -> HashMap<BindingKey, TranspilerHelperKind> {
-    let mut helpers = HashMap::new();
+    let mut helpers = HashMap::default();
 
     for item in &module.body {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
@@ -947,12 +943,14 @@ struct SpreadReplacer<'a> {
     cross_module_helper_namespaces: &'a HashMap<BindingKey, HashMap<String, TranspilerHelperKind>>,
     cross_module_ts_assign_namespaces: &'a HashMap<BindingKey, HashSet<String>>,
     swc_numeric_helper_namespaces: &'a HashSet<BindingKey>,
-    tslib_namespaces: &'a HashSet<BindingKey>,
+    local_helper_context: &'a LocalHelperContext,
     esbuild_aliases: &'a EsbuildObjectBuiltinAliases,
     esbuild_define_normal_prop_helpers: &'a HashSet<BindingKey>,
 }
 
 impl VisitMut for SpreadReplacer<'_> {
+    fn visit_mut_with_stmt(&mut self, _stmt: &mut swc_core::ecma::ast::WithStmt) {}
+
     fn visit_mut_expr(&mut self, expr: &mut Expr) {
         expr.visit_mut_children_with(self);
 
@@ -981,25 +979,33 @@ impl VisitMut for SpreadReplacer<'_> {
         // Merge all arguments into a single object expression.
         // - Object literal args: flatten their properties
         // - Everything else: wrap as spread element
-        let mut properties: Vec<PropOrSpread> = first_obj.props.clone();
+        // All rejection checks are complete. Consume the arguments so nested
+        // recoveries do not deep-clone the same function/object trees again at
+        // every enclosing helper call.
+        let mut args = std::mem::take(&mut call.args).into_iter();
+        let first = args.next().expect("nonempty arguments checked above");
+        let Expr::Object(first_obj) = *first.expr else {
+            unreachable!("fresh object target checked above");
+        };
+        let mut properties = first_obj.props;
 
-        for arg in &call.args[1..] {
+        for mut arg in args {
             if arg.spread.is_some() {
                 properties.push(PropOrSpread::Spread(SpreadElement {
                     dot3_token: DUMMY_SP,
-                    expr: restore_conditional_spread_branch_order(arg.expr.clone()),
+                    expr: restore_conditional_spread_branch_order(arg.expr),
                 }));
                 continue;
             }
 
-            match arg.expr.as_ref() {
+            match arg.expr.as_mut() {
                 Expr::Object(obj) if is_safe_to_inline_props(&obj.props) => {
-                    properties.extend(obj.props.iter().cloned());
+                    properties.append(&mut obj.props);
                 }
                 _ => {
                     properties.push(PropOrSpread::Spread(SpreadElement {
                         dot3_token: DUMMY_SP,
-                        expr: restore_conditional_spread_branch_order(arg.expr.clone()),
+                        expr: restore_conditional_spread_branch_order(arg.expr),
                     }));
                 }
             }
@@ -1062,7 +1068,7 @@ impl SpreadReplacer<'_> {
             }
             Expr::Member(_) => {
                 matches!(
-                    tslib_member_helper_kind(callee, self.tslib_namespaces),
+                    self.local_helper_context.helper_callee_kind(callee),
                     Some(TranspilerHelperKind::Extends | TranspilerHelperKind::ObjectSpread)
                 ) || matches!(
                     cross_module_member_helper_kind(callee, self.cross_module_helper_namespaces),

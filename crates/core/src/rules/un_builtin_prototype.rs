@@ -1,4 +1,4 @@
-use swc_core::common::DUMMY_SP;
+use swc_core::common::{Mark, SyntaxContext, DUMMY_SP};
 use swc_core::ecma::ast::{
     ArrowExpr, CallExpr, Callee, Expr, FnExpr, Ident, IdentName, Lit, MemberExpr, MemberProp,
     Module, Regex,
@@ -11,19 +11,18 @@ use crate::utils::paren::strip_parens;
 
 pub struct UnBuiltinPrototype {
     level: RewriteLevel,
+    /// Context for the synthesized `Array` / `Object` / ... references: they
+    /// name the globals, so they carry the unresolved mark like any other
+    /// generated global reference.
+    unresolved_ctxt: SyntaxContext,
 }
 
 impl UnBuiltinPrototype {
-    pub fn new(level: RewriteLevel) -> Self {
-        Self { level }
-    }
-}
-
-impl Default for UnBuiltinPrototype {
-    // Standard, like every other level-aware rule: a default-constructed
-    // instance must not bypass the `terser_unsafe_proto` aggressive-only gate.
-    fn default() -> Self {
-        Self::new(RewriteLevel::Standard)
+    pub fn new(unresolved_mark: Mark, level: RewriteLevel) -> Self {
+        Self {
+            level,
+            unresolved_ctxt: SyntaxContext::empty().apply_mark(unresolved_mark),
+        }
     }
 }
 
@@ -58,7 +57,7 @@ impl VisitMut for UnBuiltinPrototype {
             return;
         };
 
-        match try_replace_builtin(call) {
+        match try_replace_builtin(call, self.unresolved_ctxt) {
             Ok(new_expr) => *expr = new_expr,
             Err(original_call) => *expr = Expr::Call(original_call),
         }
@@ -67,7 +66,7 @@ impl VisitMut for UnBuiltinPrototype {
 
 /// Try to rewrite `instance.method.call(...)` → `BuiltIn.prototype.method.call(...)`
 /// Returns Ok(new_expr) on success, Err(original_call) on failure.
-fn try_replace_builtin(call: CallExpr) -> Result<Expr, CallExpr> {
+fn try_replace_builtin(call: CallExpr, unresolved_ctxt: SyntaxContext) -> Result<Expr, CallExpr> {
     // callee must be a member expression: `instance.method.call` or `instance.method.apply`
     let callee_expr = match &call.callee {
         Callee::Expr(e) => e.as_ref(),
@@ -117,9 +116,10 @@ fn try_replace_builtin(call: CallExpr) -> Result<Expr, CallExpr> {
     // Build `BuiltIn.prototype`
     let builtin_prototype = Expr::Member(MemberExpr {
         span: DUMMY_SP,
-        obj: Box::new(Expr::Ident(Ident::new_no_ctxt(
+        obj: Box::new(Expr::Ident(Ident::new(
             builtin_name.into(),
             DUMMY_SP,
+            unresolved_ctxt,
         ))),
         prop: MemberProp::Ident(IdentName::new("prototype".into(), DUMMY_SP)),
     });
@@ -156,5 +156,53 @@ fn detect_builtin(obj: &Expr) -> Option<&'static str> {
         Expr::Lit(Lit::Str(s)) if s.value.is_empty() => Some("String"),
         Expr::Fn(FnExpr { .. }) | Expr::Arrow(ArrowExpr { .. }) => Some("Function"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use swc_core::common::{sync::Lrc, Globals, Mark, SourceMap, GLOBALS};
+    use swc_core::ecma::ast::{Callee, ModuleItem, Stmt};
+    use swc_core::ecma::transforms::base::resolver;
+
+    use super::*;
+
+    fn member_root(expr: &Expr) -> &Expr {
+        match expr {
+            Expr::Member(member) => member_root(&member.obj),
+            other => other,
+        }
+    }
+
+    #[test]
+    fn synthesized_builtin_reference_carries_the_unresolved_mark() {
+        GLOBALS.set(&Globals::new(), || {
+            let cm: Lrc<SourceMap> = Default::default();
+            let mut module =
+                crate::unpacker::parse_es_module("[].splice.apply(value, args);", "fixture.js", cm)
+                    .expect("fixture should parse");
+            let unresolved_mark = Mark::new();
+            module.visit_mut_with(&mut resolver(unresolved_mark, Mark::new(), false));
+
+            module.visit_mut_with(&mut UnBuiltinPrototype::new(
+                unresolved_mark,
+                RewriteLevel::Aggressive,
+            ));
+
+            let ModuleItem::Stmt(Stmt::Expr(stmt)) = &module.body[0] else {
+                panic!("expected an expression statement");
+            };
+            let Expr::Call(call) = stmt.expr.as_ref() else {
+                panic!("expected a call, got {:?}", stmt.expr);
+            };
+            let Callee::Expr(callee) = &call.callee else {
+                panic!("expected an expression callee");
+            };
+            let Expr::Ident(id) = member_root(callee) else {
+                panic!("expected Array.prototype.splice.apply, got {callee:?}");
+            };
+            assert_eq!(id.sym.as_ref(), "Array");
+            assert_eq!(id.ctxt.outer(), unresolved_mark);
+        });
     }
 }

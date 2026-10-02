@@ -47,7 +47,7 @@ fn primed_context(source: &str) -> VueRecoveryContext {
         let unresolved_mark = Mark::new();
         let top_level_mark = Mark::new();
         module.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, false));
-        let mut ctx = collect_context(&module, cm, HashMap::new(), HashMap::new());
+        let mut ctx = collect_context(&module, cm, HashMap::default(), HashMap::default());
         ctx.unresolved_ctxt = SyntaxContext::empty().apply_mark(unresolved_mark);
         let render = find_render_source(&module, None).expect("render source");
         prime_render_context(render, &mut ctx).unwrap();
@@ -116,7 +116,7 @@ fn test_local_binding_with_scope(
         emitted_bindings: test_atoms(emitted_bindings),
         refs: test_atom_set(refs),
         source: source.to_string(),
-        import_refs: HashSet::new(),
+        import_refs: HashSet::default(),
         stmt: test_stmt(source),
         module_scope,
         template_selectable: true,

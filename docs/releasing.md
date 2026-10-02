@@ -13,24 +13,36 @@ Useful options:
 - `--include-internal` includes docs, tests, refactors, chores, CI, and build commits.
 - `--output <path>` writes the generated entry to a separate file for review.
 
-Before publishing:
+Before tagging:
 
 1. Confirm `Cargo.toml`, `Cargo.lock`, and npm package metadata match the tag version.
+   The npm versions are rewritten from the tag at publish time; the Cargo
+   version is not, and the release workflow fails if it differs from the tag.
 2. Run the release verification checks from [Testing](testing.md).
-3. Verify both Rust packages can be assembled:
-   `cargo package -p wakaru-core --allow-dirty --no-verify` followed by
-   `cargo package -p wakaru --allow-dirty --no-verify --config
-   'patch.crates-io.wakaru-core.path="crates/core"'`. The local patch is needed
-   only for pre-publication verification; an ordinary façade package resolves
-   after the engine version is indexed by crates.io.
-4. Publish `wakaru-core` first, then publish the exact-version-dependent
-   `wakaru` façade after the registry has indexed the engine version.
-5. Check `git tag -l vX.Y.Z` is empty before creating the tag.
-6. Inspect `CHANGELOG.md` against `git log --no-merges vPREV..HEAD`.
+3. Check `git tag -l vX.Y.Z` is empty before creating the tag.
+4. Inspect `CHANGELOG.md` against `git log --no-merges vPREV..HEAD`.
+5. Review `npm/README.md` against the release: its claims must match what the
+   tagged version actually ships (e.g. a bundler format merged after the
+   previous tag needs adding; an unreleased one must not appear).
 
-Before tagging, review `npm/README.md` against the release: its claims must
-match what the tagged version actually ships (e.g. a bundler format merged
-after the previous tag needs adding; an unreleased one must not appear).
+Pushing the tag runs `.github/workflows/rust-release.yml`, which builds the
+platform binaries and, once all of them succeed, publishes everything:
+
+- **crates.io**: `wakaru-core` and the exact-version-dependent `wakaru` façade
+  in one `cargo publish` invocation, which orders them and waits for the engine
+  to be indexed. The other workspace crates carry `publish = false`. The job
+  authenticates through crates.io Trusted Publishing (GitHub OIDC), so there is
+  no registry token in the repository secrets; each of the two crates has the
+  repository and workflow file registered on its crates.io settings page.
+  Versions already on crates.io are skipped, so re-running a failed workflow is
+  safe.
+- **npm**: the platform packages, `@wakaru/cli`, and the bare `wakaru` alias.
+- **GitHub Release** with the archives attached and auto-generated notes.
+
+After the workflow finishes, replace the generated release notes with the
+reviewed ones (`gh release edit vX.Y.Z --notes-file notes.md`). Past releases
+use a short lede naming the headliners, a few themed sections, and the compare
+link.
 
 The bare `wakaru` npm package (`npm/alias/`) is a thin shim around
 `@wakaru/cli`, pinned to the exact release version. The release workflow

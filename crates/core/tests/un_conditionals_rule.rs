@@ -1,12 +1,18 @@
 mod common;
 
-use common::{assert_eq_normalized, render_rule};
+use common::{assert_eq_normalized, inspect_rule_output, render_rule};
+use swc_core::ecma::ast::IfStmt;
+use swc_core::ecma::visit::{Visit, VisitWith};
 use wakaru_core::rules::{
     UnConditionals, UnConditionalsAssignmentOnly, UnConditionalsExprStmtOnly,
 };
 
 fn apply(input: &str) -> String {
-    render_rule(input, |_| UnConditionals)
+    render_rule(input, |_| UnConditionals::default())
+}
+
+fn apply_nested(input: &str) -> String {
+    render_rule(input, |_| UnConditionals::with_nested_actions())
 }
 
 fn apply_assignment_only(input: &str) -> String {
@@ -539,6 +545,166 @@ if (a) {
   h();
 }
 "#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+/// The input text each `if` statement's span starts at, in source order.
+fn if_span_starts(input: &str) -> Vec<Option<String>> {
+    struct Ifs(Vec<swc_core::common::Span>);
+    impl Visit for Ifs {
+        fn visit_if_stmt(&mut self, node: &IfStmt) {
+            self.0.push(node.span);
+            node.visit_children_with(self);
+        }
+    }
+    inspect_rule_output(
+        input,
+        |_| UnConditionals::default(),
+        |module, text| {
+            let mut ifs = Ifs(Vec::new());
+            module.visit_with(&mut ifs);
+            ifs.0
+                .into_iter()
+                .map(|span| {
+                    text.starting_at(span)
+                        .map(|rest| rest.chars().take(8).collect())
+                })
+                .collect()
+        },
+    )
+}
+
+#[test]
+fn else_if_from_a_logical_alternate_keeps_its_input_span() {
+    assert_eq!(
+        if_span_starts("x ? a() : y && b(); z ? c() : w || d();"),
+        [
+            Some("x ? a() ".to_string()),
+            Some("y && b()".to_string()),
+            Some("z ? c() ".to_string()),
+            Some("w || d()".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn split_return_ternary_ifs_keep_their_ternary_spans() {
+    assert_eq!(
+        if_span_starts("function f() { return a ? 1 : b ? 2 : 3; }"),
+        [Some("a ? 1 : ".to_string()), Some("b ? 2 : ".to_string())]
+    );
+}
+
+#[test]
+fn negates_equality_by_flipping_the_operator() {
+    let input = r#"
+a == null || a.m();
+b === c || f();
+d != e || g();
+h !== i || k();
+j < l || m();
+"#;
+    let expected = r#"
+if (a != null) {
+    a.m();
+}
+if (b !== c) {
+    f();
+}
+if (d == e) {
+    g();
+}
+if (h === i) {
+    k();
+}
+if (!(j < l)) {
+    m();
+}
+"#;
+
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn converts_logical_statements_with_nested_actions() {
+    let input = r#"
+r && (c ? f() : g());
+a && (b && f(), c);
+a && delete o[k];
+a && i++;
+a && b?.();
+x ? a && f() : b || g();
+"#;
+    let expected = r#"
+if (r) {
+    if (c) {
+        f();
+    } else {
+        g();
+    }
+}
+if (a) {
+    if (b) {
+        f();
+    }
+    c;
+}
+if (a) {
+    delete o[k];
+}
+if (a) {
+    i++;
+}
+if (a) {
+    b?.();
+}
+if (x) {
+    if (a) {
+        f();
+    }
+} else if (!b) {
+    g();
+}
+"#;
+
+    let output = apply_nested(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn keeps_logical_statements_without_nested_actions() {
+    let input = r#"
+v && (w ? 1 : 2);
+a && (f() || b);
+a && b?.c;
+"#;
+    let expected = r#"
+v && (w ? 1 : 2);
+a && (f() || b);
+a && b?.c;
+"#;
+
+    let output = apply_nested(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn default_pass_leaves_nested_actions_for_the_cleanup_pass() {
+    // Class and helper recovery match inlined helpers in expression form, so
+    // only the nested-actions pass rewrites them.
+    let input = r#"
+t && (Object.setPrototypeOf ? Object.setPrototypeOf(e, t) : e.__proto__ = t);
+a && delete o[k];
+"#;
+    let expected = r#"
+t && (Object.setPrototypeOf ? Object.setPrototypeOf(e, t) : e.__proto__ = t);
+if (a) {
+    delete o[k];
+}
+"#;
+
     let output = apply(input);
     assert_eq_normalized(&output, expected);
 }

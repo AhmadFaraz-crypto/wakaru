@@ -1,34 +1,159 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::common::DUMMY_SP;
 use swc_core::ecma::ast::{
-    AssignOp, AssignTarget, CallExpr, Callee, Class, ClassDecl, ClassMember, ClassMethod,
-    Constructor, Decl, Expr, ExprOrSpread, ExprStmt, FnExpr, Function, FunctionBody, Ident,
-    IdentName, Lit, MemberProp, MethodKind, ModuleDecl, ModuleItem, Param, ParamOrTsParamProp, Pat,
-    PropName, SimpleAssignTarget, Stmt, VarDeclKind,
+    ArrowExpr, ArrowFunctionBody, AssignOp, AssignTarget, CallExpr, Callee, Class, ClassDecl,
+    ClassMember, ClassMethod, Constructor, Decl, Expr, ExprOrSpread, ExprStmt, FnExpr, Function,
+    FunctionBody, Ident, IdentName, Lit, MemberProp, MethodKind, ModuleDecl, ModuleItem, Param,
+    ParamOrTsParamProp, Pat, PropName, SimpleAssignTarget, Stmt, VarDeclKind,
 };
+use swc_core::ecma::utils::find_pat_ids;
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use crate::utils::paren::strip_parens;
 
+use super::callability::CallabilityIndex;
 use super::decl_utils::{
     class_accessor_descriptor_attributes, class_method_has_invalid_signature,
     ensure_setter_has_value_param, has_duplicate_param_names, ClassAccessorDescriptorAttributes,
 };
 use super::helper_matcher::{binding_key, BindingKey};
 
-pub struct UnPrototypeClass;
+#[derive(Default)]
+pub struct UnPrototypeClass {
+    /// Exported names that still need `[[Call]]` from another module.
+    pin_exports: HashSet<Atom>,
+}
 
 impl VisitMut for UnPrototypeClass {
     fn visit_mut_module_items(&mut self, items: &mut Vec<ModuleItem>) {
-        items.visit_mut_children_with(self);
-        transform_module_items(items);
+        transform_module_items_to_fixpoint(items, &self.pin_exports);
     }
 
     fn visit_mut_stmts(&mut self, stmts: &mut Vec<Stmt>) {
+        transform_stmts_to_fixpoint(stmts, &[]);
+    }
+
+    fn visit_mut_function(&mut self, function: &mut Function) {
+        let mut body = function.body.take();
+        function.visit_mut_children_with(self);
+        if let Some(body) = &mut body {
+            self.visit_parameter_body(body, &find_pat_ids::<_, BindingKey>(&function.params));
+        }
+        function.body = body;
+    }
+
+    fn visit_mut_constructor(&mut self, constructor: &mut Constructor) {
+        let mut body = constructor.body.take();
+        constructor.visit_mut_children_with(self);
+        if let Some(body) = &mut body {
+            self.visit_parameter_body(body, &find_pat_ids::<_, BindingKey>(&constructor.params));
+        }
+        constructor.body = body;
+    }
+
+    fn visit_mut_arrow_expr(&mut self, arrow: &mut ArrowExpr) {
+        arrow.params.visit_mut_with(self);
+        match &mut *arrow.body {
+            ArrowFunctionBody::FunctionBody(body) => {
+                self.visit_parameter_body(body, &find_pat_ids::<_, BindingKey>(&arrow.params));
+            }
+            ArrowFunctionBody::Expr(expr) => expr.visit_mut_with(self),
+        }
+    }
+}
+
+impl UnPrototypeClass {
+    pub(crate) fn with_pins(pin_exports: HashSet<Atom>) -> Self {
+        Self { pin_exports }
+    }
+
+    fn visit_parameter_body(&mut self, body: &mut FunctionBody, parameters: &[BindingKey]) {
+        // A function declaration may share a parameter's binding; a class in
+        // the same body may not even reuse its emitted name. Visit nested
+        // scopes normally, then guard only this body's direct declarations.
+        transform_stmts_to_fixpoint(&mut body.stmts, parameters);
+    }
+}
+
+struct UnPrototypeClassPass<'a> {
+    callability: &'a CallabilityIndex,
+    converted_any: bool,
+}
+
+impl VisitMut for UnPrototypeClassPass<'_> {
+    fn visit_mut_stmts(&mut self, stmts: &mut Vec<Stmt>) {
         stmts.visit_mut_children_with(self);
-        transform_stmts(stmts);
+        self.converted_any |= transform_stmts(stmts, &[], self.callability);
+    }
+
+    fn visit_mut_function(&mut self, function: &mut Function) {
+        let mut body = function.body.take();
+        function.visit_mut_children_with(self);
+        if let Some(body) = &mut body {
+            self.visit_parameter_body(body, &find_pat_ids::<_, BindingKey>(&function.params));
+        }
+        function.body = body;
+    }
+
+    fn visit_mut_constructor(&mut self, constructor: &mut Constructor) {
+        let mut body = constructor.body.take();
+        constructor.visit_mut_children_with(self);
+        if let Some(body) = &mut body {
+            self.visit_parameter_body(body, &find_pat_ids::<_, BindingKey>(&constructor.params));
+        }
+        constructor.body = body;
+    }
+
+    fn visit_mut_arrow_expr(&mut self, arrow: &mut ArrowExpr) {
+        arrow.params.visit_mut_with(self);
+        match &mut *arrow.body {
+            ArrowFunctionBody::FunctionBody(body) => {
+                self.visit_parameter_body(body, &find_pat_ids::<_, BindingKey>(&arrow.params));
+            }
+            ArrowFunctionBody::Expr(expr) => expr.visit_mut_with(self),
+        }
+    }
+}
+
+impl UnPrototypeClassPass<'_> {
+    fn visit_parameter_body(&mut self, body: &mut FunctionBody, parameters: &[BindingKey]) {
+        body.stmts.visit_mut_children_with(self);
+        self.converted_any |= transform_stmts(&mut body.stmts, parameters, self.callability);
+    }
+}
+
+fn transform_module_items_to_fixpoint(items: &mut Vec<ModuleItem>, pin_exports: &HashSet<Atom>) {
+    loop {
+        // Re-seed every pass. Alias propagation then marks the constructor the
+        // exported IIFE returns, which is the binding this rule would class-ify.
+        let roots = super::callability::pinned_binding_keys(items, pin_exports);
+        let callability = CallabilityIndex::collect_module_items_with_roots(items, &roots);
+        let mut pass = UnPrototypeClassPass {
+            callability: &callability,
+            converted_any: false,
+        };
+        items.visit_mut_children_with(&mut pass);
+        pass.converted_any |= transform_module_items(items, &callability);
+        if !pass.converted_any {
+            break;
+        }
+    }
+}
+
+fn transform_stmts_to_fixpoint(stmts: &mut Vec<Stmt>, parameters: &[BindingKey]) {
+    loop {
+        let callability = CallabilityIndex::collect_stmts(stmts);
+        let mut pass = UnPrototypeClassPass {
+            callability: &callability,
+            converted_any: false,
+        };
+        stmts.visit_mut_children_with(&mut pass);
+        pass.converted_any |= transform_stmts(stmts, parameters, &callability);
+        if !pass.converted_any {
+            break;
+        }
     }
 }
 
@@ -66,7 +191,7 @@ enum ConstructorKind {
     VariableFunction,
 }
 
-fn transform_module_items(items: &mut Vec<ModuleItem>) {
+fn transform_module_items(items: &mut Vec<ModuleItem>, callability: &CallabilityIndex) -> bool {
     // Extract statements for analysis
     let stmts: Vec<Option<&Stmt>> = items
         .iter()
@@ -76,7 +201,7 @@ fn transform_module_items(items: &mut Vec<ModuleItem>) {
         })
         .collect();
 
-    let candidates: Vec<_> = find_candidates(&stmts, true)
+    let candidates: Vec<_> = find_candidates(&stmts, true, callability)
         .into_iter()
         .filter(|candidate| {
             candidate.constructor_kind != ConstructorKind::FunctionDeclaration
@@ -87,7 +212,7 @@ fn transform_module_items(items: &mut Vec<ModuleItem>) {
         })
         .collect();
     if candidates.is_empty() {
-        return;
+        return false;
     }
 
     let mut all_consumed: HashSet<usize> = candidates
@@ -104,6 +229,7 @@ fn transform_module_items(items: &mut Vec<ModuleItem>) {
         candidates.iter().map(|c| (c.fn_decl_idx, c)).collect();
 
     let old: Vec<ModuleItem> = std::mem::take(items);
+    let mut converted_any = false;
     for (i, item) in old.iter().enumerate() {
         if all_consumed.contains(&i) {
             continue;
@@ -112,6 +238,7 @@ fn transform_module_items(items: &mut Vec<ModuleItem>) {
             if let ModuleItem::Stmt(stmt) = item {
                 if let Some(class_decl) = build_class_decl(candidate, stmt) {
                     items.push(ModuleItem::Stmt(Stmt::Decl(Decl::Class(class_decl))));
+                    converted_any = true;
                     for &pre_idx in &candidate.pre_ref_indices {
                         items.push(old[pre_idx].clone());
                     }
@@ -130,13 +257,25 @@ fn transform_module_items(items: &mut Vec<ModuleItem>) {
             items.push(item.clone());
         }
     }
+    converted_any
 }
 
-fn transform_stmts(stmts: &mut Vec<Stmt>) {
+fn transform_stmts(
+    stmts: &mut Vec<Stmt>,
+    parameters: &[BindingKey],
+    callability: &CallabilityIndex,
+) -> bool {
     let stmt_opts: Vec<Option<&Stmt>> = stmts.iter().map(Some).collect();
-    let candidates = find_candidates(&stmt_opts, false);
+    let candidates: Vec<_> = find_candidates(&stmt_opts, false, callability)
+        .into_iter()
+        .filter(|candidate| {
+            !parameters
+                .iter()
+                .any(|(name, _)| *name == candidate.binding.0)
+        })
+        .collect();
     if candidates.is_empty() {
-        return;
+        return false;
     }
 
     let mut all_consumed: HashSet<usize> = candidates
@@ -152,6 +291,7 @@ fn transform_stmts(stmts: &mut Vec<Stmt>) {
         candidates.iter().map(|c| (c.fn_decl_idx, c)).collect();
 
     let old: Vec<Stmt> = std::mem::take(stmts);
+    let mut converted_any = false;
     for (i, stmt) in old.iter().enumerate() {
         if all_consumed.contains(&i) {
             continue;
@@ -159,6 +299,7 @@ fn transform_stmts(stmts: &mut Vec<Stmt>) {
         if let Some(candidate) = fn_decl_map.get(&i) {
             if let Some(class_decl) = build_class_decl(candidate, stmt) {
                 stmts.push(Stmt::Decl(Decl::Class(class_decl)));
+                converted_any = true;
                 for &pre_idx in &candidate.pre_ref_indices {
                     stmts.push(old[pre_idx].clone());
                 }
@@ -173,6 +314,7 @@ fn transform_stmts(stmts: &mut Vec<Stmt>) {
             stmts.push(stmt.clone());
         }
     }
+    converted_any
 }
 
 fn debug_assert_candidate_points_to_function_decl(item: &ModuleItem) {
@@ -230,7 +372,11 @@ fn extract_constructor(
 }
 
 /// Find all class candidates in a list of statements.
-fn find_candidates(stmts: &[Option<&Stmt>], allow_module_var: bool) -> Vec<ClassCandidate> {
+fn find_candidates(
+    stmts: &[Option<&Stmt>],
+    allow_module_var: bool,
+    callability: &CallabilityIndex,
+) -> Vec<ClassCandidate> {
     let len = stmts.len();
     let get_stmt = |i: usize| stmts[i];
     // Phase 1: Find function declarations and single-declarator anonymous
@@ -257,7 +403,7 @@ fn find_candidates(stmts: &[Option<&Stmt>], allow_module_var: bool) -> Vec<Class
     }
 
     // Collect the set of names that have prototype method assignments — this is the primary trigger
-    let mut names_with_proto_methods: HashSet<BindingKey> = HashSet::new();
+    let mut names_with_proto_methods: HashSet<BindingKey> = HashSet::default();
     for i in 0..len {
         let Some(stmt) = get_stmt(i) else { continue };
         let target = get_prototype_method_target(stmt).or_else(|| get_define_property_target(stmt));
@@ -273,10 +419,10 @@ fn find_candidates(stmts: &[Option<&Stmt>], allow_module_var: bool) -> Vec<Class
 
     // Phase 2: For each candidate, collect all associated statements
     let mut candidates = Vec::new();
-    let mut globally_consumed: HashSet<usize> = HashSet::new();
+    let mut globally_consumed: HashSet<usize> = HashSet::default();
 
     for (fn_idx, binding, constructor_kind) in &fn_decls {
-        if !names_with_proto_methods.contains(binding) {
+        if !names_with_proto_methods.contains(binding) || callability.requires_call(binding) {
             continue;
         }
 
@@ -285,7 +431,7 @@ fn find_candidates(stmts: &[Option<&Stmt>], allow_module_var: bool) -> Vec<Class
         // - A chained inheritance expression (consumed, super class extracted)
         // Any other reference to the name → skip candidate entirely.
         let mut pre_ref_indices: Vec<usize> = Vec::new();
-        let mut pre_consumed_indices: HashSet<usize> = HashSet::new();
+        let mut pre_consumed_indices: HashSet<usize> = HashSet::default();
         let mut pre_super_class: Option<Box<Expr>> = None;
         let mut pre_super_class_name: Option<BindingKey> = None;
         let mut pre_class_name_value: Option<Atom> = None;
@@ -413,21 +559,23 @@ fn find_candidates(stmts: &[Option<&Stmt>], allow_module_var: bool) -> Vec<Class
         // assignment. An unrecognized helper call involving the constructor
         // may replace its prototype (for example `tm.inherit(Child, Base)`), so
         // preserve the original ordering. Ordinary reads and `new Child()` are
-        // safe and are intentionally not blocked.
-        let has_interleaved_constructor_call = *constructor_kind
-            == ConstructorKind::VariableFunction
-            && candidate
-                .consumed_indices
-                .iter()
-                .copied()
-                .max()
-                .is_some_and(|last_consumed| {
-                    ((*fn_idx + 1)..last_consumed).any(|i| {
-                        !candidate.consumed_indices.contains(&i)
-                            && get_stmt(i)
-                                .is_some_and(|stmt| is_call_referencing_binding(stmt, binding))
-                    })
-                });
+        // safe and are intentionally not blocked. Hoisted function declarations
+        // need the same protection as variable-initialized constructors.
+        let has_interleaved_constructor_call = candidate
+            .consumed_indices
+            .iter()
+            .copied()
+            .max()
+            .is_some_and(|last_consumed| {
+                ((*fn_idx + 1)..last_consumed).any(|i| {
+                    !candidate.consumed_indices.contains(&i)
+                        && get_stmt(i).is_some_and(|stmt| {
+                            is_call_referencing_binding(stmt, binding)
+                                && (*constructor_kind == ConstructorKind::VariableFunction
+                                    || call_receives_constructor(stmt, binding))
+                        })
+                })
+            });
         if has_interleaved_constructor_call {
             continue;
         }
@@ -439,6 +587,7 @@ fn find_candidates(stmts: &[Option<&Stmt>], allow_module_var: bool) -> Vec<Class
         // and the leftover assignment would target a class's non-writable
         // `prototype` (a strict-mode TypeError). This hazard is independent
         // of the constructor's declaration shape.
+        let constructor_aliases = collect_constructor_aliases(stmts, binding);
         let has_retained_prototype_replacement = (0..len).any(|i| {
             get_stmt(i).is_some_and(|stmt| {
                 // These exact whole-prototype writes are consumed as recognized
@@ -446,7 +595,10 @@ fn find_candidates(stmts: &[Option<&Stmt>], allow_module_var: bool) -> Vec<Class
                 let consumed_inheritance = candidate.consumed_indices.contains(&i)
                     && (extract_chained_inheritance(stmt, binding).is_some()
                         || extract_object_create_inheritance(stmt, binding).is_some());
-                !consumed_inheritance && contains_prototype_replacement(stmt, binding)
+                !consumed_inheritance
+                    && constructor_aliases
+                        .iter()
+                        .any(|alias| contains_prototype_replacement(stmt, alias))
             })
         });
         if has_retained_prototype_replacement {
@@ -464,9 +616,70 @@ fn find_candidates(stmts: &[Option<&Stmt>], allow_module_var: bool) -> Vec<Class
     candidates
 }
 
+// Passing the constructor itself lets an unknown helper replace its prototype.
+// For hoisted declarations, keep the existing recovery across calls that only
+// receive a property such as Object.defineProperty(Foo.prototype, ...).
+fn call_receives_constructor(stmt: &Stmt, binding: &BindingKey) -> bool {
+    let Stmt::Expr(statement) = stmt else {
+        return false;
+    };
+    let Expr::Call(call) = strip_parens(&statement.expr) else {
+        return false;
+    };
+    call.args.iter().any(
+        |arg| matches!(strip_parens(&arg.expr), Expr::Ident(id) if binding_key(id) == *binding),
+    )
+}
+
 fn is_call_referencing_binding(stmt: &Stmt, binding: &BindingKey) -> bool {
     matches!(stmt, Stmt::Expr(expr_stmt) if matches!(expr_stmt.expr.as_ref(), Expr::Call(_)))
         && references_binding(stmt, binding, true)
+}
+
+/// Collect bindings reached by direct assignments such as `alias = Foo`.
+/// A later whole-prototype write through any such alias may still target
+/// Foo's prototype object and therefore prevents safe native-class recovery.
+fn collect_constructor_aliases(
+    stmts: &[Option<&Stmt>],
+    constructor: &BindingKey,
+) -> HashSet<BindingKey> {
+    #[derive(Default)]
+    struct AliasAssignments {
+        pairs: Vec<(BindingKey, BindingKey)>,
+    }
+
+    impl Visit for AliasAssignments {
+        fn visit_assign_expr(&mut self, assign: &swc_core::ecma::ast::AssignExpr) {
+            if assign.op == AssignOp::Assign {
+                if let AssignTarget::Simple(SimpleAssignTarget::Ident(target)) = &assign.left {
+                    if let Expr::Ident(source) = strip_parens(&assign.right) {
+                        self.pairs
+                            .push((binding_key(&target.id), binding_key(source)));
+                    }
+                }
+            }
+            assign.visit_children_with(self);
+        }
+    }
+
+    let mut assignments = AliasAssignments::default();
+    for stmt in stmts.iter().flatten() {
+        stmt.visit_with(&mut assignments);
+    }
+
+    let mut aliases = HashSet::default();
+    aliases.insert(constructor.clone());
+    loop {
+        let mut changed = false;
+        for (target, source) in &assignments.pairs {
+            if aliases.contains(source) {
+                changed |= aliases.insert(target.clone());
+            }
+        }
+        if !changed {
+            return aliases;
+        }
+    }
 }
 
 /// Check if a statement contains an assignment that replaces the whole
@@ -891,6 +1104,9 @@ fn extract_method_assignment<'a>(
     if has_duplicate_param_names(&fn_expr.function.params) {
         return None;
     }
+    if fn_expr_references_own_name(fn_expr) {
+        return None;
+    }
 
     // Case 1: Foo.prototype.method = function() {}
     if let Expr::Member(obj_member) = lhs.obj.as_ref() {
@@ -1121,7 +1337,9 @@ fn extract_define_property(stmt: &Stmt, ctor_binding: &BindingKey) -> Option<Vec
         class_accessor_descriptor_attributes(obj),
         Some(ClassAccessorDescriptorAttributes::ClassCompatible)
     );
-    if value_fn.is_some_and(|fn_expr| has_duplicate_param_names(&fn_expr.function.params)) {
+    if value_fn.is_some_and(|fn_expr| {
+        has_duplicate_param_names(&fn_expr.function.params) || fn_expr_references_own_name(fn_expr)
+    }) {
         return None;
     }
 
@@ -1134,6 +1352,9 @@ fn extract_define_property(stmt: &Stmt, ctor_binding: &BindingKey) -> Option<Vec
                 let Expr::Fn(fn_expr) = kv.value.as_ref() else {
                     continue;
                 };
+                if fn_expr_references_own_name(fn_expr) {
+                    return None;
+                }
                 (&kv.key, fn_expr.function.as_ref())
             }
             // ObjMethodShorthand runs before UnPrototypeClass in the full
@@ -1342,6 +1563,34 @@ fn build_constructor_from_fn(
     }
 }
 
+/// A class method has no name binding of its own, so converting a named
+/// function expression drops its inner binding. That is only safe when the
+/// body never reads the name: `Foo.prototype.m = function q() { ... q ... }`
+/// (a hand-written self-reference, e.g. `asPromise(q, this, ...)`) must stay
+/// on the prototype or `q` becomes a free identifier.
+fn fn_expr_references_own_name(fn_expr: &FnExpr) -> bool {
+    let Some(ident) = &fn_expr.ident else {
+        return false;
+    };
+    struct OwnNameFinder<'a> {
+        binding: &'a BindingKey,
+        found: bool,
+    }
+    impl Visit for OwnNameFinder<'_> {
+        fn visit_ident(&mut self, id: &Ident) {
+            if binding_key(id) == *self.binding {
+                self.found = true;
+            }
+        }
+    }
+    let mut finder = OwnNameFinder {
+        binding: &binding_key(ident),
+        found: false,
+    };
+    fn_expr.function.visit_with(&mut finder);
+    finder.found
+}
+
 fn build_class_method_from_fn(key: PropName, fn_expr: &FnExpr, is_static: bool) -> ClassMethod {
     build_class_method_from_function(key, &fn_expr.function, is_static)
 }
@@ -1463,7 +1712,7 @@ mod tests {
             binding: ("Foo".into(), Default::default()),
             super_class: None,
             super_class_binding: None,
-            consumed_indices: HashSet::new(),
+            consumed_indices: HashSet::default(),
             pre_ref_indices: Vec::new(),
             class_name_value: None,
             members: Vec::new(),

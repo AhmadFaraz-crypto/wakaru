@@ -2,7 +2,7 @@
 //! function-assigned vars, helper imports) and collect their binding identities
 //! and kinds. The per-node recognition lives in `matchers`; this is the driver.
 
-use std::collections::HashMap;
+use crate::collections::HashMap;
 
 use swc_core::common::Mark;
 use swc_core::ecma::ast::{
@@ -35,7 +35,7 @@ pub(super) fn collect_transpiler_helpers_inner(
     // or Symbol.iterator — signals that Babel sub-helpers are present.
     let has_sub_helpers = module_has_babel_sub_helper_signals(module);
 
-    let mut helpers = HashMap::new();
+    let mut helpers = HashMap::default();
     for item in &module.body {
         match item {
             // function _interopRequireDefault(obj) { ... }
@@ -58,6 +58,12 @@ pub(super) fn collect_transpiler_helpers_inner(
                         detect_helper_from_var_decl(decl, has_sub_helpers, unresolved_mark)
                     {
                         helpers.insert(key, kind);
+                    } else if let Some(key) = super::ts_helpers::detect_ts_import_star_sequence(
+                        module,
+                        decl,
+                        unresolved_mark,
+                    ) {
+                        helpers.insert(key, TranspilerHelperKind::InteropRequireWildcard);
                     }
                 }
             }
@@ -144,9 +150,8 @@ pub(super) fn collect_transpiler_helpers_inner(
 /// Modern targets commonly declare the namespace with `const`; older SWC and
 /// lifted AMD factory parameters use `var`, which is callable only when the
 /// complete binding-use index proves that namespace is never replaced.
-/// Interop-default is the only consumer for now; extending this to another
-/// helper kind requires that rule to handle namespace cleanup and fail-closed
-/// retention too.
+/// Interop-default and async-to-generator consume these namespace facts.
+/// Consumers still prove safe uses and retain helpers for rejected calls.
 pub(super) fn collect_swc_member_helpers(
     module: &Module,
     unresolved_mark: Option<Mark>,
@@ -155,10 +160,26 @@ pub(super) fn collect_swc_member_helpers(
     HashMap<BindingKey, TranspilerHelperKind>,
 ) {
     let direct_writes = BindingUseIndex::collect_direct_write_bindings(module);
-    let mut callable_helpers = HashMap::new();
-    let mut namespaces = HashMap::new();
+    let mut callable_helpers = HashMap::default();
+    let mut namespaces = HashMap::default();
 
     for item in &module.body {
+        if let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item {
+            if !import.type_only
+                && import.src.value.as_str() == Some("@swc/helpers/_/_async_to_generator")
+            {
+                for specifier in &import.specifiers {
+                    if let ImportSpecifier::Namespace(namespace) = specifier {
+                        let key = binding_key(&namespace.local);
+                        namespaces.insert(key.clone(), TranspilerHelperKind::AsyncToGenerator);
+                        if !direct_writes.contains(&key) {
+                            callable_helpers.insert(key, TranspilerHelperKind::AsyncToGenerator);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
             continue;
         };
@@ -193,16 +214,21 @@ pub(super) fn collect_swc_member_helpers(
             continue;
         };
         let path = source.value.as_str().unwrap_or("");
-        if !path.starts_with("@swc/helpers/_/_")
-            || detect_helper_from_path(path) != Some(TranspilerHelperKind::InteropRequireDefault)
-        {
+        let Some(kind) = detect_helper_from_path(path).filter(|kind| {
+            path.starts_with("@swc/helpers/_/_")
+                && matches!(
+                    kind,
+                    TranspilerHelperKind::InteropRequireDefault
+                        | TranspilerHelperKind::AsyncToGenerator
+                )
+        }) else {
             continue;
-        }
+        };
 
         let key = binding_key(&binding.id);
-        namespaces.insert(key.clone(), TranspilerHelperKind::InteropRequireDefault);
+        namespaces.insert(key.clone(), kind);
         if !direct_writes.contains(&key) {
-            callable_helpers.insert(key, TranspilerHelperKind::InteropRequireDefault);
+            callable_helpers.insert(key, kind);
         }
     }
 

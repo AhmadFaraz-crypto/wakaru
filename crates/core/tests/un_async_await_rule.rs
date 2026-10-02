@@ -248,6 +248,40 @@ function* func() {
 }
 
 #[test]
+fn block_binding_sharing_the_state_name_keeps_its_own_sent_call() {
+    // Unlike nested functions, blocks are traversed by the sent finder and
+    // replacer. Their local `_a` must not consume the preceding yield.
+    let input = r#"
+function func() {
+  return __generator(this, function (_a) {
+    switch (_a.label) {
+      case 0:
+        return [4 /*yield*/, load()];
+      case 1:
+        _a.sent();
+        {
+          let _a = item;
+          use(_a.sent());
+        }
+        return [2 /*return*/];
+    }
+  });
+}
+"#;
+    let expected = r#"
+function* func() {
+  yield load();
+  {
+    let _a = item;
+    use(_a.sent());
+  }
+}
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
 fn generator_preserves_callback_locals_declared_after_state_switch() {
     let input = r#"
 const localValue = "module";
@@ -1929,9 +1963,12 @@ __awaiter(this, void 0, void 0, function* () {
 
 #[test]
 fn nested_arrow_generator_does_not_block_standalone_awaiter_iife() {
+    // The nested wrapper passes `void 0`, not `this`: a body that read the
+    // top-level `this` would preserve the outer wrapper for a different
+    // reason (see the module-level this test below).
     let input = r#"
 __awaiter(this, void 0, void 0, function* () {
-  const nested = () => __generator(this, function (_a) {
+  const nested = () => __generator(void 0, function (_a) {
     switch (_a.label) {
       case 0:
         return [9, work()];
@@ -1951,7 +1988,7 @@ __awaiter(this, void 0, void 0, function* () {
         "the standalone awaiter yield should become await, got:\n{output}"
     );
     assert!(
-        output.contains("=>__generator(this, function(_a)"),
+        output.contains("=>__generator(void 0, function(_a)"),
         "the unsupported nested arrow wrapper must remain intact, got:\n{output}"
     );
 }
@@ -2330,4 +2367,1179 @@ function f(undefined) {
         !output.contains("await this.x"),
         "shadowed undefined must not become the enclosing this in the isolated rule:\n{output}"
     );
+}
+
+// ── thisArg / arguments slots must survive the splice destination ──────────
+
+#[test]
+fn recovers_arguments_slot_when_the_spliced_body_reads_arguments() {
+    // tsc's canonical pair: the `arguments` slot with a body that reads
+    // `arguments`. Splicing into the enclosing function keeps the same
+    // arguments object.
+    let input = r#"
+var __awaiter = require("tslib").__awaiter;
+function h() {
+    return __awaiter(this, arguments, void 0, function* () {
+        yield arguments[0];
+    });
+}
+"#;
+    let output = apply(input);
+    assert!(
+        output.contains("async function h()") && output.contains("await arguments[0]"),
+        "the canonical arguments pair must recover:\n{output}"
+    );
+}
+
+#[test]
+fn return_path_preserves_wrapper_when_empty_arguments_body_reads_arguments() {
+    // `void 0` applies an empty arguments list, but the spliced body would
+    // read the enclosing function's real arguments.
+    let input = r#"
+var __awaiter = require("tslib").__awaiter;
+function h() {
+    return __awaiter(this, void 0, void 0, function* () {
+        yield arguments[0];
+    });
+}
+"#;
+    let output = apply(input);
+    assert!(
+        !output.contains("async function h()"),
+        "an empty arguments slot must not splice a body that reads arguments:\n{output}"
+    );
+}
+
+#[test]
+fn return_path_preserves_wrapper_when_undefined_this_arg_body_reads_this() {
+    // `void 0` binds `this` to undefined inside the generator; splicing into
+    // `g` would rebind it to g's receiver.
+    let input = r#"
+var __awaiter = require("tslib").__awaiter;
+function g() {
+    return __awaiter(void 0, void 0, void 0, function* () {
+        yield this.x;
+    });
+}
+"#;
+    let output = apply(input);
+    assert!(
+        !output.contains("async function g()"),
+        "a void thisArg must not splice a body that reads this into the enclosing function:\n{output}"
+    );
+    // The expression-position fallback is exact here: a receiver-less IIFE
+    // also sees `this === undefined`.
+    assert!(
+        output.contains("async function()") && output.contains("await this.x"),
+        "the IIFE form reproduces the undefined receiver:\n{output}"
+    );
+}
+
+#[test]
+fn iife_path_preserves_wrapper_when_this_arg_body_reads_this_inside_a_function() {
+    // Inside `f`, `this` is f's receiver; a fresh IIFE would see undefined.
+    let input = r#"
+var __awaiter = require("tslib").__awaiter;
+function f() {
+    return [1].map(() => __awaiter(this, void 0, void 0, function* () {
+        yield this.x;
+    }));
+}
+"#;
+    let output = apply(input);
+    assert!(
+        output.contains("__awaiter(this") && output.contains("yield this.x"),
+        "an IIFE would rebind this; the wrapper must stay:\n{output}"
+    );
+}
+
+#[test]
+fn iife_path_preserves_wrapper_when_top_level_this_arg_body_reads_this() {
+    // A module's top-level `this` is undefined like the IIFE's, but wakaru
+    // preserves the script goal and a strict script's top-level `this` is the
+    // global object — the receiver-less IIFE would change it. No depth-zero
+    // exception: fail closed.
+    let input = r#"
+var __awaiter = require("tslib").__awaiter;
+__awaiter(this, void 0, void 0, function* () {
+    yield this.x;
+});
+"#;
+    let output = apply(input);
+    assert!(
+        output.contains("__awaiter(this") && output.contains("yield this.x"),
+        "top-level this must not be rebound by an IIFE:\n{output}"
+    );
+}
+
+#[test]
+fn iife_path_preserves_wrapper_when_arguments_slot_body_reads_arguments() {
+    // The `arguments` slot forwards f's arguments; a fresh IIFE receives none.
+    let input = r#"
+var __awaiter = require("tslib").__awaiter;
+function f() {
+    run(__awaiter(this, arguments, void 0, function* () {
+        yield arguments[0];
+    }));
+}
+"#;
+    let output = apply(input);
+    assert!(
+        output.contains("__awaiter(this, arguments"),
+        "an IIFE would empty arguments; the wrapper must stay:\n{output}"
+    );
+}
+
+#[test]
+fn preserves_wrapper_when_this_alias_is_written() {
+    // The helper reads `_this` once at call time; the spliced body would read
+    // it live, after the reassignment.
+    let input = r#"
+var __awaiter = require("tslib").__awaiter;
+function k() {
+    var _this = this;
+    _this = other;
+    return __awaiter(_this, void 0, void 0, function* () {
+        yield this.x;
+    });
+}
+"#;
+    let output = apply(input);
+    assert!(
+        output.contains("__awaiter(_this") && !output.contains("async function k()"),
+        "a written alias must preserve the wrapper:\n{output}"
+    );
+}
+
+#[test]
+fn this_alias_rewrites_lexical_this_in_class_extends_and_computed_keys() {
+    // `extends` expressions and computed keys evaluate in the enclosing scope
+    // and must follow the alias; method bodies keep their own `this`.
+    let input = r#"
+var __awaiter = require("tslib").__awaiter;
+function f(ctx) {
+    return __awaiter(ctx, void 0, void 0, function* () {
+        const C = class extends this.Base {
+            [this.k]() { return this; }
+        };
+        yield C;
+    });
+}
+"#;
+    let output = apply(input);
+    assert!(
+        output.contains("extends ctx.Base") && output.contains("[ctx.k]"),
+        "lexical this inside the class must follow the alias:\n{output}"
+    );
+    assert!(
+        output.contains("return this;"),
+        "the method body keeps its own this:\n{output}"
+    );
+}
+
+// ── with statements make identifier-shaped frame slots untrustworthy ────────
+
+#[test]
+fn with_statement_preserves_wrapper_with_identifier_this_arg() {
+    // Inside `with (box)`, `undefined` may resolve to `box.undefined` at
+    // runtime and carry a real receiver; the resolver cannot see that. The
+    // module-wide check refuses every identifier-shaped slot.
+    let input = r#"
+var __awaiter = require("tslib").__awaiter;
+var box = { undefined: ctx };
+with (box) {
+    __awaiter(undefined, void 0, void 0, function* () {
+        yield this.x;
+    });
+}
+"#;
+    let output = apply(input);
+    assert!(
+        output.contains("__awaiter(undefined") && !output.contains("async function"),
+        "an identifier thisArg under a with statement must keep the wrapper:\n{output}"
+    );
+}
+
+#[test]
+fn with_statement_still_recovers_literal_frame_slots() {
+    // `this` and `void <literal>` are not name lookups, so a `with` elsewhere
+    // in the module does not affect them.
+    let input = r#"
+var __awaiter = require("tslib").__awaiter;
+with (box) { use(value); }
+function f() {
+    return __awaiter(this, void 0, void 0, function* () {
+        yield work();
+    });
+}
+"#;
+    let output = apply(input);
+    assert!(
+        output.contains("async function f()") && output.contains("await work()"),
+        "literal-shaped slots stay canonical under a with statement:\n{output}"
+    );
+}
+
+#[test]
+fn with_statement_rejects_identifier_arguments_and_promise_slots() {
+    let input = r#"
+var __awaiter = require("tslib").__awaiter;
+with (box) { use(value); }
+function g() {
+    return __awaiter(this, arguments, Promise, function* () {
+        yield work();
+    });
+}
+"#;
+    let output = apply(input);
+    assert!(
+        output.contains("__awaiter(this, arguments, Promise") && !output.contains("async function"),
+        "identifier arguments/Promise slots under a with statement must keep the wrapper:\n{output}"
+    );
+}
+
+// TypeScript 5.9.3 --importHelpers emits these call frames (ES2015/ES5).
+fn tslib_async_body(awaiter: &str, generator: Option<&str>) -> String {
+    let body = generator.map_or_else(
+        || "function* () { var result = yield value; return result + 1; }".to_string(),
+        |generator| {
+            format!(
+                r#"function () {{
+            var result;
+            return {generator}(this, function (state) {{
+                switch (state.label) {{
+                    case 0: return [4, value];
+                    case 1: result = state.sent(); return [2, result + 1];
+                }}
+            }});
+        }}"#
+            )
+        },
+    );
+    format!("function load(value) {{ return {awaiter}(this, void 0, void 0, {body}); }}")
+}
+
+#[test]
+fn tslib_namespace_async_helpers_restore_both_targets() {
+    for declaration in [
+        "var runtime = require(\"tslib\");",
+        "import * as runtime from \"tslib\";",
+        "import runtime from \"tslib\";",
+        "import * as runtime from \"tslib/tslib.es6.js\";",
+    ] {
+        for generator in [None, Some("runtime.__generator")] {
+            let input = format!(
+                "{declaration}\n{}",
+                tslib_async_body("runtime.__awaiter", generator)
+            );
+            let statements = if generator.is_some() {
+                "var result; result = await value; return result + 1;"
+            } else {
+                "var result = await value; return result + 1;"
+            };
+            let expected = format!("{declaration}\nasync function load(value) {{ {statements} }}");
+            assert_eq_normalized(&apply_without_helpers(&input), &expected);
+        }
+    }
+}
+
+#[test]
+fn tslib_direct_require_member_async_helpers_restore_both_targets() {
+    for generator in [None, Some("require(\"tslib\").__generator")] {
+        let input = tslib_async_body("require(\"tslib\").__awaiter", generator);
+        let statements = if generator.is_some() {
+            "var result; result = await value; return result + 1;"
+        } else {
+            "var result = await value; return result + 1;"
+        };
+        assert_eq_normalized(
+            &apply_without_helpers(&input),
+            &format!("async function load(value) {{ {statements} }}"),
+        );
+    }
+}
+
+#[test]
+fn tslib_mixed_alias_and_namespace_return_the_awaited_value() {
+    for (alias, member, awaiter, generator) in [
+        ("runAsync", "__awaiter", "runAsync", "runtime.__generator"),
+        (
+            "runGenerator",
+            "__generator",
+            "runtime.__awaiter",
+            "runGenerator",
+        ),
+    ] {
+        let declaration =
+            format!("var runtime = require(\"tslib\"); var {alias} = runtime.{member};");
+        let input = format!(
+            "{declaration}\n{}",
+            tslib_async_body(awaiter, Some(generator))
+        );
+        // In particular, an async function returning runtime.__generator is
+        // NOT a successful recovery: its resolved value would be an iterator.
+        let expected = format!(
+            r#"{declaration}
+            async function load(value) {{
+                var result;
+                result = await value;
+                return result + 1;
+            }}"#
+        );
+        assert_eq_normalized(&apply_without_helpers(&input), &expected);
+        let output = render(&input);
+        assert!(output.contains("async function load(value)"), "{output}");
+        assert!(output.contains("await value"), "{output}");
+        assert!(
+            !output.contains("__generator("),
+            "must return the value, not an iterator: {output}"
+        );
+    }
+}
+
+#[test]
+fn tslib_namespace_members_require_matching_binding_and_source() {
+    for declaration in [
+        "import * as runtime from \"./other.js\";",
+        "var runtime = require(\"other\");",
+        "var runtime = customRuntime;",
+    ] {
+        let input = format!(
+            "{declaration}\n{}",
+            tslib_async_body("runtime.__awaiter", Some("runtime.__generator"))
+        );
+        assert_eq_normalized(&apply_without_helpers(&input), &input);
+    }
+    let shadowed = format!(
+        "import * as runtime from \"tslib\"; function wrapper(runtime) {{ {} return load; }}",
+        tslib_async_body("runtime.__awaiter", Some("runtime.__generator"))
+    );
+    assert_eq_normalized(&apply_without_helpers(&shadowed), &shadowed);
+}
+
+#[test]
+fn tslib_async_members_do_not_trust_shadowed_require() {
+    for body in [
+        format!(
+            "var runtime = require(\"tslib\"); {}",
+            tslib_async_body("runtime.__awaiter", Some("runtime.__generator"))
+        ),
+        tslib_async_body(
+            "require(\"tslib\").__awaiter",
+            Some("require(\"tslib\").__generator"),
+        ),
+    ] {
+        let input = format!("function require(name) {{ return customRuntime; }} {body}");
+        assert_eq_normalized(&apply_without_helpers(&input), &input);
+        assert!(!render(&input).contains("async function load"));
+    }
+}
+
+#[test]
+fn tslib_namespace_async_rollback_keeps_unsupported_generator() {
+    let input = r#"
+        import * as runtime from "tslib";
+        function load(value) {
+            return runtime.__awaiter(this, void 0, void 0, function () {
+                return runtime.__generator(this, function (state) {
+                    switch (state.label) {
+                        case 0: return [3, 99];
+                        case 1: return [2, value];
+                    }
+                });
+            });
+        }
+    "#;
+    assert_eq_normalized(&apply_without_helpers(input), input);
+    assert!(!render(input).contains("async function load"));
+}
+
+#[test]
+fn tslib_namespace_awaiter_keeps_noncanonical_frame() {
+    let input = format!(
+        "import * as runtime from \"tslib\"; {}",
+        tslib_async_body("runtime.__awaiter", None)
+    )
+    .replace("this, void 0, void 0", "this, void 0, CustomPromise");
+    assert_eq_normalized(&apply_without_helpers(&input), &input);
+}
+
+#[test]
+fn tslib_namespace_awaiter_restores_expression_position() {
+    let input = r#"
+        import * as runtime from "tslib";
+        consume(runtime.__awaiter(void 0, void 0, void 0, function* () {
+            return yield ready();
+        }));
+    "#;
+    let expected = r#"
+        import * as runtime from "tslib";
+        consume(async function () { return await ready(); }());
+    "#;
+    assert_eq_normalized(&apply_without_helpers(input), expected);
+}
+
+#[test]
+fn tslib_namespace_members_preserve_with_lookup() {
+    for callee in ["runtime.__awaiter", "require(\"tslib\").__awaiter"] {
+        let input = format!(
+            r#"
+            var runtime = require("tslib");
+            with (scope) {{
+                consume({callee}(void 0, void 0, void 0, function* () {{
+                    return yield ready();
+                }}));
+            }}
+        "#
+        );
+        assert_eq_normalized(&apply_without_helpers(&input), &input);
+    }
+}
+
+#[test]
+fn delegated_values_restore_across_tslib_delivery_forms() {
+    for (prefix, values) in [
+        ("import * as ts from 'tslib';", "ts.__values"),
+        ("var ts = require('tslib');", "ts.__values"),
+        ("import { __values as v } from 'tslib';", "v"),
+        ("", "require('tslib').__values"),
+    ] {
+        let input = format!(
+            "{prefix} function read(items) {{ return __generator(this, function(state) {{ return [5, {values}(items)]; }}); }}"
+        );
+        let output = apply(&input);
+        assert!(output.contains("yield* items"), "{output}");
+    }
+}
+
+#[test]
+fn delegated_values_preserve_unknown_calls_and_argument_effects() {
+    for (params, value) in [
+        ("items, __values", "__values(items)"),
+        ("items, require", "require('tslib').__values(items)"),
+        ("items, ts", "ts.__values(items)"),
+        ("items", "ts.__values(items, effect())"),
+        ("items", "ts.__values(...items)"),
+    ] {
+        let input = format!(
+            "import * as ts from 'tslib'; function read({params}) {{ return __generator(this, function(state) {{ return [5, {value}]; }}); }}"
+        );
+        let output = apply(&input);
+        assert!(!output.contains("yield* items;"), "{output}");
+        assert!(
+            output.contains(".__values(") || output.contains("yield* __values("),
+            "{output}"
+        );
+    }
+}
+
+#[test]
+fn delegated_values_preserve_reassigned_helpers() {
+    for (prefix, value) in [
+        ("var v = require('tslib').__values; v = custom;", "v"),
+        ("var ts = require('tslib'); ts = custom;", "ts.__values"),
+    ] {
+        let input = format!(
+            "{prefix} function read(items) {{ return __generator(this, function(state) {{ return [5, {value}(items)]; }}); }}"
+        );
+        assert!(!apply(&input).contains("yield* items;"));
+    }
+}
+
+#[test]
+fn delegated_values_use_cross_module_namespace_facts() {
+    let mut facts = ModuleFactsMap::new();
+    facts.insert(
+        "helpers.js",
+        ModuleFacts {
+            ts_helper_exports: vec![
+                TypeScriptHelperExportFact {
+                    exported: "g".into(),
+                    local: Some("g".into()),
+                    kind: TypeScriptHelperKind::Generator,
+                },
+                TypeScriptHelperExportFact {
+                    exported: "v".into(),
+                    local: Some("v".into()),
+                    kind: TypeScriptHelperKind::Values,
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    let input = r#"
+import * as h from "./helpers.js";
+function read(items) {
+    return h.g(this, function(state) { return [5, h.v(items)]; });
+}
+"#;
+    assert!(apply_cross_module_facts(input, &facts).contains("yield* items"));
+}
+
+#[test]
+fn catch_binding_avoids_names_the_machine_already_spells() {
+    // The catch body reads an outer `error`, so the synthesized catch parameter
+    // must not take that spelling. The lowered alias `error_1` is folded into
+    // the binding, so its spelling is free to reuse.
+    let input = r#"
+function fetch_items(source, error) {
+  var error_1;
+  return __generator(this, function (_a) {
+    switch (_a.label) {
+      case 0:
+        _a.trys.push([0, 2, , 3]);
+        return [4 /*yield*/, start_fetch(source)];
+      case 1:
+        _a.sent();
+        return [3 /*break*/, 3];
+      case 2:
+        error_1 = _a.sent();
+        handle(error_1, error);
+        return [3 /*break*/, 3];
+      case 3:
+        return [2 /*return*/];
+    }
+  });
+}
+"#;
+    let expected = r#"
+function* fetch_items(source, error) {
+  var error_1;
+  try {
+    yield start_fetch(source);
+  } catch (error_1) {
+    handle(error_1, error);
+  }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+// ── try regions entered through a conditional jump ──────────────────────────
+
+#[test]
+fn guarded_try_catch_stays_inside_its_branch() {
+    // TypeScript ES5 output for `if (loader.lazy) { try { await ... } catch
+    // (error) { ... } } else { ... }`. The try region starts at label 1, which
+    // is reached only by falling through the guard in label 0. Folding the
+    // branches must keep the try/catch inside the guarded branch; dropping it
+    // runs the catch body unconditionally after the await.
+    let input = r#"
+function load_resource(loader, path, options) {
+  return __awaiter(this, void 0, void 0, function () {
+    var error_1;
+    return __generator(this, function (_a) {
+      switch (_a.label) {
+        case 0:
+          if (!loader.lazy) return [3 /*break*/, 5];
+          _a.label = 1;
+        case 1:
+          _a.trys.push([1, 3, , 4]);
+          return [4 /*yield*/, loader.load(path, options)];
+        case 2:
+          _a.sent();
+          return [3 /*break*/, 4];
+        case 3:
+          error_1 = _a.sent();
+          report_error(error_1);
+          return [3 /*break*/, 4];
+        case 4: return [3 /*break*/, 6];
+        case 5:
+          loader.load(path, options).catch(report_error);
+          _a.label = 6;
+        case 6: return [2 /*return*/];
+      }
+    });
+  });
+}
+"#;
+    let expected = r#"
+async function load_resource(loader, path, options) {
+  var error_1;
+  if (loader.lazy) {
+    try {
+      await loader.load(path, options);
+    } catch (error) {
+      report_error(error);
+    }
+  } else {
+    loader.load(path, options).catch(report_error);
+  }
+}
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+    let findings = validate_output_modules(&[("input.js".to_string(), output)]);
+    assert!(findings.is_empty(), "{findings:#?}");
+}
+
+#[test]
+fn guarded_try_catch_in_terser_conditional_return_stays_inside_its_branch() {
+    // Terser folds the guard and the else branch into one conditional return:
+    // `return e.type ? [3, 1] : (else_work, [3, 4])`. The try region at labels
+    // 1-3 is the taken branch of that conditional.
+    let input = r#"
+function load(e, t, n) {
+  return __awaiter(this, void 0, void 0, function () {
+    var i;
+    return __generator(this, function (s) {
+      switch (s.label) {
+        case 0: return e.type ? [3, 1] : (e.load(t, n).catch(handle), [3, 4]);
+        case 1: s.trys.push([1, 3, , 4]); return [4, e.load(t, n)];
+        case 2: s.sent(); return [3, 4];
+        case 3: i = s.sent(); handle(i); return [3, 4];
+        case 4: return [2];
+      }
+    });
+  });
+}
+"#;
+    let expected = r#"
+async function load(e, t, n) {
+  var i;
+  if (!e.type) {
+    e.load(t, n).catch(handle);
+  } else {
+    try {
+      await e.load(t, n);
+    } catch (error) {
+      handle(error);
+    }
+  }
+}
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+    let findings = validate_output_modules(&[("input.js".to_string(), output)]);
+    assert!(findings.is_empty(), "{findings:#?}");
+}
+
+#[test]
+fn guarded_try_catch_without_else_is_recovered() {
+    // Same region, but the guard jumps straight to the end of the machine.
+    let input = r#"
+function load_resource(loader, path, options) {
+  return __awaiter(this, void 0, void 0, function () {
+    var error_1;
+    return __generator(this, function (_a) {
+      switch (_a.label) {
+        case 0:
+          if (!loader.lazy) return [3 /*break*/, 4];
+          _a.label = 1;
+        case 1:
+          _a.trys.push([1, 3, , 4]);
+          return [4 /*yield*/, loader.load(path, options)];
+        case 2:
+          _a.sent();
+          return [3 /*break*/, 4];
+        case 3:
+          error_1 = _a.sent();
+          report_error(error_1);
+          return [3 /*break*/, 4];
+        case 4: return [2 /*return*/];
+      }
+    });
+  });
+}
+"#;
+    let expected = r#"
+async function load_resource(loader, path, options) {
+  var error_1;
+  if (loader.lazy) {
+    try {
+      await loader.load(path, options);
+    } catch (error) {
+      report_error(error);
+    }
+  }
+}
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+    let findings = validate_output_modules(&[("input.js".to_string(), output)]);
+    assert!(findings.is_empty(), "{findings:#?}");
+}
+
+// ── Inline `__values` detection must not swallow user functions ─────────────
+
+#[test]
+fn one_param_function_with_a_nested_iterable_helper_is_not_a_values_helper() {
+    // A single-parameter user function whose body contains an inlined Babel
+    // iterable helper (`Symbol.iterator`) and a `TypeError` throw shares the
+    // `__values` signals only inside nested functions. It is not a helper and
+    // must survive even when nothing references it: dead input code is kept.
+    let input = r#"
+var C = function(r) {
+  var t = r.reason.stack;
+  if (t) {
+    var o = function(r) {
+      var n = r == null ? null : typeof Symbol !== "undefined" && r[Symbol.iterator] || r["@@iterator"];
+      if (n != null) return n.call(r);
+    }(t.match(E)) || function() {
+      throw new TypeError("Invalid attempt to destructure non-iterable instance.");
+    }();
+    report(o);
+  }
+};
+"#;
+    assert_eq_normalized(&apply_without_helpers(input), input);
+}
+
+#[test]
+fn function_referenced_only_inside_another_misclassified_function_survives() {
+    // Bench shape: `C` and `R` both carry the loose `__values` signals through
+    // nested inlined helpers. `C` is only referenced inside `R`'s initializer;
+    // `R` stays because the module calls it, so `C` must stay as well.
+    let input = r#"
+var C = function(r) {
+  var t = r.reason.stack;
+  if (t) {
+    var o = function(r) {
+      var n = r == null ? null : typeof Symbol !== "undefined" && r[Symbol.iterator] || r["@@iterator"];
+      if (n != null) return n.call(r);
+    }(t.match(E)) || function() {
+      throw new TypeError("Invalid attempt to destructure non-iterable instance.");
+    }();
+    report(o);
+  }
+};
+var R = (r) => {
+  var items = function(r) {
+    if (typeof Symbol !== "undefined" && r[Symbol.iterator] != null) return Array.from(r);
+  }(r) || function() {
+    throw new TypeError("Invalid attempt to spread non-iterable instance.");
+  }();
+  window.addEventListener("unhandledrejection", C);
+  return items;
+};
+R([]);
+"#;
+    assert_eq_normalized(&apply_without_helpers(input), input);
+}
+
+// ── for await through the __generator machine ───────────────────────────────
+
+#[test]
+fn ts_es5_for_await_recovers_through_the_state_machine() {
+    // TypeScript ES5 output for `for await (const item of stream) { await
+    // handle_item(item); }`: the loop is a back-edge inside a try region of the
+    // `__generator` machine, and its protocol is folded by UnForOf afterwards.
+    let input = r#"
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+var __generator = (this && this.__generator) || function (thisArg, body) {
+    var _ = { label: 0, sent: function() { if (t[0] & 1) throw t[1]; return t[1]; }, trys: [], ops: [] }, f, y, t, g = Object.create((typeof Iterator === "function" ? Iterator : Object).prototype);
+    return g.next = verb(0), g["throw"] = verb(1), g["return"] = verb(2), typeof Symbol === "function" && (g[Symbol.iterator] = function() { return this; }), g;
+    function verb(n) { return function (v) { return step([n, v]); }; }
+    function step(op) {
+        if (f) throw new TypeError("Generator is already executing.");
+        while (g && (g = 0, op[0] && (_ = 0)), _) try {
+            if (f = 1, y && (t = op[0] & 2 ? y["return"] : op[0] ? y["throw"] || ((t = y["return"]) && t.call(y), 0) : y.next) && !(t = t.call(y, op[1])).done) return t;
+            if (y = 0, t) op = [op[0] & 2, t.value];
+            switch (op[0]) {
+                case 0: case 1: t = op; break;
+                case 4: _.label++; return { value: op[1], done: false };
+                case 5: _.label++; y = op[1]; op = [0]; continue;
+                case 7: op = _.ops.pop(); _.trys.pop(); continue;
+                default:
+                    if (!(t = _.trys, t = t.length > 0 && t[t.length - 1]) && (op[0] === 6 || op[0] === 2)) { _ = 0; continue; }
+                    if (op[0] === 3 && (!t || (op[1] > t[0] && op[1] < t[3]))) { _.label = op[1]; break; }
+                    if (op[0] === 6 && _.label < t[1]) { _.label = t[1]; t = op; break; }
+                    if (t && _.label < t[2]) { _.label = t[2]; _.ops.push(op); break; }
+                    if (t[2]) _.ops.pop();
+                    _.trys.pop(); continue;
+            }
+            op = body.call(thisArg, _);
+        } catch (e) { op = [6, e]; y = 0; } finally { f = t = 0; }
+        if (op[0] & 5) throw op[1]; return { value: op[0] ? op[1] : void 0, done: true };
+    }
+};
+var __asyncValues = (this && this.__asyncValues) || function (o) {
+    if (!Symbol.asyncIterator) throw new TypeError("Symbol.asyncIterator is not defined.");
+    var m = o[Symbol.asyncIterator], i;
+    return m ? m.call(o) : (o = typeof __values === "function" ? __values(o) : o[Symbol.iterator](), i = {}, verb("next"), verb("throw"), verb("return"), i[Symbol.asyncIterator] = function () { return this; }, i);
+    function verb(n) { i[n] = o[n] && function (v) { return new Promise(function (resolve, reject) { v = o[n](v), settle(resolve, reject, v.done, v.value); }); }; }
+    function settle(resolve, reject, d, v) { Promise.resolve(v).then(function(v) { resolve({ value: v, done: d }); }, reject); }
+};
+function consume_stream(stream) {
+    return __awaiter(this, void 0, void 0, function () {
+        var item, e_1_1;
+        var _a, stream_1, stream_1_1;
+        var _b, e_1, _c, _d;
+        return __generator(this, function (_e) {
+            switch (_e.label) {
+                case 0:
+                    _e.trys.push([0, 6, 7, 12]);
+                    _a = true, stream_1 = __asyncValues(stream);
+                    _e.label = 1;
+                case 1: return [4 /*yield*/, stream_1.next()];
+                case 2:
+                    if (!(stream_1_1 = _e.sent(), _b = stream_1_1.done, !_b)) return [3 /*break*/, 5];
+                    _d = stream_1_1.value;
+                    _a = false;
+                    item = _d;
+                    return [4 /*yield*/, handle_item(item)];
+                case 3:
+                    _e.sent();
+                    _e.label = 4;
+                case 4:
+                    _a = true;
+                    return [3 /*break*/, 1];
+                case 5: return [3 /*break*/, 12];
+                case 6:
+                    e_1_1 = _e.sent();
+                    e_1 = { error: e_1_1 };
+                    return [3 /*break*/, 12];
+                case 7:
+                    _e.trys.push([7, , 10, 11]);
+                    if (!(!_a && !_b && (_c = stream_1.return))) return [3 /*break*/, 9];
+                    return [4 /*yield*/, _c.call(stream_1)];
+                case 8:
+                    _e.sent();
+                    _e.label = 9;
+                case 9: return [3 /*break*/, 11];
+                case 10:
+                    if (e_1) throw e_1.error;
+                    return [7 /*endfinally*/];
+                case 11: return [7 /*endfinally*/];
+                case 12: return [2 /*return*/];
+            }
+        });
+    });
+}
+"#;
+    let expected = r#"
+async function consume_stream(stream) {
+  for await (const item of stream) {
+    await handle_item(item);
+  }
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn compressed_ts_for_await_folds_the_head_statement_form() {
+    // Terser splits the `sent()` consumer from the guard, so the decoded loop
+    // head is a statement of its own (`l = await i.next()`) at the back-edge
+    // target. It must run every iteration, and the protocol still folds into
+    // `for await` from that head-statement form.
+    let input = r#"
+var e=this&&this.__awaiter||function(e,t,n,r){function o(e){return e instanceof n?e:new n(function(t){t(e)})}return new(n||(n=Promise))(function(n,a){function u(e){try{s(r.next(e))}catch(e){a(e)}}function c(e){try{s(r.throw(e))}catch(e){a(e)}}function s(e){e.done?n(e.value):o(e.value).then(u,c)}s((r=r.apply(e,t||[])).next())})},t=this&&this.__generator||function(e,t){var n={label:0,sent:function(){if(1&a[0])throw a[1];return a[1]},trys:[],ops:[]},r,o,a,u=Object.create(("function"==typeof Iterator?Iterator:Object).prototype);return u.next=c(0),u.throw=c(1),u.return=c(2),"function"==typeof Symbol&&(u[Symbol.iterator]=function(){return this}),u;function c(e){return function(t){return s([e,t])}}function s(c){if(r)throw new TypeError("Generator is already executing.");for(;u&&(u=0,c[0]&&(n=0)),n;)try{if(r=1,o&&(a=2&c[0]?o.return:c[0]?o.throw||((a=o.return)&&a.call(o),0):o.next)&&!(a=a.call(o,c[1])).done)return a;switch(o=0,a&&(c=[2&c[0],a.value]),c[0]){case 0:case 1:a=c;break;case 4:return n.label++,{value:c[1],done:!1};case 5:n.label++,o=c[1],c=[0];continue;case 7:c=n.ops.pop(),n.trys.pop();continue;default:if(!(a=n.trys,(a=a.length>0&&a[a.length-1])||6!==c[0]&&2!==c[0])){n=0;continue}if(3===c[0]&&(!a||c[1]>a[0]&&c[1]<a[3])){n.label=c[1];break}if(6===c[0]&&n.label<a[1]){n.label=a[1],a=c;break}if(a&&n.label<a[2]){n.label=a[2],n.ops.push(c);break}a[2]&&n.ops.pop(),n.trys.pop();continue}c=t.call(e,n)}catch(e){c=[6,e],o=0}finally{r=a=0}if(5&c[0])throw c[1];return{value:c[0]?c[1]:void 0,done:!0}}},n=this&&this.__asyncValues||function(e){if(!Symbol.asyncIterator)throw new TypeError("Symbol.asyncIterator is not defined.");var t=e[Symbol.asyncIterator],n;return t?t.call(e):(e="function"==typeof __values?__values(e):e[Symbol.iterator](),n={},r("next"),r("throw"),r("return"),n[Symbol.asyncIterator]=function(){return this},n);function r(t){n[t]=e[t]&&function(n){return new Promise(function(r,a){o(r,a,(n=e[t](n)).done,n.value)})}}function o(e,t,n,r){Promise.resolve(r).then(function(t){e({value:t,done:n})},t)}};function r(r){return e(this,void 0,void 0,function(){var e,o,a,u,c,s,i,l,f,h,y,p;return t(this,function(t){switch(t.label){case 0:e=[],t.label=1;case 1:t.trys.push([1,,15,17]),t.label=2;case 2:t.trys.push([2,8,9,14]),s=!0,i=n(r),t.label=3;case 3:return[4,i.next()];case 4:return l=t.sent(),(f=l.done)?[3,7]:(p=l.value,s=!1,(o=p).done?[3,7]:(u=(a=e).push,[4,normalize_item(o)]));case 5:u.apply(a,[t.sent()]),t.label=6;case 6:return s=!0,[3,3];case 7:return[3,14];case 8:return c=t.sent(),h={error:c},[3,14];case 9:return t.trys.push([9,,12,13]),s||f||!(y=i.return)?[3,11]:[4,y.call(i)];case 10:t.sent(),t.label=11;case 11:return[3,13];case 12:if(h)throw h.error;return[7];case 13:return[7];case 14:return[3,17];case 15:return[4,close_stream(r)];case 16:return t.sent(),[7];case 17:return[2,e]}})})}
+"#;
+    let expected = r#"
+async function r(r) {
+  const e = [];
+  try {
+    for await (const o of r) {
+      if (o.done) break;
+      e.push(await normalize_item(o));
+    }
+  } finally {
+    await close_stream(r);
+  }
+  return e;
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+// ── early return inside a loop body ─────────────────────────────────────────
+
+#[test]
+fn ts_es5_infinite_loop_with_early_return_keeps_the_loop() {
+    // `for (;;) { const r = await it.next(); if (await check(r)) return r; }`:
+    // the `return` is a value-return opcode nested in the branch, and the
+    // back-edge targets the machine entry (label 0). Both used to defeat the
+    // decode; dropping the back-edge alone would run the body once.
+    let input = r#"
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+var __generator = (this && this.__generator) || function (thisArg, body) {
+    var _ = { label: 0, sent: function() { if (t[0] & 1) throw t[1]; return t[1]; }, trys: [], ops: [] }, f, y, t, g = Object.create((typeof Iterator === "function" ? Iterator : Object).prototype);
+    return g.next = verb(0), g["throw"] = verb(1), g["return"] = verb(2), typeof Symbol === "function" && (g[Symbol.iterator] = function() { return this; }), g;
+    function verb(n) { return function (v) { return step([n, v]); }; }
+    function step(op) {
+        if (f) throw new TypeError("Generator is already executing.");
+        while (g && (g = 0, op[0] && (_ = 0)), _) try {
+            if (f = 1, y && (t = op[0] & 2 ? y["return"] : op[0] ? y["throw"] || ((t = y["return"]) && t.call(y), 0) : y.next) && !(t = t.call(y, op[1])).done) return t;
+            if (y = 0, t) op = [op[0] & 2, t.value];
+            switch (op[0]) {
+                case 0: case 1: t = op; break;
+                case 4: _.label++; return { value: op[1], done: false };
+                case 5: _.label++; y = op[1]; op = [0]; continue;
+                case 7: op = _.ops.pop(); _.trys.pop(); continue;
+                default:
+                    if (!(t = _.trys, t = t.length > 0 && t[t.length - 1]) && (op[0] === 6 || op[0] === 2)) { _ = 0; continue; }
+                    if (op[0] === 3 && (!t || (op[1] > t[0] && op[1] < t[3]))) { _.label = op[1]; break; }
+                    if (op[0] === 6 && _.label < t[1]) { _.label = t[1]; t = op; break; }
+                    if (t && _.label < t[2]) { _.label = t[2]; _.ops.push(op); break; }
+                    if (t[2]) _.ops.pop();
+                    _.trys.pop(); continue;
+            }
+            op = body.call(thisArg, _);
+        } catch (e) { op = [6, e]; y = 0; } finally { f = t = 0; }
+        if (op[0] & 5) throw op[1]; return { value: op[0] ? op[1] : void 0, done: true };
+    }
+};
+function f(it, check) {
+    return __awaiter(this, void 0, void 0, function () {
+        var r;
+        return __generator(this, function (_a) {
+            switch (_a.label) {
+                case 0: return [4 /*yield*/, it.next()];
+                case 1:
+                    r = _a.sent();
+                    return [4 /*yield*/, check(r)];
+                case 2:
+                    if (_a.sent())
+                        return [2 /*return*/, r];
+                    _a.label = 3;
+                case 3: return [3 /*break*/, 0];
+                case 4: return [2 /*return*/];
+            }
+        });
+    });
+}
+"#;
+    let expected = r#"
+async function f(it, check) {
+  let r;
+  for (;;) {
+    r = await it.next();
+    if (await check(r)) {
+      return r;
+    }
+  }
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn ts_es5_infinite_loop_with_early_return_inside_try_finally() {
+    let input = r#"
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+var __generator = (this && this.__generator) || function (thisArg, body) {
+    var _ = { label: 0, sent: function() { if (t[0] & 1) throw t[1]; return t[1]; }, trys: [], ops: [] }, f, y, t, g = Object.create((typeof Iterator === "function" ? Iterator : Object).prototype);
+    return g.next = verb(0), g["throw"] = verb(1), g["return"] = verb(2), typeof Symbol === "function" && (g[Symbol.iterator] = function() { return this; }), g;
+    function verb(n) { return function (v) { return step([n, v]); }; }
+    function step(op) {
+        if (f) throw new TypeError("Generator is already executing.");
+        while (g && (g = 0, op[0] && (_ = 0)), _) try {
+            if (f = 1, y && (t = op[0] & 2 ? y["return"] : op[0] ? y["throw"] || ((t = y["return"]) && t.call(y), 0) : y.next) && !(t = t.call(y, op[1])).done) return t;
+            if (y = 0, t) op = [op[0] & 2, t.value];
+            switch (op[0]) {
+                case 0: case 1: t = op; break;
+                case 4: _.label++; return { value: op[1], done: false };
+                case 5: _.label++; y = op[1]; op = [0]; continue;
+                case 7: op = _.ops.pop(); _.trys.pop(); continue;
+                default:
+                    if (!(t = _.trys, t = t.length > 0 && t[t.length - 1]) && (op[0] === 6 || op[0] === 2)) { _ = 0; continue; }
+                    if (op[0] === 3 && (!t || (op[1] > t[0] && op[1] < t[3]))) { _.label = op[1]; break; }
+                    if (op[0] === 6 && _.label < t[1]) { _.label = t[1]; t = op; break; }
+                    if (t && _.label < t[2]) { _.label = t[2]; _.ops.push(op); break; }
+                    if (t[2]) _.ops.pop();
+                    _.trys.pop(); continue;
+            }
+            op = body.call(thisArg, _);
+        } catch (e) { op = [6, e]; y = 0; } finally { f = t = 0; }
+        if (op[0] & 5) throw op[1]; return { value: op[0] ? op[1] : void 0, done: true };
+    }
+};
+function f(it, check) {
+    return __awaiter(this, void 0, void 0, function () {
+        var r;
+        return __generator(this, function (_a) {
+            switch (_a.label) {
+                case 0:
+                    _a.trys.push([0, , 6, 8]);
+                    _a.label = 1;
+                case 1: return [4 /*yield*/, it.next()];
+                case 2:
+                    r = _a.sent();
+                    return [4 /*yield*/, check(r)];
+                case 3:
+                    if (_a.sent())
+                        return [2 /*return*/, r];
+                    _a.label = 4;
+                case 4: return [3 /*break*/, 1];
+                case 5: return [3 /*break*/, 8];
+                case 6: return [4 /*yield*/, close(it)];
+                case 7:
+                    _a.sent();
+                    return [7 /*endfinally*/];
+                case 8: return [2 /*return*/];
+            }
+        });
+    });
+}
+"#;
+    let expected = r#"
+async function f(it, check) {
+  let r;
+  try {
+    for (;;) {
+      r = await it.next();
+      if (await check(r)) {
+        return r;
+      }
+    }
+  } finally {
+    await close(it);
+  }
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn ts_es5_indexed_loop_with_early_return_inside_try_finally() {
+    let input = r#"
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+var __generator = (this && this.__generator) || function (thisArg, body) {
+    var _ = { label: 0, sent: function() { if (t[0] & 1) throw t[1]; return t[1]; }, trys: [], ops: [] }, f, y, t, g = Object.create((typeof Iterator === "function" ? Iterator : Object).prototype);
+    return g.next = verb(0), g["throw"] = verb(1), g["return"] = verb(2), typeof Symbol === "function" && (g[Symbol.iterator] = function() { return this; }), g;
+    function verb(n) { return function (v) { return step([n, v]); }; }
+    function step(op) {
+        if (f) throw new TypeError("Generator is already executing.");
+        while (g && (g = 0, op[0] && (_ = 0)), _) try {
+            if (f = 1, y && (t = op[0] & 2 ? y["return"] : op[0] ? y["throw"] || ((t = y["return"]) && t.call(y), 0) : y.next) && !(t = t.call(y, op[1])).done) return t;
+            if (y = 0, t) op = [op[0] & 2, t.value];
+            switch (op[0]) {
+                case 0: case 1: t = op; break;
+                case 4: _.label++; return { value: op[1], done: false };
+                case 5: _.label++; y = op[1]; op = [0]; continue;
+                case 7: op = _.ops.pop(); _.trys.pop(); continue;
+                default:
+                    if (!(t = _.trys, t = t.length > 0 && t[t.length - 1]) && (op[0] === 6 || op[0] === 2)) { _ = 0; continue; }
+                    if (op[0] === 3 && (!t || (op[1] > t[0] && op[1] < t[3]))) { _.label = op[1]; break; }
+                    if (op[0] === 6 && _.label < t[1]) { _.label = t[1]; t = op; break; }
+                    if (t && _.label < t[2]) { _.label = t[2]; _.ops.push(op); break; }
+                    if (t[2]) _.ops.pop();
+                    _.trys.pop(); continue;
+            }
+            op = body.call(thisArg, _);
+        } catch (e) { op = [6, e]; y = 0; } finally { f = t = 0; }
+        if (op[0] & 5) throw op[1]; return { value: op[0] ? op[1] : void 0, done: true };
+    }
+};
+function f(items, check) {
+    return __awaiter(this, void 0, void 0, function () {
+        var _i, items_1, r;
+        return __generator(this, function (_a) {
+            switch (_a.label) {
+                case 0:
+                    _a.trys.push([0, , 5, 7]);
+                    _i = 0, items_1 = items;
+                    _a.label = 1;
+                case 1:
+                    if (!(_i < items_1.length)) return [3 /*break*/, 4];
+                    r = items_1[_i];
+                    return [4 /*yield*/, check(r)];
+                case 2:
+                    if (_a.sent())
+                        return [2 /*return*/, r];
+                    _a.label = 3;
+                case 3:
+                    _i++;
+                    return [3 /*break*/, 1];
+                case 4: return [3 /*break*/, 7];
+                case 5: return [4 /*yield*/, close(items)];
+                case 6:
+                    _a.sent();
+                    return [7 /*endfinally*/];
+                case 7: return [2 /*return*/, null];
+            }
+        });
+    });
+}
+"#;
+    let expected = r#"
+async function f(items, check) {
+  let _i;
+  let items_1;
+  let r;
+  try {
+    _i = 0;
+    items_1 = items;
+    for (; _i < items_1.length; _i++) {
+      r = items_1[_i];
+      if (await check(r)) {
+        return r;
+      }
+    }
+  } finally {
+    await close(items);
+  }
+  return null;
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn ts_es5_early_void_return_after_await_is_kept() {
+    // `if (a) { await g(); return; } h();`: the `return [2]` after the
+    // awaited call ends its branch early. Dropping it as the machine's end
+    // would let `h()` run on both branches.
+    let input = r#"
+function f(a) {
+  return __awaiter(this, void 0, void 0, function () {
+    return __generator(this, function (_b) {
+      switch (_b.label) {
+        case 0:
+          if (!a) return [3 /*break*/, 2];
+          return [4 /*yield*/, g()];
+        case 1:
+          _b.sent();
+          return [2 /*return*/];
+        case 2:
+          h();
+          return [2 /*return*/];
+      }
+    });
+  });
+}
+"#;
+    let expected = r#"
+async function f(a) {
+  if (a) {
+    await g();
+    return;
+  }
+  h();
+}
+"#;
+    assert_eq_normalized(&render(input), expected);
 }

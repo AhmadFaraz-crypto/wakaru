@@ -1,5 +1,5 @@
 use wakaru_core::driver::test_support::{unpack, unpack_raw};
-use wakaru_core::{validate_output_modules, DecompileOptions};
+use wakaru_core::{validate_output_modules, DecompileOptions, OutputFindingKind};
 
 fn expect_unpack(source: &str, filename: &str) -> Vec<(String, String)> {
     let output = unpack(
@@ -393,6 +393,77 @@ fn exported_esbuild_to_esm_helper_keeps_cross_cluster_link() {
 #[test]
 fn exported_dynamic_require_helper_keeps_cross_cluster_link() {
     assert_exported_runtime_helper_keeps_cross_cluster_link("r", "dynamicRequireRuntime");
+}
+
+fn entry_code(pairs: &[(String, String)]) -> &str {
+    &pairs
+        .iter()
+        .find(|(name, _)| name == "entry.js")
+        .unwrap_or_else(|| panic!("missing entry.js: {pairs:#?}"))
+        .1
+}
+
+fn exports_name(code: &str, name: &str) -> bool {
+    code.contains(&format!(" as {name},"))
+        || code.contains(&format!(" as {name} }}"))
+        || code.contains(&format!("export const {name} ="))
+}
+
+#[test]
+fn exported_commonjs_helper_keeps_its_declaration() {
+    // A code-splitting chunk shares its `__commonJS` helper with other chunks.
+    let bundle = r#"
+var v=(l,e)=>()=>(e||l((e={exports:{}}).exports,e),e.exports);
+var b=v((g,u)=>{u.exports={value:42}});
+console.log(b().value);
+export{v as a,b as d};
+"#;
+
+    let raw_pairs = expect_unpack_raw(bundle);
+    let raw_entry = entry_code(&raw_pairs);
+    assert!(
+        raw_entry.contains("var v = ") && raw_entry.contains("v as a"),
+        "the exported helper should keep its declaration:\n{raw_entry}"
+    );
+    assert_eq!(validate_output_modules(&raw_pairs), vec![]);
+
+    let normal_pairs = expect_unpack(bundle, "bundle.js");
+    let normal_entry = entry_code(&normal_pairs);
+    assert!(
+        exports_name(normal_entry, "a"),
+        "cleanup must keep the helper export:\n{normal_entry}"
+    );
+    assert_eq!(validate_output_modules(&normal_pairs), vec![]);
+}
+
+#[test]
+fn exported_export_helper_keeps_its_dependencies() {
+    // `__export` stays because the chunk exports it, so the property-define
+    // alias it calls must stay too.
+    let bundle = r#"
+var o=Object.defineProperty;
+var c=(l,e)=>{for(var r in e)o(l,r,{get:e[r],enumerable:!0})};
+var ns={};c(ns,{one:()=>one,two:()=>two});var one=1;function two(){return 2}
+var ns2={};c(ns2,{three:()=>three});var three=3;
+console.log(ns,ns2);
+export{c as b,ns as c,ns2 as d};
+"#;
+
+    let raw_pairs = expect_unpack_raw(bundle);
+    let raw_entry = entry_code(&raw_pairs);
+    assert!(
+        raw_entry.contains("var o = Object.defineProperty;") && raw_entry.contains("c as b"),
+        "the exported helper should keep its dependency:\n{raw_entry}"
+    );
+    assert_eq!(validate_output_modules(&raw_pairs), vec![]);
+
+    let normal_pairs = expect_unpack(bundle, "bundle.js");
+    let normal_entry = entry_code(&normal_pairs);
+    assert!(
+        exports_name(normal_entry, "b"),
+        "cleanup must keep the helper export:\n{normal_entry}"
+    );
+    assert_eq!(validate_output_modules(&normal_pairs), vec![]);
 }
 
 #[test]
@@ -1318,6 +1389,144 @@ export { a_exports, b_exports };
     );
 }
 
+/// A CommonJS factory that writes scope-owned state and also unclaimed entry
+/// state merges into the scope module, which adopts the entry state. Left
+/// standalone, the factory file would declare a second copy of the scope
+/// module's state, and writes would no longer reach the reader.
+#[test]
+fn factory_writing_scope_and_entry_state_merges_and_adopts_the_entry_state() {
+    let bundle = r#"
+var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
+var __defProp = Object.defineProperty;
+var __export = (target, all) => { for (var name in all) __defProp(target, name, { get: all[name], enumerable: true }); };
+var other = 0;
+var first = __commonJS((exports, module) => { ready = 1; other = 2; module.exports = 1; });
+var second = __commonJS((exports, module) => { ready = 3; module.exports = 2; });
+var ns = {}; __export(ns, { get: () => get });
+var ready = 0;
+function get() { ready += 1; return ready; }
+console.log(second(), first(), ns.get(), other);
+export { ns };
+"#;
+
+    let raw_pairs = expect_unpack_raw(bundle);
+    let names: Vec<&String> = raw_pairs.iter().map(|(name, _)| name).collect();
+    let (_, scope_code) = raw_pairs
+        .iter()
+        .find(|(_, code)| code.contains("function get"))
+        .expect("scope module should exist");
+    assert!(
+        scope_code.contains("export function first")
+            && scope_code.contains("export function second")
+            && scope_code.contains("var other")
+            && scope_code.matches("var ready").count() == 1,
+        "the scope module should absorb both factories and adopt `other`:\n{scope_code}"
+    );
+    assert!(
+        !names.iter().any(|name| name.as_str() == "first.js"),
+        "no standalone file should keep a copy of the state: {names:?}"
+    );
+    let declaring_ready = raw_pairs
+        .iter()
+        .filter(|(_, code)| code.contains("var ready"))
+        .count();
+    assert_eq!(
+        declaring_ready, 1,
+        "`ready` must be declared once: {raw_pairs:#?}"
+    );
+    assert_eq!(validate_output_modules(&raw_pairs), vec![]);
+
+    let output = unpack(
+        bundle,
+        DecompileOptions {
+            filename: "bundle.js".to_string(),
+            ..Default::default()
+        },
+    )
+    .expect("unpack should succeed");
+    assert!(!output.modules.is_empty());
+}
+
+/// Adopted state can make another factory an init of the same scope module.
+/// That factory comes first in source order, so partition must revisit it.
+#[test]
+fn factory_writing_only_adopted_state_merges_on_a_later_round() {
+    let bundle = r#"
+var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
+var __defProp = Object.defineProperty;
+var __export = (target, all) => { for (var name in all) __defProp(target, name, { get: all[name], enumerable: true }); };
+var other = 0;
+var zero = __commonJS((exports, module) => { other = 7; module.exports = 0; });
+var first = __commonJS((exports, module) => { ready = 1; other = 2; module.exports = 1; });
+var second = __commonJS((exports, module) => { ready = 3; module.exports = 2; });
+var ns = {}; __export(ns, { get: () => get });
+var ready = 0;
+function get() { ready += 1; return ready; }
+console.log(zero(), second(), first(), ns.get(), other);
+export { ns };
+"#;
+
+    let raw_pairs = expect_unpack_raw(bundle);
+    let (_, scope_code) = raw_pairs
+        .iter()
+        .find(|(_, code)| code.contains("function get"))
+        .expect("scope module should exist");
+    let first_at = scope_code.find("export function first");
+    let zero_at = scope_code.find("export function zero");
+    assert!(
+        zero_at.is_some() && first_at.is_some() && zero_at < first_at,
+        "both writers of `other` merge, in source order:\n{scope_code}"
+    );
+    let declaring_other = raw_pairs
+        .iter()
+        .filter(|(_, code)| code.contains("var other"))
+        .count();
+    assert_eq!(
+        declaring_other, 1,
+        "`other` must be declared once: {raw_pairs:#?}"
+    );
+    assert_eq!(validate_output_modules(&raw_pairs), vec![]);
+}
+
+/// Entry state that an entry statement also writes cannot move into the scope
+/// module, so the factory stays standalone. It must not declare its own copy
+/// of the scope module's state: the unlinked write is left for output
+/// validation to report.
+#[test]
+fn standalone_factory_does_not_copy_scope_owned_state() {
+    let bundle = r#"
+var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
+var __defProp = Object.defineProperty;
+var __export = (target, all) => { for (var name in all) __defProp(target, name, { get: all[name], enumerable: true }); };
+var other = 0;
+var first = __commonJS((exports, module) => { ready = 1; other = 2; module.exports = 1; });
+var second = __commonJS((exports, module) => { ready = 3; module.exports = 2; });
+var ns = {}; __export(ns, { get: () => get });
+var ready = 0;
+function get() { ready += 1; return ready; }
+other = 5;
+console.log(second(), first(), ns.get(), other);
+export { ns };
+"#;
+
+    let raw_pairs = expect_unpack_raw(bundle);
+    let (_, first_code) = raw_pairs
+        .iter()
+        .find(|(name, _)| name == "first.js")
+        .expect("the factory stays standalone");
+    assert!(
+        !first_code.contains("var ready") && !first_code.contains("export { other, ready }"),
+        "the standalone factory must not declare the scope module's state:\n{first_code}"
+    );
+    let findings = validate_output_modules(&raw_pairs);
+    assert!(
+        findings.iter().any(|finding| {
+            finding.kind == OutputFindingKind::UnresolvedReference && finding.filename == "first.js"
+        }),
+        "the unlinked write should be reported: {findings:?}"
+    );
+}
+
 /// If a scope-hoisted module also writes state initialized by a lazy factory,
 /// the factory must merge into that scope module. Otherwise the scope module
 /// would assign to a read-only ESM import.
@@ -1676,6 +1885,904 @@ console.log(left, right);
     );
 }
 
+/// An adopted helper has the same write restrictions as an ordinary body
+/// declaration: entry-owned state cannot become an immutable import.
+#[test]
+fn adopted_support_writes_do_not_import_entry_state() {
+    for body in [
+        "state = 1;",
+        "state++;",
+        "[state] = [1];",
+        "for (state of [1]) {}",
+    ] {
+        let bundle = format!(
+            r#"{SCOPE_HELPERS}
+function write() {{ {body} }}
+var ns = {{}}; __export(ns, {{ write: () => write }});
+function start() {{ write(); }}
+var extra = {{}}; __export(extra, {{ read: () => read }});
+function read() {{ return 7; }}
+var state = 0;
+ns.write(); record(state); export {{ ns, extra }};
+"#
+        );
+        for pairs in [
+            expect_unpack_raw(&bundle),
+            expect_unpack(&bundle, "bundle.js"),
+        ] {
+            let owner = &pairs.iter().find(|(name, _)| name == "ns.js").unwrap().1;
+            assert!(
+                owner.contains("function write"),
+                "helper must be adopted: {owner}"
+            );
+            assert!(
+                !owner.contains("from \"./entry.js\""),
+                "writer cannot import state: {owner}"
+            );
+            let findings = validate_output_modules(&pairs);
+            assert!(
+                findings.len() == 1 && findings[0].kind == OutputFindingKind::UnresolvedReference,
+                "keep the unlinked boundary visible instead of an import write: {findings:#?}"
+            );
+        }
+    }
+}
+
+/// The write inventory is binding-aware: local assignments and property
+/// mutations do not prevent a deferred read of the imported object binding.
+#[test]
+fn adopted_support_reads_still_import_entry_state() {
+    for body in [
+        "return state;",
+        "function local(state) { state = 1; } local(0); return state;",
+        "state.value = 1; return state;",
+    ] {
+        let bundle = format!(
+            r#"{SCOPE_HELPERS}
+function read() {{ {body} }}
+var ns = {{}}; __export(ns, {{ read: () => read }});
+function start() {{ return read(); }}
+var extra = {{}}; __export(extra, {{ other: () => other }});
+function other() {{ return 7; }}
+var state = {{ value: 0 }};
+record(ns.read()); export {{ ns, extra }};
+"#
+        );
+        for pairs in [
+            expect_unpack_raw(&bundle),
+            expect_unpack(&bundle, "bundle.js"),
+        ] {
+            let owner = &pairs.iter().find(|(name, _)| name == "ns.js").unwrap().1;
+            assert!(
+                owner.contains("from \"./entry.js\""),
+                "deferred read stays linked: {owner}"
+            );
+            assert_eq!(validate_output_modules(&pairs), vec![]);
+        }
+    }
+}
+
+/// A CommonJS factory keeps its callable/cache boundary when its support
+/// writer shares state with a lazy ESM initializer.
+#[test]
+fn cjs_support_writer_shares_lazy_state_owner() {
+    let bundle = r#"
+var __esm = (fn, value) => () => (fn && (value = fn(fn = 0)), value);
+var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
+var ready;
+function enable() { ready = true; return ready; }
+var init_state = __esm(() => { record('state'); ready = false; });
+var require_lib = __commonJS((exports, module) => {
+  init_state(); record('lib');
+  module.exports = { enable, read: () => ready };
+});
+record('before');
+var one = require_lib(); var two = require_lib();
+record([one === two, one.read(), one.enable(), two.read()]);
+"#;
+    let pairs = expect_unpack_raw(bundle);
+    let owner = &pairs
+        .iter()
+        .find(|(_, code)| code.contains("function enable"))
+        .unwrap()
+        .1;
+    assert!(
+        owner.contains("export function init_state")
+            && owner.contains("export function require_lib"),
+        "state, writer, and both callable factories must share an owner: {pairs:#?}"
+    );
+    let entry = &pairs.iter().find(|(name, _)| name == "entry.js").unwrap().1;
+    assert!(
+        !entry.contains("function enable") && !entry.contains("var ready"),
+        "entry must not retain a second copy of the mutable state: {entry}"
+    );
+    assert_eq!(validate_output_modules(&pairs), vec![]);
+    assert_eq!(
+        validate_output_modules(&expect_unpack(bundle, "bundle.js")),
+        vec![]
+    );
+}
+
+/// An entry-owned hoisted function may write state extracted into a namespace
+/// module even when that module never calls the writer itself.
+#[test]
+fn scope_state_adopts_entry_hoisted_writer() {
+    let bundle = r#"
+var __defProp = Object.defineProperty;
+var __export = (target, all) => { for (var name in all) __defProp(target, name, { get: all[name], enumerable: true }); };
+var ns = {}; __export(ns, { read: () => read });
+function read() { return ready; }
+var ready = false;
+function enable() { if (!ready) { ready = true; record('enabled'); } }
+record(read()); enable(); enable(); record(read());
+export { ns };
+"#;
+    let pairs = expect_unpack_raw(bundle);
+    let owner = &pairs
+        .iter()
+        .find(|(_, code)| code.contains("var ready"))
+        .unwrap()
+        .1;
+    assert!(
+        owner.contains("function enable"),
+        "state must own its hoisted writer: {pairs:#?}"
+    );
+    let entry = &pairs.iter().find(|(name, _)| name == "entry.js").unwrap().1;
+    assert!(
+        !entry.contains("function enable"),
+        "entry must call the relocated writer: {entry}"
+    );
+    assert_eq!(validate_output_modules(&pairs), vec![]);
+    assert_eq!(
+        validate_output_modules(&expect_unpack(bundle, "bundle.js")),
+        vec![]
+    );
+}
+
+#[test]
+fn scope_writer_adoption_requires_local_dependencies_and_binding_writes() {
+    let prefix = r#"
+var __defProp = Object.defineProperty;
+var __export = (target, all) => { for (var name in all) __defProp(target, name, { get: all[name], enumerable: true }); };
+var ns = {}; __export(ns, { read: () => read });
+function read() { return state; }
+var state = {};
+"#;
+    for tail in [
+        "function write(state) { state = {}; } write({});",
+        "function write() { state.value = true; } write();",
+    ] {
+        let pairs = expect_unpack_raw(&format!("{prefix} {tail} export {{ ns }};"));
+        let entry = &pairs.iter().find(|(name, _)| name == "entry.js").unwrap().1;
+        assert!(
+            entry.contains("function write"),
+            "shadowed/property writes must not nominate a writer: {pairs:#?}"
+        );
+    }
+}
+
+#[test]
+fn scope_entry_writer_reads_entry_class_after_initialization() {
+    let bundle = r#"
+var __defProp = Object.defineProperty;
+var __export = (target, all) => { for (var name in all) __defProp(target, name, { get: all[name], enumerable: true }); };
+var ns = {}; __export(ns, { read: () => read });
+function read() { return ready; }
+var ready = false;
+class Value { static read() { return true; } }
+function enable() { ready = Value.read(); }
+enable(); record(read());
+export { ns };
+"#;
+    let pairs = expect_unpack_raw(bundle);
+    let owner = &pairs
+        .iter()
+        .find(|(_, code)| code.contains("var ready"))
+        .unwrap()
+        .1;
+    assert!(
+        owner.contains("function enable") && owner.contains("from \"./entry.js\""),
+        "the deferred writer must import its entry dependency: {pairs:#?}"
+    );
+    let entry = &pairs.iter().find(|(name, _)| name == "entry.js").unwrap().1;
+    assert!(
+        entry.contains("class Value") && !entry.contains("function enable"),
+        "entry retains the class initializer and calls the relocated function: {entry}"
+    );
+    assert_eq!(validate_output_modules(&pairs), vec![]);
+    assert_eq!(
+        validate_output_modules(&expect_unpack(bundle, "bundle.js")),
+        vec![]
+    );
+}
+
+#[test]
+fn scope_writer_with_reassigned_function_binding_stays_in_entry() {
+    let bundle = r#"
+var __defProp = Object.defineProperty;
+var __export = (target, all) => { for (var name in all) __defProp(target, name, { get: all[name], enumerable: true }); };
+var ns = {}; __export(ns, { read: () => read });
+function read() { return ready; }
+var ready = false;
+function enable() { ready = true; }
+enable = replacement;
+enable();
+export { ns };
+"#;
+    let pairs = expect_unpack_raw(bundle);
+    let entry = &pairs.iter().find(|(name, _)| name == "entry.js").unwrap().1;
+    assert!(
+        entry.contains("function enable"),
+        "moving a reassigned function would create a new import write: {pairs:#?}"
+    );
+}
+
+#[test]
+fn deferred_writer_import_is_independent_of_an_unsafe_sibling_consumer() {
+    let bundle = r#"
+var __defProp = Object.defineProperty;
+var __export = (target, all) => { for (var name in all) __defProp(target, name, { get: all[name], enumerable: true }); };
+var early_ns = {}; __export(early_ns, { early: () => early });
+function early() { return Value.read(); }
+consume(early);
+var late_ns = {}; __export(late_ns, { read: () => read });
+function read() { return ready; }
+var ready = false;
+class Value { static read() { return true; } }
+function enable() { ready = Value.read(); }
+enable();
+export { early_ns, late_ns };
+"#;
+    for pairs in [
+        expect_unpack_raw(bundle),
+        expect_unpack(bundle, "bundle.js"),
+    ] {
+        let late = &pairs
+            .iter()
+            .find(|(_, code)| code.contains("function enable"))
+            .unwrap()
+            .1;
+        assert!(
+            late.contains("from \"./entry.js\""),
+            "safe consumer must get its import despite an unsafe sibling: {pairs:#?}"
+        );
+        let early = &pairs
+            .iter()
+            .find(|(_, code)| code.contains("function early"))
+            .unwrap()
+            .1;
+        assert!(
+            !early.contains("from \"./entry.js\""),
+            "unsafe consumer must not acquire an eager entry edge: {early}"
+        );
+    }
+}
+
+#[test]
+fn scope_entry_writer_does_not_adopt_a_reassigned_entry_dependency() {
+    let bundle = r#"
+var __defProp = Object.defineProperty;
+var __export = (target, all) => { for (var name in all) __defProp(target, name, { get: all[name], enumerable: true }); };
+function value() { return false; }
+var ns = {}; __export(ns, { read: () => read });
+function read() { return ready; }
+var ready = false;
+function enable() { ready = value(); }
+value = () => true;
+enable();
+export { ns };
+"#;
+    let pairs = expect_unpack_raw(bundle);
+    let entry = &pairs.iter().find(|(name, _)| name == "entry.js").unwrap().1;
+    assert!(
+        entry.contains("function value") && !entry.contains("function enable"),
+        "writer dependencies must keep their entry ownership and writes: {pairs:#?}"
+    );
+    assert_eq!(validate_output_modules(&pairs), vec![]);
+    assert_eq!(
+        validate_output_modules(&expect_unpack(bundle, "bundle.js")),
+        vec![]
+    );
+}
+
+#[test]
+fn scope_entry_writer_keeps_external_import_dependency() {
+    let bundle = r#"
+import { notify } from "external";
+var __defProp = Object.defineProperty;
+var __export = (target, all) => { for (var name in all) __defProp(target, name, { get: all[name], enumerable: true }); };
+var ns = {}; __export(ns, { read: () => read });
+function read() { return ready; }
+var ready = false;
+function enable() { ready = true; notify(); }
+enable();
+export { ns };
+"#;
+    let pairs = expect_unpack_raw(bundle);
+    let owner = &pairs
+        .iter()
+        .find(|(_, code)| code.contains("var ready"))
+        .unwrap()
+        .1;
+    assert!(
+        owner.contains("function enable") && owner.contains("from \"external\""),
+        "relocated writer must retain its external dependency: {pairs:#?}"
+    );
+    assert_eq!(validate_output_modules(&pairs), vec![]);
+}
+
+/// Factories that assign a top-level binding directly are writers of that
+/// state, like support declarations. Every such factory joins one ownership
+/// group, the group declares the state once, and entry.js re-imports it
+/// instead of keeping a second copy.
+#[test]
+fn standalone_factories_writing_shared_state_share_one_owner() {
+    let bundle = r#"
+var __esm = (fn, value) => () => (fn && (value = fn(fn = 0)), value);
+var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
+var ready = 0;
+var require_lib = __commonJS((exports, module) => { ready = 1; module.exports = { read: () => ready }; });
+var init_lib = __esm(() => { ready = 2; });
+record(require_lib().read()); init_lib(); record(require_lib().read()); record(ready);
+"#;
+    for pairs in [
+        expect_unpack_raw(bundle),
+        expect_unpack(bundle, "bundle.js"),
+    ] {
+        let declarations: Vec<&String> = pairs
+            .iter()
+            .filter(|(_, code)| code.contains("var ready = 0") || code.contains("let ready = 0"))
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            declarations.len(),
+            1,
+            "the state must be declared exactly once: {pairs:#?}"
+        );
+        let owner = &pairs
+            .iter()
+            .find(|(name, _)| name == declarations[0])
+            .unwrap()
+            .1;
+        assert!(
+            owner.contains("export function require_lib")
+                && owner.contains("export function init_lib"),
+            "both writers must share the state owner: {owner}"
+        );
+        let entry = &pairs.iter().find(|(name, _)| name == "entry.js").unwrap().1;
+        assert!(
+            !entry.contains("var ready") && !entry.contains("let ready") && entry.contains("ready"),
+            "entry must import the single mutable copy: {entry}"
+        );
+        assert_eq!(validate_output_modules(&pairs), vec![]);
+    }
+}
+
+/// An entry function declaration that writes factory-owned state joins the
+/// ownership unit like a support declaration: the group declares the state
+/// and exports the writer, and entry calls it through an import.
+#[test]
+fn entry_function_writer_joins_factory_state_group() {
+    for factory in [
+        "var load = __commonJS((exports, module) => { ready = 1; module.exports = 1; });",
+        "var load = __esm(() => { ready = 1; });",
+    ] {
+        let bundle = format!(
+            r#"
+var __esm = (fn, value) => () => (fn && (value = fn(fn = 0)), value);
+var __commonJS = (cb, mod) => () => (mod || cb((mod = {{ exports: {{}} }}).exports, mod), mod.exports);
+var require_dummy = __commonJS((exports, module) => {{ module.exports = {{}}; }});
+var ready = 0;
+{factory}
+function reset() {{ ready = 2; }}
+record(load()); reset(); record(ready); record(require_dummy());
+export {{ reset }};
+"#
+        );
+        for pairs in [
+            expect_unpack_raw(&bundle),
+            expect_unpack(&bundle, "bundle.js"),
+        ] {
+            let owners: Vec<&(String, String)> = pairs
+                .iter()
+                .filter(|(_, code)| code.contains("ready = 0"))
+                .collect();
+            assert_eq!(owners.len(), 1, "state declared once: {pairs:#?}");
+            let owner = &owners[0].1;
+            assert!(
+                owner.contains("function reset") && owner.contains("export function load"),
+                "writer and factory share the state owner: {owner}"
+            );
+            let entry = &pairs.iter().find(|(name, _)| name == "entry.js").unwrap().1;
+            assert!(
+                !entry.contains("ready = 0")
+                    && !entry.contains("function reset")
+                    && entry.contains("reset()")
+                    && entry.contains("export { reset }"),
+                "entry calls and re-exports the relocated writer: {entry}"
+            );
+            assert_eq!(validate_output_modules(&pairs), vec![]);
+        }
+    }
+}
+
+/// An entry writer that cannot move or join the group cancels the split. A
+/// CommonJS factory demotes like a lazy ESM initializer: the entry keeps the
+/// state, the writer, and a synthesized cached callable.
+#[test]
+fn unrelocatable_entry_writer_demotes_cjs_factory_group() {
+    for writer in [
+        "var reset = () => { ready = 2; };",
+        "function reset() { ready = 2; } reset = () => { ready = 3; };",
+    ] {
+        let bundle = format!(
+            r#"
+var __commonJS = (cb, mod) => () => (mod || cb((mod = {{ exports: {{}} }}).exports, mod), mod.exports);
+var ready = 0;
+var load = __commonJS((exports, module) => {{ ready = 1; module.exports = {{ read: () => ready }}; }});
+{writer}
+record(load().read()); reset(); record(ready);
+"#
+        );
+        for pairs in [
+            expect_unpack_raw(&bundle),
+            expect_unpack(&bundle, "bundle.js"),
+        ] {
+            assert!(
+                pairs.iter().all(|(name, _)| name != "load.js"),
+                "the group must demote into entry: {pairs:#?}"
+            );
+            let entry = &pairs.iter().find(|(name, _)| name == "entry.js").unwrap().1;
+            assert!(
+                entry.contains("ready = 0")
+                    && entry.contains("function load()")
+                    && entry.contains("__wakaru_load_cache")
+                    && entry.contains("ready = 1")
+                    && entry.contains("ready = 2"),
+                "entry keeps state, writer, and the cached factory: {entry}"
+            );
+            assert_eq!(validate_output_modules(&pairs), vec![]);
+        }
+    }
+}
+
+/// Cancelling a multi-factory split must remove its compatibility aliases,
+/// while aliases of a surviving writer group still point to a real owner.
+#[test]
+fn demoted_factory_group_leaves_no_forwarding_modules() {
+    let bundle = format!(
+        r#"{SCOPE_HELPERS}
+var state = 0;
+var first = __commonJS((exports, module) => {{ state = 1; module.exports = () => state; }});
+var second = __commonJS((exports, module) => {{ state = 2; module.exports = () => state; }});
+var reset = () => {{ state = 3; }};
+var other = 0;
+var keep_first = __commonJS((exports, module) => {{ other = 4; module.exports = () => other; }});
+var keep_second = __commonJS((exports, module) => {{ other = 5; module.exports = () => other; }});
+record(first()()); record(second()()); reset(); record(state);
+record(keep_first()()); record(keep_second()());
+"#
+    );
+    for pairs in [
+        expect_unpack_raw(&bundle),
+        expect_unpack(&bundle, "bundle.js"),
+    ] {
+        assert!(
+            pairs
+                .iter()
+                .all(|(name, _)| name != "first.js" && name != "second.js"),
+            "demoted members must leave no standalone or forwarding file: {pairs:#?}"
+        );
+        assert!(pairs.iter().any(|(name, _)| name == "keep_first.js"));
+        assert!(pairs.iter().any(|(name, _)| name == "keep_second.js"));
+        let entry = &pairs.iter().find(|(name, _)| name == "entry.js").unwrap().1;
+        assert!(entry.contains("function first()") && entry.contains("function second()"));
+        assert_eq!(validate_output_modules(&pairs), vec![]);
+    }
+}
+
+/// Scope extraction precedes factory demotion. Imports for those provisional
+/// owners must not survive after both state and callables return to entry.
+#[test]
+fn demoted_factory_state_has_no_stale_entry_import() {
+    for factories in [
+        "var first = __esm(() => { state = 1; }); var second = __esm(() => { state = 2; });",
+        "var first = __commonJS(() => { state = 1; }); var second = __commonJS(() => { state = 2; });",
+    ] {
+        let bundle = format!(
+            r#"{SCOPE_HELPERS}
+var state = 0;
+{factories}
+var reset = () => {{ state = 3; }};
+first(); record(state); second(); record(state); reset(); record(state);
+var extra = {{}}; __export(extra, {{ get: () => get }});
+function get() {{ return 7; }}
+record(extra.get()); export {{ extra }};
+"#
+        );
+        for pairs in [expect_unpack_raw(&bundle), expect_unpack(&bundle, "bundle.js")] {
+            let entry = &pairs.iter().find(|(name, _)| name == "entry.js").unwrap().1;
+            assert!(entry.contains("function first()") && entry.contains("function second()"));
+            assert!(entry.contains("state = 0"));
+            assert!(
+                !entry.contains("from \"./first.js\"") && !entry.contains("from \"./second.js\""),
+                "entry cannot import demoted factory state: {entry}"
+            );
+            assert_eq!(validate_output_modules(&pairs), vec![]);
+        }
+    }
+}
+
+/// A factory declared in a mixed declaration leaves its sibling declarator
+/// in entry. With an unrelocatable entry writer the group still cancels its
+/// split, and no assignment to an import survives.
+#[test]
+fn mixed_declaration_factory_group_demotes_with_entry_writer() {
+    let bundle = r#"
+var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
+var ready = 0, load = __commonJS((exports, module) => { ready = 1; module.exports = 1; });
+var reset = () => { ready = 2; };
+record(load()); reset(); record(ready);
+"#;
+    for pairs in [
+        expect_unpack_raw(bundle),
+        expect_unpack(bundle, "bundle.js"),
+    ] {
+        let entry = &pairs.iter().find(|(name, _)| name == "entry.js").unwrap().1;
+        assert!(
+            entry.contains("ready = 0") && entry.contains("ready = 2"),
+            "entry keeps the state its writer assigns: {pairs:#?}"
+        );
+        assert!(
+            validate_output_modules(&pairs)
+                .iter()
+                .all(|finding| finding.kind != OutputFindingKind::AssignToImport),
+            "no import write may remain: {pairs:#?}"
+        );
+    }
+}
+
+/// A demoted factory's synthesized cache or guard must not reuse a name the
+/// entry already declares: a `var` collision silently skips the factory body
+/// and a lexical collision is a duplicate declaration.
+#[test]
+fn demoted_factory_helpers_avoid_entry_declarations() {
+    let cjs = "var load = __commonJS((exports, module) => { ready = 1; module.exports = 1; });";
+    let esm = "var load = __esm(() => { ready = 1; });";
+    let cjs_local = "var load = __commonJS((exports, module) => { var __wakaru_load_cache$2 = 7; ready = 1; module.exports = __wakaru_load_cache$2; });";
+    let esm_local = "var load = __esm(() => { var __wakaru_load_initialized$2 = 7; ready = __wakaru_load_initialized$2; });";
+    for (factory, existing, helper, fresh) in [
+        (
+            cjs,
+            "var __wakaru_load_cache = 42;",
+            "__wakaru_load_cache",
+            "$2",
+        ),
+        (
+            cjs,
+            "let __wakaru_load_cache = 42;",
+            "__wakaru_load_cache",
+            "$2",
+        ),
+        (
+            esm,
+            "var __wakaru_load_initialized = 42;",
+            "__wakaru_load_initialized",
+            "$2",
+        ),
+        (
+            esm,
+            "let __wakaru_load_initialized = 42;",
+            "__wakaru_load_initialized",
+            "$2",
+        ),
+        // A factory-local binding occupying the next candidate would shadow
+        // the cache inside the callable and re-run the body on every call.
+        (
+            cjs_local,
+            "var __wakaru_load_cache = 42;",
+            "__wakaru_load_cache",
+            "$3",
+        ),
+        (
+            esm_local,
+            "var __wakaru_load_initialized = 42;",
+            "__wakaru_load_initialized",
+            "$3",
+        ),
+    ] {
+        let bundle = format!(
+            r#"
+var __esm = (fn, value) => () => (fn && (value = fn(fn = 0)), value);
+var __commonJS = (cb, mod) => () => (mod || cb((mod = {{ exports: {{}} }}).exports, mod), mod.exports);
+var require_dummy = __commonJS((exports, module) => {{ module.exports = {{}}; }});
+{existing}
+var ready = 0;
+{factory}
+var reset = () => {{ ready = 2; }};
+load(); reset(); record([ready, {helper}]); record(require_dummy());
+"#
+        );
+        let pairs = expect_unpack_raw(&bundle);
+        let entry = &pairs.iter().find(|(name, _)| name == "entry.js").unwrap().1;
+        assert!(
+            entry.contains("function load()")
+                && entry.contains(&format!("{helper} = 42"))
+                && entry.contains(&format!("var {helper}{fresh}")),
+            "the demoted helper must take a fresh name: {entry}"
+        );
+        assert_eq!(
+            entry.matches(&format!("{helper} = 42")).count(),
+            1,
+            "the existing declaration stays untouched: {entry}"
+        );
+        assert_eq!(validate_output_modules(&pairs), vec![]);
+        assert_eq!(
+            validate_output_modules(&expect_unpack(&bundle, "bundle.js")),
+            vec![]
+        );
+    }
+}
+
+const SCOPE_HELPERS: &str = r#"
+var __esm = (fn, value) => () => (fn && (value = fn(fn = 0)), value);
+var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
+var __defProp = Object.defineProperty;
+var __export = (target, all) => { for (var name in all) __defProp(target, name, { get: all[name], enumerable: true }); };
+"#;
+
+/// A CommonJS factory whose written state sits inside a scope module's
+/// region follows the lazy ESM initializer path: the factory keeps its
+/// cached callable next to the state it owns, and the module's call to it
+/// resolves either locally or through an import.
+#[test]
+fn scope_module_reaches_cjs_factory_writing_region_state() {
+    let bundle = format!(
+        r#"{SCOPE_HELPERS}
+var ns = {{}}; __export(ns, {{ get: () => get }});
+function get() {{ return load(); }}
+var ready = 0;
+var load = __commonJS((exports, module) => {{ ready = 1; module.exports = 1; }});
+record(ns.get()); record(ready);
+export {{ ns }};
+"#
+    );
+    for pairs in [
+        expect_unpack_raw(&bundle),
+        expect_unpack(&bundle, "bundle.js"),
+    ] {
+        let owners: Vec<&(String, String)> = pairs
+            .iter()
+            .filter(|(_, code)| code.contains("function load()"))
+            .collect();
+        assert_eq!(owners.len(), 1, "the factory is emitted once: {pairs:#?}");
+        let (owner_name, owner) = owners[0];
+        assert!(
+            owner.contains("__wakaru_load_cache")
+                && owner.contains("ready = 1")
+                && owner.contains("ready = 0"),
+            "the factory keeps its cached callable next to its state: {owner}"
+        );
+        let ns = &pairs.iter().find(|(name, _)| name == "ns.js").unwrap().1;
+        assert!(
+            owner_name == "ns.js" || ns.contains("import { load }"),
+            "the scope module must reach the factory it calls: {ns}"
+        );
+        assert_eq!(validate_output_modules(&pairs), vec![]);
+    }
+}
+
+/// A scope module that calls a standalone CommonJS factory imports it even
+/// when that factory assigns entry-owned state.
+#[test]
+fn scope_module_imports_cjs_factory_that_writes_entry_state() {
+    let bundle = format!(
+        r#"{SCOPE_HELPERS}
+var ready = 0;
+var ns = {{}}; __export(ns, {{ get: () => get }});
+function get() {{ return load(); }}
+var load = __commonJS((exports, module) => {{ ready = 1; module.exports = 1; }});
+record(ns.get()); record(ready);
+export {{ ns }};
+"#
+    );
+    for pairs in [
+        expect_unpack_raw(&bundle),
+        expect_unpack(&bundle, "bundle.js"),
+    ] {
+        let ns = &pairs.iter().find(|(name, _)| name == "ns.js").unwrap().1;
+        assert!(
+            ns.contains("import { load } from \"./load.js\""),
+            "the scope module must import the factory it calls: {ns}"
+        );
+        let load = &pairs.iter().find(|(name, _)| name == "load.js").unwrap().1;
+        assert!(
+            load.contains("export function load()") && load.contains("ready = 0"),
+            "the standalone factory owns the state it writes: {load}"
+        );
+        assert_eq!(validate_output_modules(&pairs), vec![]);
+    }
+}
+
+/// A scope module that writes a CommonJS factory's state claims the factory.
+/// The merged factory keeps its cached callable, is exported for entry
+/// callers, and still imports the sibling factory its body calls.
+#[test]
+fn merged_cjs_factory_imports_sibling_factory() {
+    let bundle = format!(
+        r#"{SCOPE_HELPERS}
+var ns = {{}}; __export(ns, {{ get: () => get }});
+function get() {{ value += 1; return value; }}
+var value = 0;
+var fill = __commonJS((exports, module) => {{ value = load(); module.exports = 1; }});
+var ready = 0;
+var load = __commonJS((exports, module) => {{ ready = 1; module.exports = 1; }});
+record(fill()); record(ns.get()); record(ready);
+export {{ ns }};
+"#
+    );
+    for pairs in [
+        expect_unpack_raw(&bundle),
+        expect_unpack(&bundle, "bundle.js"),
+    ] {
+        let ns = &pairs.iter().find(|(name, _)| name == "ns.js").unwrap().1;
+        assert!(
+            ns.contains("export function fill()")
+                && ns.contains("__wakaru_fill_cache")
+                && ns.contains("value = load()")
+                && ns.contains("import { load } from \"./load.js\""),
+            "the merged factory is emitted with its import: {ns}"
+        );
+        assert!(
+            pairs.iter().all(|(name, _)| name != "fill.js"),
+            "no standalone file remains for the merged factory: {pairs:#?}"
+        );
+        let entry = &pairs.iter().find(|(name, _)| name == "entry.js").unwrap().1;
+        assert!(
+            entry.contains("fill()"),
+            "entry keeps calling the merged factory: {entry}"
+        );
+        assert_eq!(validate_output_modules(&pairs), vec![]);
+    }
+}
+
+/// When a merged factory references a group that an unrelocatable entry
+/// writer would demote, the split cannot be cancelled. The writer's
+/// assignment to the imported state remains and output validation reports
+/// it; the state is never forked into a second silent copy.
+#[test]
+fn undemotable_writer_group_keeps_validator_visible_residual() {
+    let bundle = format!(
+        r#"{SCOPE_HELPERS}
+var ns = {{}}; __export(ns, {{ get: () => get }});
+function get() {{ value += 1; return value; }}
+var value = 0;
+var fill = __commonJS((exports, module) => {{ value = load(); module.exports = 1; }});
+var ready = 0;
+var load = __commonJS((exports, module) => {{ ready = 1; module.exports = 1; }});
+var reset = () => {{ ready = 2; }};
+record(fill()); record(ns.get()); reset(); record(ready);
+export {{ ns }};
+"#
+    );
+    for pairs in [
+        expect_unpack_raw(&bundle),
+        expect_unpack(&bundle, "bundle.js"),
+    ] {
+        assert_eq!(
+            pairs
+                .iter()
+                .filter(|(_, code)| code.contains("ready = 0"))
+                .count(),
+            1,
+            "the state must not fork: {pairs:#?}"
+        );
+        let findings = validate_output_modules(&pairs);
+        assert!(
+            findings.len() == 1
+                && findings[0].filename == "entry.js"
+                && findings[0].kind == OutputFindingKind::AssignToImport,
+            "the residual is exactly the entry writer's import assignment: {findings:#?}"
+        );
+    }
+}
+
+/// Synthesized factory caches and guards avoid names declared in the module
+/// they are emitted into, for merged and standalone emission alike.
+#[test]
+fn factory_helpers_avoid_module_declarations() {
+    let merged = format!(
+        r#"{SCOPE_HELPERS}
+var ns = {{}}; __export(ns, {{ get: () => get }});
+function get() {{ ready = 5; return load() + __wakaru_load_cache; }}
+var __wakaru_load_cache = 40;
+var ready = 0;
+var load = __commonJS((exports, module) => {{ ready = 1; module.exports = 2; }});
+record(ns.get());
+export {{ ns }};
+"#
+    );
+    let standalone = format!(
+        r#"{SCOPE_HELPERS}
+var __wakaru_load_cache = 40;
+var __wakaru_init_initialized = 40;
+var load = __commonJS((exports, module) => {{ module.exports = __wakaru_load_cache; }});
+var init = __esm(() => {{ record(__wakaru_init_initialized); }});
+record(load()); init();
+"#
+    );
+    // The factory bodies themselves declare the base name and the next
+    // candidate, as a local and as a parameter.
+    let body_locals = format!(
+        r#"{SCOPE_HELPERS}
+var load = __commonJS((exports, module) => {{ var __wakaru_load_cache = 40, __wakaru_load_cache$2 = 1; module.exports = __wakaru_load_cache; }});
+var init = __esm(() => {{ var __wakaru_init_initialized = 40; record(((__wakaru_init_initialized$2) => __wakaru_init_initialized$2)(__wakaru_init_initialized)); }});
+record(load()); init();
+"#
+    );
+    for (bundle, owner, helper, fresh) in [
+        (&merged, "ns.js", "__wakaru_load_cache", "$2"),
+        (&standalone, "load.js", "__wakaru_load_cache", "$2"),
+        (&standalone, "init.js", "__wakaru_init_initialized", "$2"),
+        (&body_locals, "load.js", "__wakaru_load_cache", "$3"),
+        (&body_locals, "init.js", "__wakaru_init_initialized", "$3"),
+    ] {
+        let pairs = expect_unpack_raw(bundle);
+        let code = &pairs.iter().find(|(name, _)| name == owner).unwrap().1;
+        assert!(
+            code.contains(&format!("{helper} = 40"))
+                && code.contains(&format!("var {helper}{fresh}")),
+            "the helper must take a fresh name next to the user declaration: {code}"
+        );
+        assert_eq!(validate_output_modules(&pairs), vec![]);
+        assert_eq!(
+            validate_output_modules(&expect_unpack(bundle, "bundle.js")),
+            vec![]
+        );
+    }
+}
+
+/// One factory writing top-level state is still a writer group: the entry
+/// declaration moves into the factory and entry reads follow the import.
+#[test]
+fn single_factory_state_write_moves_entry_declaration() {
+    for factory in [
+        "var require_lib = __commonJS((exports, module) => { ready = true; module.exports = { read: () => ready }; });
+record(require_lib().read()); record(ready);",
+        "var init_lib = __esm(() => { ready = true; });
+init_lib(); record(ready); record(require_dummy());",
+    ] {
+        let bundle = format!(
+            r#"
+var __esm = (fn, value) => () => (fn && (value = fn(fn = 0)), value);
+var __commonJS = (cb, mod) => () => (mod || cb((mod = {{ exports: {{}} }}).exports, mod), mod.exports);
+var require_dummy = __commonJS((exports, module) => {{ module.exports = {{}}; }});
+var ready;
+{factory}
+"#
+        );
+        let pairs = expect_unpack_raw(&bundle);
+        let entry = &pairs.iter().find(|(name, _)| name == "entry.js").unwrap().1;
+        assert!(
+            !entry.contains("var ready") && entry.contains("ready"),
+            "entry must not fork the factory-owned state: {pairs:#?}"
+        );
+        assert_eq!(
+            pairs
+                .iter()
+                .filter(|(_, code)| code.contains("var ready"))
+                .count(),
+            1,
+            "the state must be declared exactly once: {pairs:#?}"
+        );
+        assert_eq!(validate_output_modules(&pairs), vec![]);
+        assert_eq!(
+            validate_output_modules(&expect_unpack(&bundle, "bundle.js")),
+            vec![]
+        );
+    }
+}
+
 /// A top-level initialization assignment is part of the mutable binding's
 /// ownership unit. If support writers make a standalone factory own the
 /// declaration, leaving the initializer in entry.js creates an assignment to
@@ -1827,6 +2934,174 @@ console.log(state, flags);
         validate_output_modules(&raw_pairs),
         vec![],
         "cancelling the split must produce valid ESM"
+    );
+}
+
+/// A `for ... in` / `for ... of` assignment head writes its existing binding
+/// even though SWC represents that target as a pattern rather than an
+/// `AssignExpr`. Those writers must follow state owned by a standalone factory
+/// just like ordinary assignment statements.
+#[test]
+fn standalone_factory_owns_for_head_state_writers() {
+    let bundle = r#"
+var y = (q,K) => () => (q && (K = q(q = 0)), K);
+var first = y(() => { firstValue = 1; });
+var second = y(() => { secondValue = 2; });
+var third = y(() => { thirdValue = 3; });
+var fourth = y(() => { fourthValue = 4; });
+var state;
+for (state of globalThis.values) consume(state);
+var key;
+for (key in globalThis.values) consume(key);
+function readState() { return state; }
+function writeState(value) { state = value; }
+function readKey() { return key; }
+function writeKey(value) { key = value; }
+var init_config = y(() => { use(readState, writeState, readKey, writeKey); });
+init_config();
+console.log(state, key);
+"#;
+
+    let raw_pairs = expect_unpack_raw(bundle);
+    let owner_code = &raw_pairs
+        .iter()
+        .find(|(_, code)| code.contains("export function init_config"))
+        .expect("config factory should own its mutable support closure")
+        .1;
+    assert!(
+        owner_code.contains("var state")
+            && owner_code.contains("for (state of globalThis.values)")
+            && owner_code.contains("var key")
+            && owner_code.contains("key in globalThis.values"),
+        "for-head writers must move with their declarations:\n{owner_code}"
+    );
+
+    let entry_code = &raw_pairs
+        .iter()
+        .find(|(name, _)| name == "entry.js")
+        .expect("entry module should exist")
+        .1;
+    assert!(
+        !entry_code.contains("state of globalThis.values")
+            && !entry_code.contains("key in globalThis.values"),
+        "entry must not retain a writer of relocated state:\n{entry_code}"
+    );
+    assert_eq!(
+        validate_output_modules(&raw_pairs),
+        vec![],
+        "relocating for-head writers must produce valid ESM"
+    );
+}
+
+/// Demotion closure must use the references of top-level writer statements
+/// already scheduled for relocation. Otherwise a writer can move into group A
+/// while its dependency's group B is demoted back to entry, leaving an
+/// unresolved binding in A.
+#[test]
+fn demotion_cascades_through_relocated_writer_dependencies() {
+    let bundle = r#"
+var y = (q,K) => () => (q && (K = q(q = 0)), K);
+var first = y(() => { firstValue = 1; });
+var second = y(() => { secondValue = 2; });
+var third = y(() => { thirdValue = 3; });
+var fourth = y(() => { fourthValue = 4; });
+var flags = readFlags();
+flags.checked = true;
+var stateB;
+stateB = flags.enabled ? getComputedStyle(document.documentElement) : undefined;
+function readB() { return stateB; }
+function writeB(value) { stateB = value; }
+var init_b = y(() => { use(readB, writeB); });
+var stateA;
+if (globalThis.ready) stateA = stateB;
+function readA() { return stateA; }
+function writeA(value) { stateA = value; }
+var init_a = y(() => { use(readA, writeA); });
+init_a();
+init_b();
+console.log(stateA, stateB, flags);
+"#;
+
+    let raw_pairs = expect_unpack_raw(bundle);
+    let entry_code = &raw_pairs
+        .iter()
+        .find(|(name, _)| name == "entry.js")
+        .expect("entry module should exist")
+        .1;
+    assert!(
+        entry_code.contains("var stateA")
+            && entry_code.contains("var stateB")
+            && entry_code.contains("stateA = stateB")
+            && entry_code.contains("function init_a")
+            && entry_code.contains("function init_b"),
+        "both dependent ownership groups must demote together:\n{entry_code}"
+    );
+    assert!(
+        !raw_pairs.iter().any(|(name, code)| {
+            name != "entry.js" && (code.contains("init_a") || code.contains("init_b"))
+        }),
+        "no standalone module may retain either demoted group: {:?}",
+        raw_pairs.iter().map(|(name, _)| name).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        validate_output_modules(&raw_pairs),
+        vec![],
+        "cascading demotion must not leave an unresolved cross-group reference"
+    );
+}
+
+/// The support declarations adopted by a standalone group participate in its
+/// emitted dependency surface too. Their references must therefore drive the
+/// same demotion closure as factory bodies and relocated writer statements.
+#[test]
+fn demotion_cascades_through_owned_support_dependencies() {
+    let bundle = r#"
+var y = (q,K) => () => (q && (K = q(q = 0)), K);
+var first = y(() => { firstValue = 1; });
+var second = y(() => { secondValue = 2; });
+var third = y(() => { thirdValue = 3; });
+var fourth = y(() => { fourthValue = 4; });
+var flags = readFlags();
+flags.checked = true;
+var stateB;
+stateB = flags.enabled ? getComputedStyle(document.documentElement) : undefined;
+function readB() { return stateB; }
+function writeB(value) { stateB = value; }
+var init_b = y(() => { use(readB, writeB); });
+var stateA;
+function readA() { return stateA === stateB; }
+function writeA(value) { stateA = value; }
+var init_a = y(() => { use(readA, writeA); });
+init_a();
+init_b();
+console.log(stateA, stateB, flags);
+"#;
+
+    let raw_pairs = expect_unpack_raw(bundle);
+    let entry_code = &raw_pairs
+        .iter()
+        .find(|(name, _)| name == "entry.js")
+        .expect("entry module should exist")
+        .1;
+    assert!(
+        entry_code.contains("var stateA")
+            && entry_code.contains("var stateB")
+            && entry_code.contains("stateA === stateB")
+            && entry_code.contains("function init_a")
+            && entry_code.contains("function init_b"),
+        "a support-declaration dependency must demote both groups:\n{entry_code}"
+    );
+    assert!(
+        !raw_pairs.iter().any(|(name, code)| {
+            name != "entry.js" && (code.contains("init_a") || code.contains("init_b"))
+        }),
+        "no standalone module may retain either demoted group: {:?}",
+        raw_pairs.iter().map(|(name, _)| name).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        validate_output_modules(&raw_pairs),
+        vec![],
+        "support-dependency demotion must not leave an unresolved reference"
     );
 }
 
@@ -2976,4 +4251,700 @@ fn webpack_style_bundle_not_detected_as_esbuild() {
         pairs.len() >= 2,
         "webpack4 bundle should be split by webpack4 detector, not esbuild"
     );
+}
+
+#[test]
+fn esbuild_unpacks_iife_wrapped_browser_bundle() {
+    // esbuild --format=iife (the browser default) wraps the entire bundle in a
+    // zero-arg arrow IIFE: (() => { ...helpers + factories + entry... })();
+    let inner = make_bundle(
+        "(q,K)=>()=>(K||q((K={exports:{}}).exports,K),K.exports)",
+        "m",
+    );
+    let bundle = format!("(() => {{\n{inner}\n}})();\n");
+    let pairs = expect_unpack(&bundle, "bundle.js");
+
+    assert!(
+        pairs.len() >= 6,
+        "expected ≥6 modules (5 factories + entry), got {}: {:?}",
+        pairs.len(),
+        pairs.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+    assert!(
+        pairs.iter().any(|(n, _)| n == "entry.js"),
+        "missing entry.js"
+    );
+    assert!(
+        pairs.iter().any(|(n, _)| n == "mod_a.js"),
+        "missing mod_a.js"
+    );
+}
+
+#[test]
+fn esbuild_unpacks_named_global_iife_bundle() {
+    // esbuild --format=iife --global-name=app (and rollup's iife output with a
+    // name) assign the IIFE result: var app = (function () { ...; return X; })();
+    let inner = make_bundle(
+        "(q,K)=>()=>(K||q((K={exports:{}}).exports,K),K.exports)",
+        "m",
+    );
+    let bundle = format!("var app = (function () {{\n{inner}\nreturn mod_a;\n}})();\n");
+    let pairs = expect_unpack(&bundle, "bundle.js");
+
+    assert!(
+        pairs.len() >= 6,
+        "expected ≥6 modules (5 factories + entry), got {}: {:?}",
+        pairs.len(),
+        pairs.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+    assert!(
+        pairs.iter().any(|(n, _)| n == "entry.js"),
+        "missing entry.js"
+    );
+}
+
+#[test]
+fn esbuild_named_global_iife_preserves_returned_entry_call() {
+    // esbuild 0.28.2 --bundle --format=iife --global-name=App places the
+    // CommonJS entry startup in the wrapper's terminal return expression.
+    let bundle = r#"
+var App = (() => {
+  var __commonJS = (cb, mod) => function __require() {
+    return mod || (0, cb[Object.getOwnPropertyNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+  };
+  var require_entry = __commonJS({
+    "entry.js"(exports, module) {
+      globalThis.trace = ["loaded"];
+      module.exports = 42;
+    }
+  });
+  return require_entry();
+})();
+"#;
+    let pairs = expect_unpack_raw(bundle);
+
+    assert!(
+        pairs.len() >= 2,
+        "expected entry factory plus startup: {pairs:#?}"
+    );
+    assert!(
+        pairs
+            .iter()
+            .any(|(_, code)| code.contains("require_entry();")),
+        "the terminal return expression must remain evaluated: {pairs:#?}"
+    );
+}
+
+#[test]
+fn esbuild_plain_iife_preserves_terminal_return_side_effect() {
+    let inner = make_bundle(
+        "(q,K)=>()=>(K||q((K={exports:{}}).exports,K),K.exports)",
+        "m",
+    );
+    let bundle = format!("(() => {{\n{inner}\nreturn globalThis.after = 9;\n}})();\n");
+    let pairs = expect_unpack_raw(&bundle);
+
+    assert!(
+        pairs
+            .iter()
+            .any(|(_, code)| code.contains("globalThis.after = 9")),
+        "unwrapping must retain terminal return-expression effects: {pairs:#?}"
+    );
+}
+
+#[test]
+fn esbuild_unpacks_bang_iife_bundle() {
+    // Some minifiers emit !function(){ ... }() instead of a parenthesized IIFE.
+    let inner = make_bundle(
+        "(q,K)=>()=>(K||q((K={exports:{}}).exports,K),K.exports)",
+        "m",
+    );
+    let bundle = format!("!function () {{\n{inner}\n}}();\n");
+    let pairs = expect_unpack(&bundle, "bundle.js");
+
+    assert!(
+        pairs.len() >= 6,
+        "expected ≥6 modules (5 factories + entry), got {}: {:?}",
+        pairs.len(),
+        pairs.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn esbuild_iife_with_sibling_statements_fails_closed() {
+    let inner = make_bundle(
+        "(q,K)=>()=>(K||q((K={exports:{}}).exports,K),K.exports)",
+        "m",
+    );
+    let bundle = format!(
+        "console.log('before-wrapper');\n(() => {{\n{inner}\n}})();\nconsole.log('after-wrapper');\n"
+    );
+    let pairs = expect_unpack_raw(&bundle);
+
+    assert_eq!(
+        pairs.len(),
+        1,
+        "an IIFE with top-level siblings is not a whole-file wrapper: {:?}",
+        pairs.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+    assert!(pairs[0].1.contains("before-wrapper"));
+    assert!(pairs[0].1.contains("after-wrapper"));
+}
+
+#[test]
+fn esbuild_iife_with_nested_return_fails_closed() {
+    let inner = make_bundle(
+        "(q,K)=>()=>(K||q((K={exports:{}}).exports,K),K.exports)",
+        "m",
+    );
+    let bundle = format!("(() => {{\nif (globalThis.skipBundle) return;\n{inner}\n}})();\n");
+    let pairs = expect_unpack_raw(&bundle);
+
+    assert_eq!(
+        pairs.len(),
+        1,
+        "a wrapper with a function-level return must remain intact: {:?}",
+        pairs.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+    assert!(pairs[0].1.contains("return"));
+}
+
+#[test]
+fn esbuild_generator_iife_fails_closed() {
+    let inner = make_bundle(
+        "(q,K)=>()=>(K||q((K={exports:{}}).exports,K),K.exports)",
+        "m",
+    );
+    let bundle = format!("(function* () {{\n{inner}\n}})();\n");
+    let pairs = expect_unpack_raw(&bundle);
+
+    assert_eq!(
+        pairs.len(),
+        1,
+        "calling a generator does not execute its bundle-looking body: {:?}",
+        pairs.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+    assert!(pairs[0].1.contains("function*"));
+}
+
+#[test]
+fn esbuild_async_iife_fails_closed() {
+    let inner = make_bundle(
+        "(q,K)=>()=>(K||q((K={exports:{}}).exports,K),K.exports)",
+        "m",
+    );
+    let bundle = format!("(async function () {{\nawait 0;\n{inner}\n}})();\n");
+    let pairs = expect_unpack_raw(&bundle);
+
+    assert_eq!(
+        pairs.len(),
+        1,
+        "an async IIFE does not share the enclosing module's execution boundary: {:?}",
+        pairs.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+    assert!(pairs[0].1.contains("async function"));
+    assert!(pairs[0].1.contains("await 0"));
+}
+
+#[test]
+fn esbuild_iife_with_parameter_fails_closed() {
+    let inner = make_bundle(
+        "(q,K)=>()=>(K||q((K={exports:{}}).exports,K),K.exports)",
+        "m",
+    );
+    let bundle =
+        format!("(function (unused = console.log('parameter-default')) {{\n{inner}\n}})();\n");
+    let pairs = expect_unpack_raw(&bundle);
+
+    assert_eq!(
+        pairs.len(),
+        1,
+        "unwrapping a parameterized IIFE could discard parameter initialization: {:?}",
+        pairs.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+    assert!(pairs[0].1.contains("parameter-default"));
+}
+
+#[test]
+fn esbuild_named_function_iife_self_binding_fails_closed() {
+    let inner = make_bundle(
+        "(q,K)=>()=>(K||q((K={exports:{}}).exports,K),K.exports)",
+        "m",
+    );
+    let bundle = format!(
+        "(function ownWrapper() {{\n{inner}\nglobalThis.kind = typeof ownWrapper;\n}})();\n"
+    );
+    let pairs = expect_unpack_raw(&bundle);
+
+    assert_eq!(
+        pairs.len(),
+        1,
+        "a named function expression must keep its self-binding: {pairs:#?}"
+    );
+    assert!(pairs[0].1.contains("function ownWrapper"));
+}
+
+#[test]
+fn esbuild_function_iife_arguments_binding_fails_closed() {
+    let inner = make_bundle(
+        "(q,K)=>()=>(K||q((K={exports:{}}).exports,K),K.exports)",
+        "m",
+    );
+    let bundle =
+        format!("(function () {{\n{inner}\nglobalThis.count = arguments.length;\n}})();\n");
+    let pairs = expect_unpack_raw(&bundle);
+
+    assert_eq!(
+        pairs.len(),
+        1,
+        "a regular-function IIFE must keep its arguments binding: {pairs:#?}"
+    );
+    assert!(pairs[0].1.contains("arguments.length"));
+}
+
+const ENTRY_OWNED_BINDINGS_BUNDLE: &str = r#"
+var __defProp = Object.defineProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+var __esm = (fn, res) => () => (fn && (res = fn(fn = 0)), res);
+var ns_lazy = {};
+__export(ns_lazy, { value: () => value });
+var value;
+var init_lazy = __esm(() => {
+  value = 42;
+});
+var ns_a = {};
+__export(ns_a, { greet: () => greet, load: () => load });
+function greet() {
+  entryHelper();
+  return "hi";
+}
+function load() {
+  return Promise.resolve().then(() => (init_lazy(), ns_lazy));
+}
+var ns_main = {};
+__export(ns_main, { main: () => main, entryHelper: () => entryHelper });
+import { readFileSync } from "fs";
+function entryHelper() {
+  console.log("helper");
+}
+async function main() {
+  greet();
+  console.log((await load()).value);
+}
+main();
+"#;
+
+#[test]
+fn scope_module_imports_entry_owned_declaration_and_restored_namespace() {
+    // Bun keeps external `import` declarations at their module position, so
+    // the last namespace header is followed by an import and its body stays
+    // in the entry remainder. `greet` (in ns_a) calls that entry-owned
+    // `entryHelper`, and `load` returns the restored lazy namespace object
+    // `ns_lazy` through the `import()` lowering. Both need an edge from the
+    // scope module to the entry.
+    let raw_pairs = expect_unpack_raw(ENTRY_OWNED_BINDINGS_BUNDLE);
+    let ns_a = &raw_pairs.iter().find(|(n, _)| n == "ns_a.js").unwrap().1;
+    assert!(
+        ns_a.contains("import { entryHelper, ns_lazy } from \"./entry.js\";"),
+        "ns_a.js should import the entry-owned bindings: {ns_a}"
+    );
+    let entry = &raw_pairs.iter().find(|(n, _)| n == "entry.js").unwrap().1;
+    assert!(
+        entry.contains("export { entryHelper, ns_lazy };"),
+        "entry.js should export the bindings scope modules import: {entry}"
+    );
+    assert!(
+        entry.contains("function entryHelper()"),
+        "entry.js should still own the declaration: {entry}"
+    );
+    assert_eq!(validate_output_modules(&raw_pairs), vec![]);
+
+    let normal_pairs = expect_unpack(ENTRY_OWNED_BINDINGS_BUNDLE, "bundle.js");
+    assert_eq!(validate_output_modules(&normal_pairs), vec![]);
+}
+
+#[test]
+fn scope_module_imports_restored_lazy_namespace_without_entry_remainder() {
+    // Same bundle without the inline import: the last namespace becomes a
+    // regular scope module, so only the lazy namespace object stays in the
+    // entry. With startup left to the importer, the consumer can safely
+    // import it from there: no scope module invokes the exported functions.
+    let bundle = ENTRY_OWNED_BINDINGS_BUNDLE
+        .replace("import { readFileSync } from \"fs\";\n", "")
+        .replace("\nmain();\n", "\n");
+    let raw_pairs = expect_unpack_raw(&bundle);
+    let ns_a = &raw_pairs.iter().find(|(n, _)| n == "ns_a.js").unwrap().1;
+    assert!(
+        ns_a.contains("import { ns_lazy } from \"./entry.js\";"),
+        "ns_a.js should import the restored namespace: {ns_a}"
+    );
+    assert!(
+        ns_a.contains("import { entryHelper } from \"./ns_main.js\";"),
+        "entryHelper lives in the ns_main scope module here: {ns_a}"
+    );
+    let entry = &raw_pairs.iter().find(|(n, _)| n == "entry.js").unwrap().1;
+    assert!(
+        entry.contains("export { ns_lazy };"),
+        "entry.js should export the restored namespace: {entry}"
+    );
+    assert_eq!(validate_output_modules(&raw_pairs), vec![]);
+    assert_eq!(
+        validate_output_modules(&expect_unpack(&bundle, "bundle.js")),
+        vec![]
+    );
+}
+
+#[test]
+fn eager_read_of_entry_owned_state_gets_no_entry_import() {
+    // `shared` stays in the entry (a prelude constant no boundary claims) and
+    // ns_a reads it while evaluating. An import edge would make ns_a
+    // evaluate before the entry and read `shared` in its TDZ, so the edge is
+    // withheld; the graph validator reports the reference instead.
+    let bundle = r#"
+var __defProp = Object.defineProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+const shared = 42;
+var ns_a = {};
+__export(ns_a, { value: () => value });
+const value = shared;
+var ns_main = {};
+__export(ns_main, { run: () => run });
+import { readFileSync } from "fs";
+function run() { console.log(value); }
+run();
+"#;
+    let raw_pairs = expect_unpack_raw(bundle);
+    let ns_a = &raw_pairs.iter().find(|(n, _)| n == "ns_a.js").unwrap().1;
+    assert!(
+        !ns_a.contains("entry.js"),
+        "eager entry state must not be imported through a cycle: {ns_a}"
+    );
+    let entry = &raw_pairs.iter().find(|(n, _)| n == "entry.js").unwrap().1;
+    assert!(
+        !entry.contains("export { shared }"),
+        "entry should not export state nobody can import safely: {entry}"
+    );
+    let findings = validate_output_modules(&raw_pairs);
+    assert_eq!(
+        findings
+            .iter()
+            .map(|f| (f.kind, f.filename.as_str(), f.message.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(
+            OutputFindingKind::UnresolvedReference,
+            "ns_a.js",
+            "unresolved identifier \"shared\" is declared at module scope only by entry.js, which this module does not import"
+        )]
+    );
+}
+
+#[test]
+fn eager_call_of_entry_owned_function_keeps_the_entry_import() {
+    // Hoisted function declarations are callable before the entry body runs,
+    // so an eager call is safe through the cycle.
+    let bundle = r#"
+var __defProp = Object.defineProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+var ns_a = {};
+__export(ns_a, { value: () => value });
+const value = compute();
+var ns_main = {};
+__export(ns_main, { run: () => run });
+import { readFileSync } from "fs";
+function compute() { return 42; }
+function run() { console.log(value); }
+run();
+"#;
+    let raw_pairs = expect_unpack_raw(bundle);
+    let ns_a = &raw_pairs.iter().find(|(n, _)| n == "ns_a.js").unwrap().1;
+    assert!(
+        ns_a.contains("import { compute } from \"./entry.js\";"),
+        "hoisted entry function should be imported: {ns_a}"
+    );
+    assert_eq!(validate_output_modules(&raw_pairs), vec![]);
+}
+
+#[test]
+fn written_entry_owned_state_gets_no_entry_import() {
+    let bundle = r#"
+var __defProp = Object.defineProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+var counter = 0;
+var ns_a = {};
+__export(ns_a, { bump: () => bump });
+function bump() { counter += 1; return counter; }
+var ns_main = {};
+__export(ns_main, { run: () => run });
+import { readFileSync } from "fs";
+function run() { console.log(bump()); }
+run();
+"#;
+    let raw_pairs = expect_unpack_raw(bundle);
+    let ns_a = &raw_pairs.iter().find(|(n, _)| n == "ns_a.js").unwrap().1;
+    assert!(
+        !ns_a.contains("import { counter }"),
+        "a written binding cannot be imported: {ns_a}"
+    );
+}
+
+/// Bundle where `shared` (entry state) and `compute` (entry function reading
+/// it) stay in the entry and ns_a reads through `READ`.
+fn entry_state_bundle(read: &str) -> String {
+    format!(
+        r#"
+var __defProp = Object.defineProperty;
+var __export = (target, all) => {{
+  for (var name in all)
+    __defProp(target, name, {{ get: all[name], enumerable: true }});
+}};
+const shared = 42;
+var ns_a = {{}};
+__export(ns_a, {{ value: () => value }});
+const value = {read};
+var ns_main = {{}};
+__export(ns_main, {{ run: () => run }});
+import {{ readFileSync }} from "fs";
+function compute() {{ return shared; }}
+function pure() {{ return 42; }}
+function run() {{ console.log(value); }}
+run();
+"#
+    )
+}
+
+fn ns_a_entry_imports(read: &str) -> Vec<String> {
+    let raw_pairs = expect_unpack_raw(&entry_state_bundle(read));
+    let ns_a = &raw_pairs.iter().find(|(n, _)| n == "ns_a.js").unwrap().1;
+    ns_a.lines()
+        .filter(|line| line.contains("./entry.js"))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn immediately_invoked_bodies_count_as_eager_entry_reads() {
+    for read in [
+        "(() => shared)()",
+        "(function () { return shared; })()",
+        "(function () { return shared; }).call(null)",
+        "new (function () { this.v = shared; })().v",
+    ] {
+        assert_eq!(ns_a_entry_imports(read), Vec::<String>::new(), "{read}");
+    }
+}
+
+#[test]
+fn computed_keys_count_as_eager_entry_reads() {
+    for read in [
+        "class { [shared]() {} }",
+        "({ get [shared]() { return 1; } })",
+        "({ [shared]() {} })",
+        "class { [shared] = 1; }",
+    ] {
+        assert_eq!(ns_a_entry_imports(read), Vec::<String>::new(), "{read}");
+    }
+    // The member bodies themselves are still deferred.
+    assert_eq!(
+        ns_a_entry_imports("class { m() { return shared; } }"),
+        vec!["import { shared } from \"./entry.js\";".to_string()]
+    );
+}
+
+#[test]
+fn eagerly_called_entry_function_needs_self_contained_references() {
+    // `compute` reads entry state that has not been initialized when ns_a
+    // evaluates; `pure` references nothing outside itself.
+    assert_eq!(ns_a_entry_imports("compute()"), Vec::<String>::new());
+    assert_eq!(
+        ns_a_entry_imports("pure()"),
+        vec!["import { pure } from \"./entry.js\";".to_string()]
+    );
+    // Deferred calls to either are fine.
+    assert_eq!(
+        ns_a_entry_imports("() => compute() + pure()"),
+        vec!["import { compute, pure } from \"./entry.js\";".to_string()]
+    );
+}
+
+#[test]
+fn deferred_reference_needs_a_guard_that_nothing_evaluates_early() {
+    // A local function called while the module evaluates runs its body
+    // early; a getter read on the spot does too. Neither read of `shared` is
+    // provably deferred, so no entry edge is added.
+    let bundle = entry_state_bundle("read()").replace(
+        "const value = read();",
+        "function read() { return shared; }\nconst value = read();",
+    );
+    let raw_pairs = expect_unpack_raw(&bundle);
+    let ns_a = &raw_pairs.iter().find(|(n, _)| n == "ns_a.js").unwrap().1;
+    assert!(!ns_a.contains("entry.js"), "{ns_a}");
+    assert_eq!(
+        ns_a_entry_imports("({ get v() { return shared; } }).v"),
+        Vec::<String>::new()
+    );
+    // An unguarded deferred reference (object-literal method at top level)
+    // has unknown timing and is treated the same way.
+    assert_eq!(
+        ns_a_entry_imports("{ m() { return shared; } }"),
+        Vec::<String>::new()
+    );
+    // The same body behind a top-level function nobody evaluates early is
+    // provably deferred.
+    let bundle = entry_state_bundle("null").replace(
+        "const value = null;",
+        "function read() { return shared; }\nconst value = read;",
+    );
+    let raw_pairs = expect_unpack_raw(&bundle);
+    let ns_a = &raw_pairs.iter().find(|(n, _)| n == "ns_a.js").unwrap().1;
+    assert!(
+        !ns_a.contains("entry.js"),
+        "aliasing the guard eagerly (`const value = read`) is an eager reference: {ns_a}"
+    );
+    let bundle = entry_state_bundle("null").replace(
+        "const value = null;",
+        "export function read() { return shared; }\nconst value = 1;",
+    );
+    let raw_pairs = expect_unpack_raw(&bundle);
+    let ns_a = &raw_pairs.iter().find(|(n, _)| n == "ns_a.js").unwrap().1;
+    assert!(
+        ns_a.contains("import { shared } from \"./entry.js\";"),
+        "{ns_a}"
+    );
+}
+
+#[test]
+fn guard_evaluated_early_by_another_scope_module_blocks_the_edge() {
+    // ns_a's `read` is deferred inside ns_a, but ns_b calls it while ns_b
+    // evaluates, before the entry initializes `shared`.
+    let bundle = r#"
+var __defProp = Object.defineProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+const shared = 42;
+var ns_a = {};
+__export(ns_a, { read: () => read });
+function read() { return shared; }
+var ns_b = {};
+__export(ns_b, { early: () => early });
+const early = read();
+var ns_main = {};
+__export(ns_main, { run: () => run });
+import { readFileSync } from "fs";
+function run() { console.log(early); }
+run();
+"#;
+    let raw_pairs = expect_unpack_raw(bundle);
+    let ns_a = &raw_pairs.iter().find(|(n, _)| n == "ns_a.js").unwrap().1;
+    assert!(!ns_a.contains("entry.js"), "{ns_a}");
+}
+
+#[test]
+fn namespace_object_read_early_blocks_the_edge() {
+    // ns_b reads ns_a's namespace object while evaluating; its getters could
+    // hand out `read` and run it before the entry initializes `shared`.
+    let bundle = r#"
+var __defProp = Object.defineProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+const shared = 42;
+var ns_a = {};
+__export(ns_a, { read: () => read });
+function read() { return shared; }
+var ns_b = {};
+__export(ns_b, { early: () => early });
+const early = ns_a.read();
+var ns_main = {};
+__export(ns_main, { run: () => run });
+import { readFileSync } from "fs";
+function run() { console.log(early); }
+run();
+"#;
+    let raw_pairs = expect_unpack_raw(bundle);
+    let ns_a = &raw_pairs.iter().find(|(n, _)| n == "ns_a.js").unwrap().1;
+    assert!(!ns_a.contains("entry.js"), "{ns_a}");
+}
+
+#[test]
+fn entry_state_stays_unlinked_through_transitive_guard_calls() {
+    for body in [
+        "function read() { return shared; }\nfunction start() { return read(); }\nconst value = start();",
+        "function read() { return shared; }\nfunction middle() { return read(); }\nfunction start() { return middle(); }\nconst value = start();",
+        "function read() { return shared; }\nfunction start() { return read(); }\nconst value = ({ get v() { return start(); } }).v;",
+    ] {
+        let bundle = entry_state_bundle("null").replace("const value = null;", body);
+        let raw_pairs = expect_unpack_raw(&bundle);
+        let ns_a = &raw_pairs.iter().find(|(n, _)| n == "ns_a.js").unwrap().1;
+        assert!(!ns_a.contains("entry.js"), "{body}\n{ns_a}");
+    }
+}
+
+#[test]
+fn recursive_guards_need_an_early_root_to_block_entry_linkage() {
+    for (initializer, expected_import) in [("first(1)", false), ("0", true)] {
+        let body = format!(
+            "function first(n) {{ return n ? second(n - 1) : 0; }}\n\
+             function second(n) {{ return n ? first(n - 1) : shared; }}\nconst value = {initializer};"
+        );
+        let bundle = entry_state_bundle("null").replace("const value = null;", &body);
+        let raw_pairs = expect_unpack_raw(&bundle);
+        let ns_a = &raw_pairs.iter().find(|(n, _)| n == "ns_a.js").unwrap().1;
+        assert_eq!(
+            ns_a.contains("import { shared } from \"./entry.js\";"),
+            expected_import,
+            "{body}\n{ns_a}"
+        );
+    }
+}
+
+#[test]
+fn namespace_exposure_propagates_through_guard_calls() {
+    let bundle = entry_state_bundle("null")
+        .replace(
+            "__export(ns_a, { value: () => value });",
+            "__export(ns_a, { value: () => value, read: () => read });",
+        )
+        .replace(
+            "const value = null;",
+            "function read() { return shared; }\nfunction start() { return ns_a.read(); }\nconst value = start();",
+        );
+    let raw_pairs = expect_unpack_raw(&bundle);
+    let ns_a = &raw_pairs.iter().find(|(n, _)| n == "ns_a.js").unwrap().1;
+    assert!(
+        !ns_a.contains("import { shared }"),
+        "a transitively exposed namespace must expose its guards too: {ns_a}"
+    );
+}
+
+#[test]
+fn early_guard_with_nested_callback_keeps_unproven_namespace_unlinked() {
+    // main now executes in a scope module, reaching load before entry runs.
+    // The Promise callback happens later at runtime, but guard reachability
+    // deliberately does not infer callback scheduling. Keep the unresolved
+    // reference instead of treating a nested callback as a deferral proof.
+    let bundle = ENTRY_OWNED_BINDINGS_BUNDLE.replace("import { readFileSync } from \"fs\";\n", "");
+    let raw_pairs = expect_unpack_raw(&bundle);
+    let ns_a = &raw_pairs.iter().find(|(n, _)| n == "ns_a.js").unwrap().1;
+    assert!(!ns_a.contains("import { ns_lazy }"), "{ns_a}");
+    let findings = validate_output_modules(&raw_pairs);
+    assert!(findings.iter().any(|finding| {
+        finding.kind == OutputFindingKind::UnresolvedReference
+            && finding.filename == "ns_a.js"
+            && finding.message.contains("ns_lazy")
+    }));
 }

@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::collections::{HashMap, HashSet};
+use std::collections::VecDeque;
 
 use swc_core::common::{sync::Lrc, SourceMap, GLOBALS};
 use swc_core::ecma::ast::{ModuleDecl, ModuleItem};
@@ -15,7 +16,7 @@ pub(crate) fn collect_import_cycle_warnings(modules: &[(String, String)]) -> Vec
         .iter()
         .map(|(filename, _)| filename.clone())
         .collect();
-    let mut graph: HashMap<String, Vec<String>> = HashMap::new();
+    let mut graph: HashMap<String, Vec<String>> = HashMap::default();
     for (filename, code) in modules {
         let deps = local_import_dependencies(filename, code, &module_names);
         graph.insert(filename.clone(), deps);
@@ -68,7 +69,7 @@ fn deterministic_cycle_witness(
     // insertion order. Skip a self-edge here so a multi-member SCC reports a
     // witness that demonstrates at least one of its cross-module edges.
     let mut queue = VecDeque::new();
-    let mut predecessor: HashMap<String, String> = HashMap::new();
+    let mut predecessor: HashMap<String, String> = HashMap::default();
     let mut start_deps = graph[&start]
         .iter()
         .filter(|dep| dep.as_str() != start && members.contains(dep.as_str()))
@@ -290,9 +291,9 @@ fn tarjan_sccs(graph: &HashMap<String, Vec<String>>) -> Vec<Vec<String>> {
         graph,
         index: 0,
         stack: Vec::new(),
-        on_stack: HashSet::new(),
-        indices: HashMap::new(),
-        lowlinks: HashMap::new(),
+        on_stack: HashSet::default(),
+        indices: HashMap::default(),
+        lowlinks: HashMap::default(),
         components: Vec::new(),
     };
     let mut nodes: Vec<String> = graph.keys().cloned().collect();

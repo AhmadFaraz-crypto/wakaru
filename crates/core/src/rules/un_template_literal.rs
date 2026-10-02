@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
-use swc_core::common::DUMMY_SP;
+use swc_core::common::{Span, DUMMY_SP};
 use swc_core::ecma::ast::{
     ArrowFunctionBody, AssignOp, AssignTarget, BinExpr, BinaryOp, CallExpr, Callee, Decl, Expr,
     Lit, MemberExpr, MemberProp, Module, ModuleItem, Pat, SimpleAssignTarget, Stmt, TaggedTpl, Tpl,
@@ -13,7 +13,7 @@ use super::cross_module_helper_refs::{
     collect_cross_module_helper_refs, cross_module_member_helper_kind, CrossModuleHelperRefs,
 };
 use super::helper_matcher::{
-    binding_key, expr_binding_key, remaining_refs_outside_declarations, remove_fn_decls_by_binding,
+    binding_key, expr_binding_key, removable_without_remaining_refs, remove_fn_decls_by_binding,
     remove_import_specifiers_by_binding, remove_var_declarators_by_binding,
     var_declarator_binding_key, BindingKey,
 };
@@ -60,6 +60,15 @@ impl<'a> UnTemplateLiteral<'a> {
         module: &mut Module,
         local_helpers: &LocalHelperContext,
     ) {
+        // Tagged-template recovery consumes helper, cache, and factory
+        // bindings; a `with` statement or a direct eval anywhere in the module
+        // can still reach them by name, so only the binding-free concat and
+        // plus-chain rewrites run (docs/rewrite-assumptions.md, dynamic-scope
+        // skip).
+        if super::eval_utils::has_dynamic_scope_construct(module) {
+            module.visit_mut_children_with(self);
+            return;
+        }
         let cross_module_helpers = self
             .module_facts
             .map(|facts| {
@@ -68,19 +77,14 @@ impl<'a> UnTemplateLiteral<'a> {
                 })
             })
             .unwrap_or_default();
-        let detected_helpers: HashSet<BindingKey> = local_helpers
-            .helpers_of_kind(TranspilerHelperKind::TaggedTemplateLiteral)
-            .into_keys()
-            .collect();
-        let factories =
-            collect_template_factories(module, &cross_module_helpers, &detected_helpers);
+        let factories = collect_template_factories(module, &cross_module_helpers, local_helpers);
         let mut replacer = TaggedTemplateReplacer {
             factories: &factories,
             cross_module_helpers: &cross_module_helpers,
-            detected_helpers: &detected_helpers,
-            consumed_helpers: HashSet::new(),
-            consumed_caches: HashSet::new(),
-            consumed_factories: HashSet::new(),
+            local_helpers,
+            consumed_helpers: HashSet::default(),
+            consumed_caches: HashSet::default(),
+            consumed_factories: HashSet::default(),
         };
         module.visit_mut_children_with(&mut replacer);
         module.visit_mut_children_with(self);
@@ -101,7 +105,10 @@ impl Default for UnTemplateLiteral<'_> {
 }
 
 enum Part {
-    Text(String),
+    /// Cooked text and the span of the string literal it came from. A string
+    /// with a lone surrogate has no UTF-8 form, so the rewrite bails instead
+    /// of building text from it.
+    Text(String, Span),
     Expr(Box<Expr>),
 }
 
@@ -125,7 +132,7 @@ impl VisitMut for UnTemplateLiteral<'_> {
     }
 
     fn visit_mut_expr(&mut self, expr: &mut Expr) {
-        if let Some(next) = rewrite_concat_chain(expr) {
+        if let Some(next) = rewrite_concat_chain(expr, self.level) {
             *expr = next;
             expr.visit_mut_children_with(self);
         } else if let Some(next) = rewrite_plus_chain(expr, self.level) {
@@ -143,13 +150,17 @@ impl VisitMut for UnTemplateLiteral<'_> {
 struct TaggedTemplateReplacer<'a> {
     factories: &'a HashMap<BindingKey, TemplateData>,
     cross_module_helpers: &'a CrossModuleHelperRefs,
-    detected_helpers: &'a HashSet<BindingKey>,
+    local_helpers: &'a LocalHelperContext,
     consumed_helpers: HashSet<BindingKey>,
     consumed_caches: HashSet<BindingKey>,
     consumed_factories: HashSet<BindingKey>,
 }
 
 impl VisitMut for TaggedTemplateReplacer<'_> {
+    fn visit_mut_with_stmt(&mut self, _stmt: &mut swc_core::ecma::ast::WithStmt) {
+        // Dynamic lookup can override even a resolver-proven helper binding.
+    }
+
     fn visit_mut_expr(&mut self, expr: &mut Expr) {
         expr.visit_mut_children_with(self);
 
@@ -160,7 +171,7 @@ impl VisitMut for TaggedTemplateReplacer<'_> {
             call,
             self.factories,
             self.cross_module_helpers,
-            self.detected_helpers,
+            self.local_helpers,
             &mut self.consumed_helpers,
             &mut self.consumed_caches,
             &mut self.consumed_factories,
@@ -171,13 +182,30 @@ impl VisitMut for TaggedTemplateReplacer<'_> {
     }
 }
 
-fn rewrite_concat_chain(expr: &Expr) -> Option<Expr> {
+/// `"a".concat(b, "c")` → `` `a${b}c` `` — the Babel (spec mode), SWC,
+/// esbuild, and TypeScript ≥ 4.5 lowering of a template literal.
+///
+/// `String.prototype.concat` evaluates every argument before coercing any of
+/// them; a template coerces each substitution before evaluating the next. The
+/// two differ only when a substitution's coercion has effects a later
+/// substitution's evaluation can observe. `standard` accepts that under the
+/// `concat_coercion_order` assumption (`rewrite-assumptions.md`); the
+/// string-literal receiver is strong producer evidence, not a proof. `minimal`
+/// rewrites only when every substitution is a syntax-proven primitive, where
+/// coercion is the identity and the two orders coincide. Like every rewrite
+/// of a builtin method call, this relies on the execution-environment
+/// baseline (`String.prototype.concat` is the intrinsic; see
+/// `rewrite-assumptions.md`), not on anything the AST proves.
+fn rewrite_concat_chain(expr: &Expr, level: RewriteLevel) -> Option<Expr> {
     let Expr::Call(call) = expr else {
         return None;
     };
 
     let mut parts = Vec::new();
     if !collect_concat_parts(call, &mut parts) {
+        return None;
+    }
+    if level == RewriteLevel::Minimal && !substitutions_are_syntax_proven_primitive(&parts) {
         return None;
     }
 
@@ -202,7 +230,12 @@ fn collect_concat_parts(call: &CallExpr, out: &mut Vec<Part>) -> bool {
                 return false;
             }
         }
-        Expr::Lit(Lit::Str(s)) => out.push(Part::Text(s.value.to_string_lossy().into_owned())),
+        Expr::Lit(Lit::Str(s)) => {
+            let Some(text) = s.value.as_str() else {
+                return false;
+            };
+            out.push(Part::Text(text.to_owned(), s.span))
+        }
         _ => return false,
     }
 
@@ -211,7 +244,12 @@ fn collect_concat_parts(call: &CallExpr, out: &mut Vec<Part>) -> bool {
             return false;
         }
         match &*arg.expr {
-            Expr::Lit(Lit::Str(s)) => out.push(Part::Text(s.value.to_string_lossy().into_owned())),
+            Expr::Lit(Lit::Str(s)) => {
+                let Some(text) = s.value.as_str() else {
+                    return false;
+                };
+                out.push(Part::Text(text.to_owned(), s.span))
+            }
             other => out.push(Part::Expr(Box::new(other.clone()))),
         }
     }
@@ -223,7 +261,7 @@ fn rewrite_tagged_template_call(
     call: &CallExpr,
     factories: &HashMap<BindingKey, TemplateData>,
     cross_module_helpers: &CrossModuleHelperRefs,
-    detected_helpers: &HashSet<BindingKey>,
+    local_helpers: &LocalHelperContext,
     consumed_helpers: &mut HashSet<BindingKey>,
     consumed_caches: &mut HashSet<BindingKey>,
     consumed_factories: &mut HashSet<BindingKey>,
@@ -236,7 +274,7 @@ fn rewrite_tagged_template_call(
         call.args[0].expr.as_ref(),
         factories,
         cross_module_helpers,
-        detected_helpers,
+        local_helpers,
     )?;
     if template_match.data.cooked.len() != call.args.len() {
         return None;
@@ -277,12 +315,12 @@ fn extract_template_match(
     expr: &Expr,
     factories: &HashMap<BindingKey, TemplateData>,
     cross_module_helpers: &CrossModuleHelperRefs,
-    detected_helpers: &HashSet<BindingKey>,
+    local_helpers: &LocalHelperContext,
 ) -> Option<TemplateMatch> {
     let expr = strip_parens(expr);
 
     if let Some((data, helper)) =
-        extract_direct_template_helper_call(expr, cross_module_helpers, detected_helpers)
+        extract_direct_template_helper_call(expr, cross_module_helpers, local_helpers)
     {
         return Some(TemplateMatch {
             data: TemplateData { helper, ..data },
@@ -325,7 +363,7 @@ fn extract_template_match(
     let (data, helper) = extract_direct_template_helper_call(
         strip_parens(&assign.right),
         cross_module_helpers,
-        detected_helpers,
+        local_helpers,
     )?;
 
     Some(TemplateMatch {
@@ -357,7 +395,7 @@ fn extract_template_factory_call<'a>(
 fn extract_direct_template_helper_call(
     expr: &Expr,
     cross_module_helpers: &CrossModuleHelperRefs,
-    detected_helpers: &HashSet<BindingKey>,
+    local_helpers: &LocalHelperContext,
 ) -> Option<(TemplateData, Option<BindingKey>)> {
     let Expr::Call(call) = expr else {
         return None;
@@ -375,13 +413,16 @@ fn extract_direct_template_helper_call(
             if let Some(helper) = expr_binding_key(callee) {
                 if !is_template_helper_name(helper.0.as_ref())
                     && !cross_module_helpers.direct.contains_key(&helper)
-                    && !detected_helpers.contains(&helper)
+                    && !local_helpers
+                        .is_helper_callee(callee, TranspilerHelperKind::TaggedTemplateLiteral)
                 {
                     return None;
                 }
                 Some(helper)
             } else if cross_module_member_helper_kind(callee, &cross_module_helpers.namespaces)
                 == Some(TranspilerHelperKind::TaggedTemplateLiteral)
+                || local_helpers
+                    .is_helper_callee(callee, TranspilerHelperKind::TaggedTemplateLiteral)
                 || is_inline_template_helper(callee)
             {
                 None
@@ -463,6 +504,16 @@ fn is_inline_template_helper(expr: &Expr) -> bool {
 /// literal. All non-string elements that appear **before** the first string
 /// literal are grouped into a single sub-expression to preserve arithmetic
 /// semantics (e.g. `a + b + "c"` → `` `${a + b}c` `` not `` `${a}${b}c` ``).
+///
+/// A plus chain evaluates and coerces its operands in the same order a
+/// template does; the only difference is the coercion hint (`+` uses
+/// `default`, a template uses `string`), which matters for objects whose
+/// `valueOf` and `toString` disagree. Babel loose mode and TypeScript ≤ 4.4
+/// lower templates to this exact shape, indistinguishable from handwritten
+/// concatenation. `standard` accepts the hint change under the
+/// `string_coercion_hint` assumption (`rewrite-assumptions.md`); `minimal`
+/// rewrites only when every substitution is a syntax-proven primitive, where
+/// the hint is irrelevant.
 fn rewrite_plus_chain(expr: &Expr, level: RewriteLevel) -> Option<Expr> {
     // Collect the flat left-associative operand list
     let mut operands: Vec<&Expr> = Vec::new();
@@ -473,9 +524,6 @@ fn rewrite_plus_chain(expr: &Expr, level: RewriteLevel) -> Option<Expr> {
         return None;
     }
     let first_str_idx = operands.iter().position(|e| is_str_lit(e))?;
-    if level == RewriteLevel::Minimal && is_empty_str_lit(operands[first_str_idx]) {
-        return None;
-    }
 
     // Determine the span for the resulting template
     let span = match expr {
@@ -496,7 +544,7 @@ fn rewrite_plus_chain(expr: &Expr, level: RewriteLevel) -> Option<Expr> {
 
     for op in &operands[first_str_idx..] {
         if let Expr::Lit(Lit::Str(s)) = op {
-            parts.push(Part::Text(s.value.to_string_lossy().into_owned()));
+            parts.push(Part::Text(s.value.as_str()?.to_owned(), s.span));
         } else {
             parts.push(Part::Expr(Box::new((*op).clone())));
         }
@@ -507,8 +555,51 @@ fn rewrite_plus_chain(expr: &Expr, level: RewriteLevel) -> Option<Expr> {
     if !parts.iter().any(|p| matches!(p, Part::Expr(_))) {
         return None;
     }
+    if level == RewriteLevel::Minimal && !substitutions_are_syntax_proven_primitive(&parts) {
+        return None;
+    }
 
     Some(Expr::Tpl(parts_to_template(parts, span)))
+}
+
+fn substitutions_are_syntax_proven_primitive(parts: &[Part]) -> bool {
+    parts.iter().all(|part| match part {
+        Part::Text(..) => true,
+        Part::Expr(expr) => is_syntax_proven_primitive(expr),
+    })
+}
+
+/// Whether an expression's value is a primitive by syntax alone. ToPrimitive
+/// is the identity on primitives, so for these substitutions neither the
+/// coercion hint nor the coercion order can be observed and the template
+/// rewrite is exact at every level.
+///
+/// Unary and binary operators always produce primitives (any exception they
+/// raise happens while evaluating the operand, identically in both forms), so
+/// they count regardless of their operands. Identifiers do not: even
+/// `undefined` or `NaN` would need the resolver mark to be trusted here.
+fn is_syntax_proven_primitive(expr: &Expr) -> bool {
+    match strip_parens(expr) {
+        Expr::Lit(lit) => !matches!(lit, Lit::Regex(_) | Lit::JSXText(_)),
+        Expr::Tpl(_) => true,
+        Expr::Unary(_) | Expr::Update(_) => true,
+        // Logical operators yield one of their operands unchanged; every
+        // other binary operator yields a number, bigint, boolean, or string.
+        Expr::Bin(bin) => match bin.op {
+            BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::NullishCoalescing => {
+                is_syntax_proven_primitive(&bin.left) && is_syntax_proven_primitive(&bin.right)
+            }
+            _ => true,
+        },
+        Expr::Cond(cond) => {
+            is_syntax_proven_primitive(&cond.cons) && is_syntax_proven_primitive(&cond.alt)
+        }
+        Expr::Seq(seq) => seq
+            .exprs
+            .last()
+            .is_some_and(|last| is_syntax_proven_primitive(last)),
+        _ => false,
+    }
 }
 
 /// Flatten a left-associative `+` chain into individual operands.
@@ -529,10 +620,6 @@ fn collect_add_chain<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 
 fn is_str_lit(expr: &Expr) -> bool {
     matches!(expr, Expr::Lit(Lit::Str(_)))
-}
-
-fn is_empty_str_lit(expr: &Expr) -> bool {
-    matches!(expr, Expr::Lit(Lit::Str(s)) if s.value.is_empty())
 }
 
 fn normalize_escaped_newline_template_raw(tpl: &mut Tpl, level: RewriteLevel) {
@@ -588,7 +675,7 @@ fn normalize_newline_escapes(raw: &str) -> Option<String> {
 fn collect_template_factories(
     module: &Module,
     cross_module_helpers: &CrossModuleHelperRefs,
-    detected_helpers: &HashSet<BindingKey>,
+    local_helpers: &LocalHelperContext,
 ) -> HashMap<BindingKey, TemplateData> {
     module
         .body
@@ -601,7 +688,7 @@ fn collect_template_factories(
             let data = extract_template_from_factory_body(
                 &body.stmts,
                 cross_module_helpers,
-                detected_helpers,
+                local_helpers,
             )?;
             Some((binding_key(&func.ident), data))
         })
@@ -611,9 +698,9 @@ fn collect_template_factories(
 fn extract_template_from_factory_body(
     stmts: &[Stmt],
     cross_module_helpers: &CrossModuleHelperRefs,
-    detected_helpers: &HashSet<BindingKey>,
+    local_helpers: &LocalHelperContext,
 ) -> Option<TemplateData> {
-    let mut locals: HashMap<BindingKey, TemplateData> = HashMap::new();
+    let mut locals: HashMap<BindingKey, TemplateData> = HashMap::default();
 
     for stmt in stmts {
         match stmt {
@@ -628,7 +715,7 @@ fn extract_template_from_factory_body(
                     if let Some((data, helper)) = extract_direct_template_helper_call(
                         init,
                         cross_module_helpers,
-                        detected_helpers,
+                        local_helpers,
                     ) {
                         locals.insert(key, TemplateData { helper, ..data });
                     }
@@ -642,7 +729,7 @@ fn extract_template_from_factory_body(
                     }
                 }
                 if let Some((data, helper)) =
-                    extract_direct_template_helper_call(arg, cross_module_helpers, detected_helpers)
+                    extract_direct_template_helper_call(arg, cross_module_helpers, local_helpers)
                 {
                     return Some(TemplateData { helper, ..data });
                 }
@@ -667,7 +754,7 @@ fn collect_template_array(expr: &Expr) -> Option<Vec<Option<String>>> {
                 return None;
             }
             match elem.expr.as_ref() {
-                Expr::Lit(Lit::Str(s)) => Some(Some(s.value.to_string_lossy().into_owned())),
+                Expr::Lit(Lit::Str(s)) => Some(Some(s.value.as_str()?.to_owned())),
                 Expr::Ident(id) if id.sym.as_ref() == "undefined" => Some(None),
                 Expr::Unary(unary)
                     if unary.op == swc_core::ecma::ast::UnaryOp::Void
@@ -727,17 +814,29 @@ impl TemplateData {
     }
 }
 
+/// Each quasi spans the string literals merged into it, so its text maps to
+/// those literals; a quasi with no literal (an empty head or tail) keeps the
+/// whole template's span.
 fn parts_to_template(parts: Vec<Part>, span: swc_core::common::Span) -> Tpl {
     let mut quasis = Vec::new();
     let mut exprs = Vec::new();
     let mut current = String::new();
+    let mut current_span: Option<Span> = None;
 
     for part in parts {
         match part {
-            Part::Text(text) => current.push_str(&text),
+            Part::Text(text, text_span) => {
+                current.push_str(&text);
+                if !text_span.is_dummy() {
+                    current_span = Some(match current_span {
+                        Some(merged) => Span::new(merged.lo, text_span.hi),
+                        None => text_span,
+                    });
+                }
+            }
             Part::Expr(expr) => {
                 quasis.push(TplElement {
-                    span,
+                    span: current_span.take().unwrap_or(span),
                     tail: false,
                     cooked: Some(current.clone().into()),
                     raw: escape_template_raw(&current).into(),
@@ -749,7 +848,7 @@ fn parts_to_template(parts: Vec<Part>, span: swc_core::common::Span) -> Tpl {
     }
 
     quasis.push(TplElement {
-        span,
+        span: current_span.unwrap_or(span),
         tail: true,
         cooked: Some(current.clone().into()),
         raw: escape_template_raw(&current).into(),
@@ -780,8 +879,7 @@ fn escape_template_raw_cooked_copy(input: &str) -> String {
 }
 
 fn remove_unused_template_bindings(module: &mut Module, candidates: &HashSet<BindingKey>) {
-    let remaining = remaining_refs_outside_declarations(module, candidates, candidates);
-    let unused: HashSet<_> = candidates.difference(&remaining).cloned().collect();
+    let unused = removable_without_remaining_refs(module, candidates);
     if unused.is_empty() {
         return;
     }

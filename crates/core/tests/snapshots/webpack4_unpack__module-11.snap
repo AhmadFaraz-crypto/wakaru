@@ -40,13 +40,13 @@ export function createStore(e, t, n) {
             d = f.slice();
         }
     }
-    function m() {
+    function getState() {
         if (p) {
             throw new Error("You may not call store.getState() while the reducer is executing. The reducer has already received the state as an argument. Pass it down from the top reducer instead of reading it from the store.");
         }
         return s;
     }
-    function y(e) {
+    function subscribe(e) {
         if (typeof e !== "function") {
             throw new Error("Expected the listener to be a function.");
         }
@@ -94,8 +94,8 @@ export function createStore(e, t, n) {
     });
     return {
         dispatch: v,
-        subscribe: y,
-        getState: m,
+        subscribe,
+        getState,
         replaceReducer (e) {
             if (typeof e !== "function") {
                 throw new Error("Expected the nextReducer to be a function.");
@@ -106,7 +106,7 @@ export function createStore(e, t, n) {
             });
         },
         [a]: function() {
-            const t = y;
+            const t = subscribe;
             return {
                 subscribe (e) {
                     if ((e === undefined ? "undefined" : typeof e) !== "object" || e === null) {
@@ -114,7 +114,7 @@ export function createStore(e, t, n) {
                     }
                     function n() {
                         if (e.next) {
-                            e.next(m());
+                            e.next(getState());
                         }
                     }
                     n();
@@ -136,6 +136,7 @@ function c(e, t) {
 export function combineReducers(e) {
     for(var t = Object.keys(e), n = {}, r = 0; r < t.length; r++){
         const i = t[r];
+        0;
         if (typeof e[i] === "function") {
             n[i] = e[i];
         }
@@ -143,7 +144,7 @@ export function combineReducers(e) {
     const a = Object.keys(n);
     let u;
     try {
-        !((e)=>{
+        ((e)=>{
             Object.keys(e).forEach((t)=>{
                 const n = e[t];
                 if (n(undefined, {
@@ -158,8 +159,8 @@ export function combineReducers(e) {
                 }
             });
         })(n);
-    } catch (e) {
-        u = e;
+    } catch (error) {
+        u = error;
     }
     return (e = {}, t)=>{
         if (u) {
@@ -205,15 +206,15 @@ export function bindActionCreators(e, t) {
     }
     return r;
 }
-export function compose(...t) {
-    if (t.length === 0) {
+export function compose(...t_1) {
+    if (t_1.length === 0) {
         return (e)=>e;
     }
-    if (t.length === 1) {
-        return t[0];
+    if (t_1.length === 1) {
+        return t_1[0];
     }
-    return t.reduce((e, t)=>function() {
-            return e(t(...arguments));
+    return t_1.reduce((acc, item)=>function() {
+            return acc(item(...arguments));
         });
 }
 export function applyMiddleware(...t) {

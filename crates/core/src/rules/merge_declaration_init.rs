@@ -10,7 +10,8 @@
 //!
 //! This rule folds the bare `let`/`var` declaration into its first
 //! statement-level assignment **in the same statement list**. It also handles
-//! an exactly-adjacent top-level declaration and literal initializer, including
+//! an exactly-adjacent top-level declaration and literal or inert anonymous class
+//! initializer, including
 //! `export let Enum; Enum = { ... };`. In standard mode, it only folds inert
 //! right-hand sides. Aggressive mode also folds broader generated-code shapes
 //! such as `let response; response = await fetch_user(id);`.
@@ -29,7 +30,8 @@
 //! - the declaration is a single bare `let`/`var` binding (no initializer);
 //! - the first statement-level assignment to that binding is a simple `=` in the
 //!   same statement list (not nested in a branch/loop/closure);
-//! - top-level module merging is exactly adjacent and recursively literal-only;
+//! - top-level module merging is exactly adjacent and accepts recursively literal
+//!   initializers or anonymous classes with no definition-time user code;
 //! - only other bare declarations appear between the declaration and that
 //!   assignment (calls, branches, function declarations, and initialized
 //!   declarations may observe declaration timing or closure state);
@@ -46,12 +48,13 @@
 //! Matching is by [`BindingId`] (name + `SyntaxContext`), so same-named bindings
 //! in different scopes are never conflated.
 
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use swc_core::common::DUMMY_SP;
 use swc_core::ecma::ast::{
-    AssignOp, AssignTarget, Decl, EmptyStmt, Expr, Ident, Lit, Module, ModuleDecl, ModuleItem, Pat,
-    Prop, PropName, PropOrSpread, SimpleAssignTarget, Stmt, UnaryOp, VarDecl, VarDeclKind,
+    AssignOp, AssignTarget, ClassMember, Decl, EmptyStmt, Expr, Function, Ident, Lit, Module,
+    ModuleDecl, ModuleItem, ParamOrTsParamProp, Pat, Prop, PropName, PropOrSpread,
+    SimpleAssignTarget, Stmt, UnaryOp, VarDecl, VarDeclKind,
 };
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
@@ -69,7 +72,7 @@ impl MergeDeclarationInit {
     pub fn new(level: RewriteLevel) -> Self {
         Self {
             level,
-            merged_let_bindings: HashSet::new(),
+            merged_let_bindings: HashSet::default(),
         }
     }
 }
@@ -111,7 +114,7 @@ fn merge_module_item_list(items: &mut Vec<ModuleItem>) -> Vec<BindingId> {
         };
         if module_assignment_target(&items[i + 1]).as_ref() != Some(&id)
             || module_assignment_rhs_references(&items[i + 1], &id)
-            || !module_assignment_rhs_is_literal(&items[i + 1]).unwrap_or(false)
+            || !module_assignment_rhs_is_safe(&items[i + 1]).unwrap_or(false)
         {
             i += 1;
             continue;
@@ -286,11 +289,12 @@ fn module_assignment_rhs_references(item: &ModuleItem, id: &BindingId) -> bool {
     assignment_rhs_references(stmt, id)
 }
 
-fn module_assignment_rhs_is_literal(item: &ModuleItem) -> Option<bool> {
+fn module_assignment_rhs_is_safe(item: &ModuleItem) -> Option<bool> {
     let ModuleItem::Stmt(stmt) = item else {
         return None;
     };
-    Some(expr_is_literal_initializer(assignment_rhs(stmt)?))
+    let rhs = assignment_rhs(stmt)?;
+    Some(expr_is_literal_initializer(rhs) || expr_is_inert_class(rhs))
 }
 
 fn assignment_rhs(stmt: &Stmt) -> Option<&Expr> {
@@ -311,6 +315,50 @@ fn expr_is_inert_initializer(expr: &Expr) -> bool {
         Expr::Paren(paren) => expr_is_inert_initializer(&paren.expr),
         _ => false,
     }
+}
+
+/// Class creation must not call code that can observe the split binding's
+/// initialized-undefined state. Instance initializers and method bodies run
+/// later; heritage, computed keys, decorators, and static initialization do not.
+/// Keep this separate from literal recursion so nested class expressions do not
+/// broaden the existing object/array initializer matcher.
+fn expr_is_inert_class(expr: &Expr) -> bool {
+    let Expr::Class(expr) = crate::utils::paren::strip_parens(expr) else {
+        return false;
+    };
+    expr.ident.is_none()
+        && expr.class.super_class.is_none()
+        && expr.class.decorators.is_empty()
+        && expr.class.body.iter().all(class_member_is_inert)
+}
+
+fn class_member_is_inert(member: &ClassMember) -> bool {
+    match member {
+        ClassMember::Constructor(constructor) => constructor.params.iter().all(|param| {
+            matches!(param, ParamOrTsParamProp::Param(param) if param.decorators.is_empty())
+        }),
+        ClassMember::Method(method) => {
+            !matches!(method.key, PropName::Computed(_))
+                && function_has_no_decorators(&method.function)
+        }
+        ClassMember::PrivateMethod(method) => function_has_no_decorators(&method.function),
+        ClassMember::ClassProp(prop) => {
+            !prop.is_static
+                && !matches!(prop.key, PropName::Computed(_))
+                && prop.decorators.is_empty()
+        }
+        ClassMember::PrivateProp(prop) => !prop.is_static && prop.decorators.is_empty(),
+        ClassMember::Empty(_) => true,
+        _ => false,
+    }
+}
+
+fn function_has_no_decorators(function: &Function) -> bool {
+    function.decorators.is_empty()
+        && function
+            .params
+            .iter()
+            .all(|param| param.decorators.is_empty())
 }
 
 fn expr_is_literal_initializer(expr: &Expr) -> bool {

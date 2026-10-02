@@ -87,7 +87,7 @@ fn resolve_passthrough(
 ) -> Option<Atom> {
     let original_importer = current_filename?;
     let mut current = facts.resolve_key_from(current_filename, source)?;
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::collections::HashSet::default();
 
     loop {
         if !seen.insert(current.clone()) {
@@ -193,7 +193,11 @@ impl Visit for MemberOnlyAnalyzer<'_> {
         }
     }
 
-    fn visit_prop_name(&mut self, _: &swc_core::ecma::ast::PropName) {}
+    fn visit_prop_name(&mut self, prop: &swc_core::ecma::ast::PropName) {
+        if let swc_core::ecma::ast::PropName::Computed(computed) = prop {
+            computed.visit_with(self);
+        }
+    }
 
     fn visit_member_prop(&mut self, prop: &MemberProp) {
         if let MemberProp::Computed(prop) = prop {

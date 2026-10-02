@@ -36,8 +36,8 @@
     "runnable": 2180,
     "skipped": 0,
     "unsupported": 5,
-    "rejected": 129,
-    "passed": 2046,
+    "rejected": 120,
+    "passed": 2055,
     "failed": 0
   },
   "outcomes": [
@@ -592,78 +592,6 @@
       "kind": "transform-reject",
       "fingerprint": "e22653c5ea3891c4dd0d5014af19f2b7e91280cc05daaa1f3ed1f8f247400a02",
       "summary": "Error: Transform failed with 1 error:\n<stdin>:32:9: ERROR: Cannot assign to \"c\" because it is a constant"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-elem-trlg-iter-elision-iter-abpt.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "aef887c417a1aada8d580c1ea946643df546cea16d38525021b65fc507d0063a",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected a Test262Error but got a TypeError"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-elem-trlg-iter-elision-iter-nrml-close-err.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "c5ccd73b77f0212f88a3e3086a0b3627c8da4641580042779f148bd000c83e80",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«1», «2») to be true"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-elem-trlg-iter-elision-iter-nrml-close-skip.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "7cc19a11f6026502f83cfac4159dd1f82cf39faebc9bdcd8608c634e63a30d7e",
-      "summary": "Error: sloppy: expected success, got runtime TypeError: Iterator result undefined is not an object"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-elem-trlg-iter-elision-iter-nrml-close.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "353e2e566ff58b00c8a9cf8e0b5724f19ad4e6cc72c1d2e2713e112b14580b67",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«1», «2») to be true"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-elision-iter-abpt.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "cac4a307c31a466884a4533ae8e2668ceb08f36cd8eb9274c994d8ef6bde2ce9",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected a Test262Error but got a TypeError"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-elision-iter-nrml-close-err.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "1cc099991039073c3d18a1da0b391afab1e4dccc45b9b85736abd785b60c2d64",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-elision-iter-nrml-close-skip.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "676ac2ccfd38a16980101df6752ee48af8230a2b1f0dc36a50e895e014a9bcbb",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-elision-iter-nrml-close.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "351e57bba9ab724bdce78f163cf069ac71a304961ca6b968750be23e3e20ca08",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-iteration.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "fd4567c956dc390140870e44ac450490dfb725406d331340bf5f73041d2aa3bb",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«0», «2») to be true"
     },
     {
       "path": "test/language/statements/for-of/dstr/array-rest-put-const.js",

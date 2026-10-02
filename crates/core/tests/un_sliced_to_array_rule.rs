@@ -15,7 +15,7 @@ var _ref = _slicedToArray(a, 2);
 var name = _ref[0];
 var value = _ref[1];
 "#;
-    // slicedToArray just unwraps; destructuring reconstruction is done by downstream rules
+    // The helper and all indexed bindings are recovered together.
     let output = render(input);
     insta::assert_snapshot!(output);
 }
@@ -109,12 +109,14 @@ fn handles_cross_module_default_object_helper_member_fact() {
 
     let input = r#"
 import helpers from "./helpers.js";
-var _useState = helpers._(useState(value), 2), current = _useState[0], setCurrent = _useState[1];
+var _useState = helpers._(useState(value), 2);
+var current = _useState[0];
+var setCurrent = _useState[1];
 use(current, setCurrent);
 "#;
     let expected = r#"
 import helpers from "./helpers.js";
-var _useState = useState(value), current = _useState[0], setCurrent = _useState[1];
+var [current, setCurrent] = useState(value);
 use(current, setCurrent);
 "#;
     assert_eq_normalized(
@@ -239,21 +241,11 @@ function Component() {
     use(current, setCurrent);
 }
 "#;
-    let expected = r#"
-function Component() {
-    var current;
-    var setCurrent;
-    var tuple = useState(value);
-    current = tuple[0];
-    setCurrent = tuple[1];
-    use(current, setCurrent);
-}
-"#;
     assert_eq_normalized(
         &common::render_rule(input, |_| {
             UnSlicedToArray::new_with_level(RewriteLevel::Minimal)
         }),
-        expected,
+        input,
     );
 }
 
@@ -305,6 +297,55 @@ function Component() {
 }
 
 #[test]
+fn folds_helper_ref_assignment_with_trailing_ref_value() {
+    // swc lowers the statement `[a, b] = f()` to a sequence that ends with
+    // `ref`, the value of the assignment expression. The statement discards
+    // that value, so the trailing read belongs to the lowered form.
+    let input = r#"
+import { _ as _sliced_to_array } from "@swc/helpers/_/_sliced_to_array";
+function Component() {
+    var current;
+    var setCurrent;
+    var ref;
+    ref = _sliced_to_array(useState(value), 2);
+    current = ref[0];
+    setCurrent = ref[1];
+    ref;
+    use(current, setCurrent);
+}
+"#;
+    let expected = r#"
+function Component() {
+    var [current, setCurrent] = useState(value);
+    use(current, setCurrent);
+}
+"#;
+    assert_eq_normalized(
+        &common::render_rule(input, |_| UnSlicedToArray::new()),
+        expected,
+    );
+}
+
+#[test]
+fn keeps_helper_ref_assignment_when_ref_is_read_after_its_value() {
+    let input = r#"
+import { _ as _sliced_to_array } from "@swc/helpers/_/_sliced_to_array";
+function Component() {
+    var current;
+    var setCurrent;
+    var ref;
+    ref = _sliced_to_array(useState(value), 2);
+    current = ref[0];
+    setCurrent = ref[1];
+    ref;
+    use(ref);
+}
+"#;
+    let output = common::render_rule(input, |_| UnSlicedToArray::new());
+    assert!(output.contains("ref = _sliced_to_array("), "{output}");
+}
+
+#[test]
 fn unwraps_tslib_namespace_read_require() {
     let input = r#"
 var tslib_1 = require("tslib");
@@ -349,12 +390,14 @@ fn unwraps_cross_module_ts_read_helper_fact() {
 
     let input = r#"
 import { __read } from "./helpers.js";
-var _a = __read(pair, 2), first = _a[0], second = _a[1];
+var _a = __read(pair, 2);
+var first = _a[0];
+var second = _a[1];
 use(first, second);
 "#;
     let expected = r#"
 import { __read } from "./helpers.js";
-var _a = pair, first = _a[0], second = _a[1];
+var [first, second] = pair;
 use(first, second);
 "#;
     assert_eq_normalized(
@@ -384,7 +427,9 @@ var __read = (this && this.__read) || function (o, n) {
     }
     return ar;
 };
-var _a = __read(pair, 2), first = _a[0], second = _a[1];
+var _a = __read(pair, 2);
+var first = _a[0];
+var second = _a[1];
 use(first, second);
 "#;
     let expected = r#"
@@ -437,14 +482,14 @@ _slicedToArray(a, 2, 3);
 }
 
 #[test]
-fn removes_helper_declaration() {
+fn incomplete_group_retains_helper_declaration() {
     let input = r#"
 var _slicedToArray = require("@babel/runtime/helpers/slicedToArray");
 var _ref = _slicedToArray(a, 2);
 var name = _ref[0];
 "#;
     let output = render(input);
-    insta::assert_snapshot!(output);
+    insta::assert_snapshot!("removes_helper_declaration", output);
 }
 
 // ---------------------------------------------------------------------------
@@ -728,6 +773,9 @@ function read(pair) {
 
 #[test]
 fn recovers_array_destructured_default_parameter_from_nested_helper() {
+    // UnSlicedToArray leaves the default element to UnDestructuring, which
+    // drops the proven helper once the pattern covers both materialized
+    // elements; UnParameters2 then folds the pattern into the parameter.
     let input = r#"
 function _arrayWithHoles(arr) {
     if (Array.isArray(arr)) return arr;
@@ -764,13 +812,9 @@ function _slicedToArray(arr, i) {
 var _ref = _slicedToArray(pair, 2), key = _ref[0], value = _ref[1];
 use(key, value, _ref);
 "#;
-    let expected = r#"
-const _ref = pair;
-const key = _ref[0];
-const value = _ref[1];
-use(key, value, _ref);
-"#;
-    assert_eq_normalized(&render(input), expected);
+    let output = render(input);
+    assert!(output.contains("_slicedToArray(pair, 2)"), "{output}");
+    assert!(output.contains("use(key, value, _ref)"), "{output}");
 }
 
 #[test]
@@ -1167,4 +1211,203 @@ const tuple = sliced(...args);
         &common::render_rule(input, |_| UnSlicedToArray::new()),
         input,
     );
+}
+
+#[test]
+fn complete_indexed_return_recovers_a_destructuring_group() {
+    let input = r#"
+import { __read } from "tslib";
+function read(items) {
+    var pair = __read(items, 2);
+    return pair[0] + pair[1];
+}
+"#;
+    let output = common::render_rule(input, |_| UnSlicedToArray::new());
+    assert_eq_normalized(
+        &output,
+        "function read(items) { var [_item, _item2] = items; return _item + _item2; }",
+    );
+    assert!(!render(input).contains("__read(items, 2)"));
+}
+
+#[test]
+fn escaping_zero_length_result_keeps_its_binding() {
+    let input = r#"
+import { __read } from "tslib";
+var result = __read(items, 0);
+consume(result);
+"#;
+    assert_eq_normalized(
+        &common::render_rule(input, |_| UnSlicedToArray::new()),
+        input,
+    );
+}
+
+#[test]
+fn incomplete_or_observable_indexed_returns_keep_materialization() {
+    for body in [
+        "return pair[0];",
+        "return pair[1] + pair[0];",
+        "return pair[0] + pair[0];",
+        "return pair[0] + pair[2];",
+        "return pair[0] + consume(pair[1]);",
+        "return pair[0] || pair[1];",
+        "return pair[0] + (() => pair[1])();",
+        "return pair[0] + pair[1]++;",
+        "consume(pair); return pair[0] + pair[1];",
+        "return pair[0] + pair[1]; function later() { return pair; }",
+        "eval('pair'); return pair[0] + pair[1];",
+        "with (scope) { return pair[0] + pair[1]; }",
+    ] {
+        let input = format!(
+            "import {{ __read }} from 'tslib'; function read(items) {{ var pair = __read(items, 2); {body} }}"
+        );
+        assert_eq_normalized(
+            &common::render_rule(&input, |_| UnSlicedToArray::new()),
+            &input,
+        );
+    }
+}
+
+#[test]
+fn indexed_return_requires_stable_helper_identity() {
+    for (header, callee) in [
+        ("function custom(items, n) { return items; }", "custom"),
+        ("var h = require('tslib').__read; h = custom;", "h"),
+        (
+            "var h = require('tslib').__read; function replace() { h = custom; }",
+            "h",
+        ),
+        (
+            "var ts = require('tslib'); ts.__read = custom;",
+            "ts.__read",
+        ),
+        ("var ts = require('tslib'); consume(ts);", "ts.__read"),
+        ("var ts = require('tslib'); var ts = custom;", "ts.__read"),
+        ("var h = require('tslib').__read; var h = custom;", "h"),
+    ] {
+        let input = format!(
+            "{header} function read(items) {{ var pair = {callee}(items, 2); return pair[0] + pair[1]; }}"
+        );
+        assert_eq_normalized(
+            &common::render_rule(&input, |_| UnSlicedToArray::new()),
+            &input,
+        );
+    }
+}
+
+#[test]
+fn indexed_return_generated_names_do_not_capture_existing_names() {
+    let input = "import { __read } from 'tslib'; function read(items, _item) { var pair = __read(items, 2); return pair[0] + pair[1]; } function other() { return _item2; }";
+    let expected = "function read(items, _item) { var [_item3, _item4] = items; return _item3 + _item4; } function other() { return _item2; }";
+    assert_eq_normalized(
+        &common::render_rule(input, |_| UnSlicedToArray::new()),
+        expected,
+    );
+}
+
+#[test]
+fn minimal_indexed_return_retains_materialization() {
+    let input = "import { __read } from 'tslib'; function read(items) { var pair = __read(items, 2); return pair[0] + pair[1]; }";
+    assert_eq_normalized(
+        &common::render_rule(input, |_| {
+            UnSlicedToArray::new_with_level(RewriteLevel::Minimal)
+        }),
+        input,
+    );
+}
+
+#[test]
+fn indexed_return_requires_matching_limit_and_preserves_hoisted_vars() {
+    let input = "import { __read } from 'tslib'; function read(items) { var pair = __read(items, 2); var unused; return pair[0] + pair[1]; }";
+    let expected =
+        "function read(items) { var [_item, _item2] = items; var unused; return _item + _item2; }";
+    assert_eq_normalized(
+        &common::render_rule(input, |_| UnSlicedToArray::new()),
+        expected,
+    );
+    for limit in ["3", "count", "2.5", "...counts"] {
+        let input = input.replace("items, 2", &format!("items, {limit}"));
+        assert_eq_normalized(
+            &common::render_rule(&input, |_| UnSlicedToArray::new()),
+            &input,
+        );
+    }
+    let input = "import { __read } from 'tslib'; function read(items) { var pair = __read(items, 3); return pair[0] + (pair[1] * pair[2]); }";
+    let expected = "function read(items) { var [_item, _item2, _item3] = items; return _item + _item2 * _item3; }";
+    assert_eq_normalized(
+        &common::render_rule(input, |_| UnSlicedToArray::new()),
+        expected,
+    );
+}
+
+#[test]
+fn indexed_return_tracks_shadowed_helpers_and_temporary_bindings() {
+    let input = "import { __read } from 'tslib'; function read(items) { var pair = __read(items, 2); return pair[0] + pair[1]; } function other(__read, pair) { __read = custom; return pair[0]; }";
+    let expected = "function read(items) { var [_item, _item2] = items; return _item + _item2; } function other(__read, pair) { __read = custom; return pair[0]; }";
+    assert_eq_normalized(
+        &common::render_rule(input, |_| UnSlicedToArray::new()),
+        expected,
+    );
+    let input = "import { __read } from 'tslib'; function read(items, __read) { var pair = __read(items, 2); return pair[0] + pair[1]; }";
+    let output = common::render_rule(input, |_| UnSlicedToArray::new());
+    assert!(output.contains("__read(items, 2)"), "{output}");
+}
+
+#[test]
+fn indexed_return_retains_array_like_wrapper_and_its_helper_argument() {
+    let input = r#"
+function _maybeArrayLike(r, a, e) {
+    if (a && !Array.isArray(a) && typeof a.length === "number") return a;
+    return r(a, e);
+}
+var sliced = require("@babel/runtime/helpers/slicedToArray");
+sliced = custom;
+function read(items) {
+    var pair = _maybeArrayLike(sliced, items, 2);
+    return pair[0] + pair[1];
+}
+"#;
+    assert_eq_normalized(
+        &common::render_rule(input, |_| UnSlicedToArray::new()),
+        input,
+    );
+}
+
+#[test]
+fn indexed_return_recovers_eager_suffix_leaves_after_all_elements() {
+    for suffix in ["1", "other", "(other * 2)", "'tail'", "null", "true", "1n"] {
+        let input = format!(
+            "import {{ __read }} from 'tslib'; function read(items, other) {{ var pair = __read(items, 2); return pair[0] + pair[1] + {suffix}; }}"
+        );
+        let expected_suffix = suffix.trim_matches(['(', ')']);
+        let expected = format!(
+            "function read(items, other) {{ var [_item, _item2] = items; return _item + _item2 + {expected_suffix}; }}"
+        );
+        assert_eq_normalized(
+            &common::render_rule(&input, |_| UnSlicedToArray::new()),
+            &expected,
+        );
+    }
+}
+
+#[test]
+fn indexed_return_keeps_suffix_effects_and_interleaved_leaves() {
+    for expression in [
+        "pair[0] + other + pair[1]",
+        "pair[0] + 1 + pair[1]",
+        "other + pair[0] + pair[1]",
+        "pair[0] + pair[1] + read()",
+        "pair[0] + pair[1] + obj.value",
+        "pair[0] + pair[1] + (other || fallback)",
+        "pair[0] + pair[1] + pair",
+    ] {
+        let input = format!(
+            "import {{ __read }} from 'tslib'; function read(items, other) {{ var pair = __read(items, 2); return {expression}; }}"
+        );
+        assert_eq_normalized(
+            &common::render_rule(&input, |_| UnSlicedToArray::new()),
+            &input,
+        );
+    }
 }

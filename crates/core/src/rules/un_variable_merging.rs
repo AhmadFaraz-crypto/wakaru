@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use swc_core::ecma::ast::{
     Decl, ExportDecl, Expr, ForStmt, MemberExpr, ModuleDecl, ModuleItem, Pat, Stmt, VarDecl,
@@ -133,7 +133,7 @@ fn extract_for_init_stmts(mut for_stmt: ForStmt) -> Vec<Stmt> {
     }
 
     // Collect identifiers referenced in test and update (not body)
-    let mut used_names: HashSet<String> = HashSet::new();
+    let mut used_names: HashSet<String> = HashSet::default();
     if let Some(test) = &for_stmt.test {
         collect_ident_names_expr(test, &mut used_names);
     }
@@ -160,7 +160,7 @@ fn extract_for_init_stmts(mut for_stmt: ForStmt) -> Vec<Stmt> {
 
     // Phase 1: determine which declarator indices must stay in the for init.
     // Start with those whose bound names appear in test/update.
-    let mut must_keep: HashSet<usize> = HashSet::new();
+    let mut must_keep: HashSet<usize> = HashSet::default();
     for (i, decl) in decls.iter().enumerate() {
         let names = bound_names_pat(&decl.name);
         if names.iter().any(|n| used_names.contains(n)) {
@@ -183,7 +183,7 @@ fn extract_for_init_stmts(mut for_stmt: ForStmt) -> Vec<Stmt> {
             if must_keep.contains(&i) {
                 continue;
             }
-            let mut init_refs = HashSet::new();
+            let mut init_refs = HashSet::default();
             if let Some(init) = &decl.init {
                 collect_ident_names_expr(init, &mut init_refs);
             }

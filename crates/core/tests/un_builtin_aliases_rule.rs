@@ -135,3 +135,51 @@ use2(e(value));
     let output = apply(input);
     assert_eq_normalized(&output, input);
 }
+
+#[test]
+fn alias_named_by_export_specifier_remains_declared() {
+    // `export { o }` can only name a binding, so the alias declaration has to
+    // stay even though every expression use could be inlined.
+    let input = r#"
+var o = Object.create;
+var d = Object.defineProperty;
+function f(q) {
+    return d(o(q), "x", { value: 1 });
+}
+export { o, f };
+"#;
+    let expected = r#"
+var o = Object.create;
+function f(q) {
+    return Object.defineProperty(o(q), "x", { value: 1 });
+}
+export { o, f };
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn alias_call_inside_a_computed_object_key_is_inlined() {
+    let input = r#"
+const o = Object.keys;
+const m = { [o(x)[0]]: 1 };
+o(y);
+export { m };
+"#;
+    let output = apply(input);
+    assert!(output.contains("[Object.keys(x)[0]]: 1"), "{output}");
+    assert!(output.contains("Object.keys(y);"), "{output}");
+    assert!(!output.contains("const o ="), "{output}");
+    assert!(!output.contains("o(x)"), "{output}");
+}
+
+#[test]
+fn preserves_const_alias_when_module_has_dynamic_scope() {
+    // The `var` path already rejected dynamic scope; `const`/`let` aliases
+    // are the same hazard: inlining reads `Object` as the global at a site
+    // where `with` or a direct eval may have bound that name.
+    for hazard in ["eval(code);", "with (scope) { observe(); }"] {
+        let input = format!("const e = Object.freeze;\n{hazard}\nuse(e(value));\n");
+        assert_eq_normalized(&apply(&input), &input);
+    }
+}

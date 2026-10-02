@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::common::util::take::Take;
@@ -21,15 +21,14 @@ use super::cross_module_helper_refs::{
     collect_cross_module_helper_refs, collect_cross_module_ts_helper_refs,
     cross_module_member_helper_kind,
 };
+use super::decl_utils::fresh_binding_ident;
 use super::helper_matcher::{
-    binding_key, member_prop_name, remaining_refs_outside_declarations,
+    binding_key, member_prop_name, removable_without_remaining_refs,
     remove_fn_decls_from_body_by_binding, remove_import_specifiers_by_binding,
     remove_var_declarators_by_binding, static_member_prop_name, var_declarator_binding_key,
     NumericRequireNamespaces,
 };
-use super::transpiler_helper_utils::{
-    tslib_member_helper_kind, BindingKey, LocalHelperContext, TranspilerHelperKind,
-};
+use super::transpiler_helper_utils::{BindingKey, LocalHelperContext, TranspilerHelperKind};
 
 /// Convert inline `_objectWithoutPropertiesLoose` IIFEs to object rest destructuring.
 ///
@@ -143,6 +142,12 @@ fn run_un_object_rest(
     module_facts: Option<&ModuleFactsMap>,
     current_filename: Option<&str>,
 ) {
+    // Rest recovery removes helper and temp bindings; a `with` statement or a
+    // direct eval anywhere in the module can still reach them by name, so the
+    // module is left as is (docs/rewrite-assumptions.md, dynamic-scope skip).
+    if super::eval_utils::has_dynamic_scope_construct(module) {
+        return;
+    }
     // Collect named OWP helpers (function declarations detected by transpiler_helper_utils)
     let mut local_named_helpers =
         local_helpers.helpers_of_kind(TranspilerHelperKind::ObjectWithoutProperties);
@@ -189,7 +194,6 @@ fn run_un_object_rest(
                 );
         }
     }
-    let tslib_namespaces = local_helpers.tslib_namespaces();
     let swc_numeric_helper_namespaces =
         NumericRequireNamespaces::collect(module, Some(unresolved_mark));
 
@@ -197,7 +201,7 @@ fn run_un_object_rest(
         collect_property_key_coercion_helpers(module, local_helpers, unresolved_mark);
     let computed_context = ComputedObjectRestContext {
         named_helpers: &named_helpers,
-        tslib_namespaces,
+        local_helpers,
         swc_numeric_helper_namespaces: &swc_numeric_helper_namespaces.candidates,
         cross_module_namespaces: &cross_module_helpers.namespaces,
         property_key_helpers: &property_key_helpers,
@@ -214,7 +218,9 @@ fn run_un_object_rest(
 
     if named_helpers.is_empty()
         && cross_module_helpers.namespaces.is_empty()
-        && tslib_namespaces.is_empty()
+        && local_helpers.tslib_namespaces().is_empty()
+        && !local_helpers
+            .has_tslib_require_member_call(TranspilerHelperKind::ObjectWithoutProperties)
         && swc_numeric_helper_namespaces.candidates.is_empty()
         && !UnObjectRest::has_owp_iife_candidate(module)
     {
@@ -232,7 +238,7 @@ fn run_un_object_rest(
     let exclusion_arrays = collect_exclusion_arrays_from_module_items(&module.body);
     let mut processor = ObjectRestProcessor {
         named_helpers: &named_helpers,
-        tslib_namespaces,
+        local_helpers,
         swc_numeric_helper_namespaces: &swc_numeric_helper_namespaces.candidates,
         cross_module_namespaces: &cross_module_helpers.namespaces,
         exclusion_arrays: exclusion_arrays.clone(),
@@ -243,20 +249,22 @@ fn run_un_object_rest(
     reattach_elided_object_rest_in_module_items(
         &mut module.body,
         &named_helpers,
-        tslib_namespaces,
+        local_helpers,
         &cross_module_helpers.namespaces,
         unresolved_mark,
     );
 
     // Process module-level statements
     let mut new_body = Vec::with_capacity(module.body.len());
-    let mut recent_stmts: Vec<Stmt> = Vec::new();
+    // Keep only the current statement-run boundary; look behind in new_body
+    // instead of retaining a deep-cloned copy of every emitted statement.
+    let mut recent_start = 0;
     let mut exclusion_arrays = exclusion_arrays;
 
-    let items = std::mem::take(&mut module.body);
-    for (index, item) in items.iter().cloned().enumerate() {
+    let mut items = std::mem::take(&mut module.body).into_iter();
+    while let Some(item) = items.next() {
         let ModuleItem::Stmt(ref stmt) = item else {
-            recent_stmts.clear();
+            recent_start = new_body.len() + 1;
             new_body.push(item);
             continue;
         };
@@ -265,7 +273,7 @@ fn run_un_object_rest(
             try_extract_owp_named_call(
                 stmt,
                 &named_helpers,
-                tslib_namespaces,
+                local_helpers,
                 &swc_numeric_helper_namespaces.candidates,
                 &cross_module_helpers.namespaces,
                 &exclusion_arrays,
@@ -275,29 +283,30 @@ fn run_un_object_rest(
         if let Some((rest_binding, declaration_kind, source, excluded_keys, before, after)) =
             extraction
         {
-            let future_jsx_tag_bindings = jsx_tag_bindings_in_module_items(&items[index + 1..]);
+            let future_jsx_tag_bindings = jsx_tag_bindings_in_module_items(items.as_slice());
             if has_jsx_tag_default_pair(
-                &recent_stmts,
+                &new_body[recent_start..],
                 &source,
                 &excluded_keys,
                 &future_jsx_tag_bindings,
                 unresolved_mark,
             ) {
                 collect_exclusion_arrays_from_stmt(stmt, &mut exclusion_arrays);
-                recent_stmts.push(stmt.clone());
                 new_body.push(item);
                 continue;
             }
             let mut inline_accesses = declarators_to_accesses(&before, &source, &excluded_keys);
-            let preceding_scan =
-                scan_preceding_detailed(&recent_stmts, &source, &excluded_keys, unresolved_mark);
+            let preceding_scan = scan_preceding_detailed(
+                &new_body[recent_start..],
+                &source,
+                &excluded_keys,
+                unresolved_mark,
+            );
             for _ in 0..preceding_scan.absorbed {
-                recent_stmts.pop();
                 new_body.pop();
             }
             if let Some(source_init) = preceding_scan.source_init.clone() {
                 let source_init_stmt = build_source_init_stmt(source_init);
-                recent_stmts.push(source_init_stmt.clone());
                 new_body.push(ModuleItem::Stmt(source_init_stmt));
             }
             let mut preceding_accesses = preceding_scan.accesses;
@@ -316,7 +325,6 @@ fn run_un_object_rest(
                     reserved_names: &reserved_names,
                 },
             );
-            recent_stmts.push(new_stmt.clone());
             new_body.push(ModuleItem::Stmt(new_stmt));
             if !after.is_empty() {
                 let after_stmt = Stmt::Decl(Decl::Var(Box::new(VarDecl {
@@ -326,7 +334,6 @@ fn run_un_object_rest(
                     declare: false,
                     decls: after,
                 })));
-                recent_stmts.push(after_stmt.clone());
                 new_body.push(ModuleItem::Stmt(after_stmt));
             }
             continue;
@@ -335,17 +342,22 @@ fn run_un_object_rest(
         if let Some((rest_binding, source, excluded_keys)) = try_extract_owp_named_assignment(
             stmt,
             &named_helpers,
-            tslib_namespaces,
+            local_helpers,
             &swc_numeric_helper_namespaces.candidates,
             &cross_module_helpers.namespaces,
             &exclusion_arrays,
         ) {
             let original_span = stmt.span();
-            let preceding_scan =
-                scan_preceding_detailed(&recent_stmts, &source, &excluded_keys, unresolved_mark);
+            let preceding_scan = scan_preceding_detailed(
+                &new_body[recent_start..],
+                &source,
+                &excluded_keys,
+                unresolved_mark,
+            );
             let scope_names = collect_scope_names_module(&new_body);
             if preceding_scan.absorbed > 0 {
-                if let Some(new_stmt) = build_rest_assignment(
+                if let Some(new_stmts) = build_rest_assignment_with_declarations(
+                    &new_body[new_body.len() - preceding_scan.absorbed..],
                     original_span,
                     &rest_binding,
                     &source,
@@ -354,23 +366,21 @@ fn run_un_object_rest(
                     &scope_names,
                 ) {
                     for _ in 0..preceding_scan.absorbed {
-                        recent_stmts.pop();
                         new_body.pop();
                     }
                     if let Some(source_init) = preceding_scan.source_init {
                         let source_init_stmt = build_source_init_stmt(source_init);
-                        recent_stmts.push(source_init_stmt.clone());
                         new_body.push(ModuleItem::Stmt(source_init_stmt));
                     }
-                    recent_stmts.push(new_stmt.clone());
-                    new_body.push(ModuleItem::Stmt(new_stmt));
+                    for new_stmt in new_stmts {
+                        new_body.push(ModuleItem::Stmt(new_stmt));
+                    }
                     continue;
                 }
             }
         }
 
         collect_exclusion_arrays_from_stmt(stmt, &mut exclusion_arrays);
-        recent_stmts.push(stmt.clone());
         new_body.push(item);
     }
     module.body = new_body;
@@ -403,8 +413,7 @@ fn remove_unused_property_key_helpers(module: &mut Module, helpers: &HashSet<Bin
     if helpers.is_empty() {
         return;
     }
-    let remaining = remaining_refs_outside_declarations(module, helpers, helpers);
-    let removable: HashSet<_> = helpers.difference(&remaining).cloned().collect();
+    let removable = removable_without_remaining_refs(module, helpers);
     if removable.is_empty() {
         return;
     }
@@ -434,7 +443,7 @@ fn collect_property_key_coercion_helpers(
         .into_keys()
         .collect();
     collect_property_key_typeof_helpers(module, unresolved_mark, &mut typeof_helpers);
-    let mut helpers = HashSet::new();
+    let mut helpers = HashSet::default();
 
     for item in &module.body {
         match item {
@@ -894,7 +903,7 @@ fn property_key_string_fallback_matches(
 
 struct ComputedObjectRestContext<'a> {
     named_helpers: &'a HashMap<BindingKey, TranspilerHelperKind>,
-    tslib_namespaces: &'a HashSet<BindingKey>,
+    local_helpers: &'a LocalHelperContext,
     swc_numeric_helper_namespaces: &'a HashSet<BindingKey>,
     cross_module_namespaces: &'a HashMap<BindingKey, HashMap<String, TranspilerHelperKind>>,
     property_key_helpers: &'a HashSet<BindingKey>,
@@ -906,7 +915,7 @@ fn recover_computed_object_rest(
     module: &mut Module,
     context: &ComputedObjectRestContext<'_>,
 ) -> HashSet<BindingKey> {
-    let mut collapsed_key_aliases = HashSet::new();
+    let mut collapsed_key_aliases = HashSet::default();
     let mut processor = ComputedObjectRestProcessor {
         context,
         collapsed_key_aliases: &mut collapsed_key_aliases,
@@ -926,6 +935,8 @@ struct ComputedObjectRestProcessor<'a, 'b, 'c> {
 }
 
 impl VisitMut for ComputedObjectRestProcessor<'_, '_, '_> {
+    fn visit_mut_with_stmt(&mut self, _stmt: &mut swc_core::ecma::ast::WithStmt) {}
+
     fn visit_mut_stmts(&mut self, stmts: &mut Vec<Stmt>) {
         stmts.visit_mut_children_with(self);
         recover_computed_object_rest_in_stmts(stmts, self.context, self.collapsed_key_aliases);
@@ -1032,8 +1043,7 @@ fn remove_unused_computed_key_aliases(module: &mut Module, aliases: &HashSet<Bin
     if aliases.is_empty() {
         return;
     }
-    let remaining = remaining_refs_outside_declarations(module, aliases, aliases);
-    let removable: HashSet<_> = aliases.difference(&remaining).cloned().collect();
+    let removable = removable_without_remaining_refs(module, aliases);
     if removable.is_empty() {
         return;
     }
@@ -1163,7 +1173,7 @@ fn extract_computed_named_owp_args(
     if !is_named_owp_callee(
         callee,
         context.named_helpers,
-        context.tslib_namespaces,
+        context.local_helpers,
         context.swc_numeric_helper_namespaces,
         context.cross_module_namespaces,
     ) || call.args.len() != 2
@@ -1452,10 +1462,10 @@ fn collect_mangled_esbuild_object_rest_helpers(
     aliases: &EsbuildObjectRestBuiltinAliases,
 ) -> HashMap<BindingKey, TranspilerHelperKind> {
     if !aliases.has_required_signals() {
-        return HashMap::new();
+        return HashMap::default();
     }
 
-    let mut helpers = HashMap::new();
+    let mut helpers = HashMap::default();
     for item in &module.body {
         let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
             continue;
@@ -1662,11 +1672,7 @@ fn remove_unused_esbuild_object_rest_builtin_aliases(
     if candidates.is_empty() {
         return;
     }
-    let remaining = remaining_refs_outside_declarations(module, &candidates, &candidates);
-    let removable: HashSet<_> = candidates
-        .into_iter()
-        .filter(|key| !remaining.contains(key))
-        .collect();
+    let removable = removable_without_remaining_refs(module, &candidates);
     if !removable.is_empty() {
         remove_var_declarators_by_binding(&mut module.body, &removable);
     }
@@ -1674,7 +1680,7 @@ fn remove_unused_esbuild_object_rest_builtin_aliases(
 
 struct ObjectRestProcessor<'a> {
     named_helpers: &'a HashMap<BindingKey, TranspilerHelperKind>,
-    tslib_namespaces: &'a HashSet<BindingKey>,
+    local_helpers: &'a LocalHelperContext,
     swc_numeric_helper_namespaces: &'a HashSet<BindingKey>,
     cross_module_namespaces: &'a HashMap<BindingKey, HashMap<String, TranspilerHelperKind>>,
     exclusion_arrays: HashMap<BindingKey, Vec<Atom>>,
@@ -1683,6 +1689,8 @@ struct ObjectRestProcessor<'a> {
 }
 
 impl VisitMut for ObjectRestProcessor<'_> {
+    fn visit_mut_with_stmt(&mut self, _stmt: &mut swc_core::ecma::ast::WithStmt) {}
+
     fn visit_mut_fn_decl(&mut self, decl: &mut FnDecl) {
         if self.is_named_helper(&decl.ident) {
             return;
@@ -1704,7 +1712,7 @@ impl VisitMut for ObjectRestProcessor<'_> {
         reattach_elided_object_rest_in_stmts(
             stmts,
             self.named_helpers,
-            self.tslib_namespaces,
+            self.local_helpers,
             self.cross_module_namespaces,
             self.unresolved_mark,
         );
@@ -1712,12 +1720,22 @@ impl VisitMut for ObjectRestProcessor<'_> {
         let mut new_stmts = Vec::with_capacity(stmts.len());
         let mut exclusion_arrays = self.exclusion_arrays.clone();
 
-        for (index, stmt) in stmts.iter().enumerate() {
-            let extraction = try_extract_owp_iife(stmt, &exclusion_arrays).or_else(|| {
+        // Move untouched subtrees instead of cloning them again at every
+        // enclosing statement list. The iterator retains the original suffix
+        // for the JSX look-ahead proof.
+        let mut remaining = std::mem::take(stmts).into_iter();
+        while let Some(stmt) = remaining.next() {
+            if let Some(return_stmt) =
+                self.rewrite_returned_rest(&stmt, &mut new_stmts, &exclusion_arrays)
+            {
+                new_stmts.push(return_stmt);
+                continue;
+            }
+            let extraction = try_extract_owp_iife(&stmt, &exclusion_arrays).or_else(|| {
                 try_extract_owp_named_call(
-                    stmt,
+                    &stmt,
                     self.named_helpers,
-                    self.tslib_namespaces,
+                    self.local_helpers,
                     self.swc_numeric_helper_namespaces,
                     self.cross_module_namespaces,
                     &exclusion_arrays,
@@ -1727,7 +1745,7 @@ impl VisitMut for ObjectRestProcessor<'_> {
             if let Some((rest_binding, declaration_kind, source, excluded_keys, before, after)) =
                 extraction
             {
-                let future_jsx_tag_bindings = jsx_tag_bindings_in_stmts(&stmts[index + 1..]);
+                let future_jsx_tag_bindings = jsx_tag_bindings_in_stmts(remaining.as_slice());
                 if has_jsx_tag_default_pair(
                     &new_stmts,
                     &source,
@@ -1735,8 +1753,8 @@ impl VisitMut for ObjectRestProcessor<'_> {
                     &future_jsx_tag_bindings,
                     self.unresolved_mark,
                 ) {
-                    collect_exclusion_arrays_from_stmt(stmt, &mut exclusion_arrays);
-                    new_stmts.push(stmt.clone());
+                    collect_exclusion_arrays_from_stmt(&stmt, &mut exclusion_arrays);
+                    new_stmts.push(stmt);
                     continue;
                 }
                 let mut inline_accesses = declarators_to_accesses(&before, &source, &excluded_keys);
@@ -1781,9 +1799,9 @@ impl VisitMut for ObjectRestProcessor<'_> {
             }
 
             if let Some((rest_binding, source, excluded_keys)) = try_extract_owp_named_assignment(
-                stmt,
+                &stmt,
                 self.named_helpers,
-                self.tslib_namespaces,
+                self.local_helpers,
                 self.swc_numeric_helper_namespaces,
                 self.cross_module_namespaces,
                 &exclusion_arrays,
@@ -1797,7 +1815,8 @@ impl VisitMut for ObjectRestProcessor<'_> {
                 );
                 let scope_names = collect_scope_names(&new_stmts);
                 if preceding_scan.absorbed > 0 {
-                    if let Some(new_stmt) = build_rest_assignment(
+                    if let Some(replacement) = build_rest_assignment_with_declarations(
+                        &new_stmts[new_stmts.len() - preceding_scan.absorbed..],
                         original_span,
                         &rest_binding,
                         &source,
@@ -1811,14 +1830,14 @@ impl VisitMut for ObjectRestProcessor<'_> {
                         if let Some(source_init) = preceding_scan.source_init {
                             new_stmts.push(build_source_init_stmt(source_init));
                         }
-                        new_stmts.push(new_stmt);
+                        new_stmts.extend(replacement);
                         continue;
                     }
                 }
             }
 
-            collect_exclusion_arrays_from_stmt(stmt, &mut exclusion_arrays);
-            new_stmts.push(stmt.clone());
+            collect_exclusion_arrays_from_stmt(&stmt, &mut exclusion_arrays);
+            new_stmts.push(stmt);
         }
 
         *stmts = new_stmts;
@@ -1826,6 +1845,89 @@ impl VisitMut for ObjectRestProcessor<'_> {
 }
 
 impl ObjectRestProcessor<'_> {
+    fn rewrite_returned_rest(
+        &self,
+        stmt: &Stmt,
+        preceding: &mut Vec<Stmt>,
+        exclusion_arrays: &HashMap<BindingKey, Vec<Atom>>,
+    ) -> Option<Stmt> {
+        let Stmt::Return(ret) = stmt else { return None };
+        let (source, keys) = extract_named_owp_args(
+            ret.arg.as_deref()?,
+            self.named_helpers,
+            self.local_helpers,
+            self.swc_numeric_helper_namespaces,
+            self.cross_module_namespaces,
+            exclusion_arrays,
+        )?;
+        let Expr::Ident(source_id) = source.as_ref() else {
+            return None;
+        };
+        if keys.is_empty() || keys.iter().collect::<HashSet<_>>().len() != keys.len() {
+            return None;
+        }
+        // Terser leaves the inlined result's hoisted var declaration behind.
+        // Keep it, and require the complete ordered getter sequence before it.
+        let mut end = preceding.len();
+        while end > 0
+            && matches!(&preceding[end - 1],
+            Stmt::Decl(Decl::Var(var)) if var.kind == VarDeclKind::Var
+                && var.decls.iter().all(|decl| decl.init.is_none() && matches!(decl.name, Pat::Ident(_))))
+        {
+            end -= 1;
+        }
+        let start = end.checked_sub(keys.len())?;
+        let mut accesses = Vec::new();
+        for (stmt, key) in preceding[start..end].iter().zip(&keys) {
+            let Stmt::Decl(Decl::Var(var)) = stmt else {
+                return None;
+            };
+            if var.kind != VarDeclKind::Var || var.decls.len() != 1 {
+                return None;
+            }
+            let decl = &var.decls[0];
+            let Pat::Ident(binding) = &decl.name else {
+                return None;
+            };
+            let Expr::Member(member) = decl.init.as_deref()? else {
+                return None;
+            };
+            if !matches!(member.obj.as_ref(), Expr::Ident(id) if binding_key(id) == binding_key(source_id))
+                || !member_prop_name(&member.prop, key)
+            {
+                return None;
+            }
+            accesses.push(PrecedingAccess::PropAccess {
+                prop: key.clone(),
+                binding: binding.id.sym.clone(),
+                ctxt: binding.id.ctxt,
+            });
+        }
+        let scope_names = collect_scope_names(preceding);
+        let conflicts = AliasNameConflicts {
+            scope_names: &scope_names,
+            reserved_names: self.reserved_names,
+        };
+        let name = find_non_conflicting_alias("rest", conflicts, &HashSet::default());
+        let binding = BindingIdent {
+            id: fresh_binding_ident(name, ret.span),
+            type_ann: None,
+        };
+        let pattern = build_rest_destructuring(
+            ret.span,
+            VarDeclKind::Var,
+            &binding,
+            &source,
+            &keys,
+            &accesses,
+            conflicts,
+        );
+        preceding.splice(start..end, [pattern]);
+        let mut ret = ret.clone();
+        ret.arg = Some(Box::new(Expr::Ident(binding.id)));
+        Some(Stmt::Return(ret))
+    }
+
     fn is_named_helper(&self, ident: &Ident) -> bool {
         self.named_helpers
             .contains_key(&(ident.sym.clone(), ident.ctxt))
@@ -1835,14 +1937,14 @@ impl ObjectRestProcessor<'_> {
 fn reattach_elided_object_rest_in_module_items(
     items: &mut [ModuleItem],
     named_helpers: &HashMap<BindingKey, TranspilerHelperKind>,
-    tslib_namespaces: &HashSet<BindingKey>,
+    local_helpers: &LocalHelperContext,
     cross_module_namespaces: &HashMap<BindingKey, HashMap<String, TranspilerHelperKind>>,
     unresolved_mark: Mark,
 ) {
     if !module_items_contain_owp_spread_candidate(
         items,
         named_helpers,
-        tslib_namespaces,
+        local_helpers,
         cross_module_namespaces,
     ) {
         return;
@@ -1853,7 +1955,7 @@ fn reattach_elided_object_rest_in_module_items(
             reattach_elided_object_rest_in_stmt(
                 stmt,
                 named_helpers,
-                tslib_namespaces,
+                local_helpers,
                 cross_module_namespaces,
                 unresolved_mark,
             );
@@ -1880,7 +1982,7 @@ fn reattach_elided_object_rest_in_module_items(
             let mut replacer = ElidedRestSpreadReplacer {
                 rest_binding: &rest_binding,
                 named_helpers,
-                tslib_namespaces,
+                local_helpers,
                 cross_module_namespaces,
                 preceding: Some(&preceding),
                 unresolved_mark,
@@ -1902,14 +2004,14 @@ fn reattach_elided_object_rest_in_module_items(
 fn reattach_elided_object_rest_in_stmts(
     stmts: &mut [Stmt],
     named_helpers: &HashMap<BindingKey, TranspilerHelperKind>,
-    tslib_namespaces: &HashSet<BindingKey>,
+    local_helpers: &LocalHelperContext,
     cross_module_namespaces: &HashMap<BindingKey, HashMap<String, TranspilerHelperKind>>,
     unresolved_mark: Mark,
 ) {
     if !stmts_contain_owp_spread_candidate(
         stmts,
         named_helpers,
-        tslib_namespaces,
+        local_helpers,
         cross_module_namespaces,
     ) {
         return;
@@ -1919,7 +2021,7 @@ fn reattach_elided_object_rest_in_stmts(
         reattach_elided_object_rest_in_stmt(
             stmt,
             named_helpers,
-            tslib_namespaces,
+            local_helpers,
             cross_module_namespaces,
             unresolved_mark,
         );
@@ -1936,7 +2038,7 @@ fn reattach_elided_object_rest_in_stmts(
             let mut replacer = ElidedRestSpreadReplacer {
                 rest_binding: &rest_binding,
                 named_helpers,
-                tslib_namespaces,
+                local_helpers,
                 cross_module_namespaces,
                 preceding: Some(&preceding),
                 unresolved_mark,
@@ -1958,12 +2060,12 @@ fn reattach_elided_object_rest_in_stmts(
 fn module_items_contain_owp_spread_candidate(
     items: &[ModuleItem],
     named_helpers: &HashMap<BindingKey, TranspilerHelperKind>,
-    tslib_namespaces: &HashSet<BindingKey>,
+    local_helpers: &LocalHelperContext,
     cross_module_namespaces: &HashMap<BindingKey, HashMap<String, TranspilerHelperKind>>,
 ) -> bool {
     let mut visitor = ObjectRestSpreadCandidateVisitor {
         named_helpers,
-        tslib_namespaces,
+        local_helpers,
         cross_module_namespaces,
         found: false,
     };
@@ -1979,12 +2081,12 @@ fn module_items_contain_owp_spread_candidate(
 fn stmts_contain_owp_spread_candidate(
     stmts: &[Stmt],
     named_helpers: &HashMap<BindingKey, TranspilerHelperKind>,
-    tslib_namespaces: &HashSet<BindingKey>,
+    local_helpers: &LocalHelperContext,
     cross_module_namespaces: &HashMap<BindingKey, HashMap<String, TranspilerHelperKind>>,
 ) -> bool {
     let mut visitor = ObjectRestSpreadCandidateVisitor {
         named_helpers,
-        tslib_namespaces,
+        local_helpers,
         cross_module_namespaces,
         found: false,
     };
@@ -1999,7 +2101,7 @@ fn stmts_contain_owp_spread_candidate(
 
 struct ObjectRestSpreadCandidateVisitor<'a> {
     named_helpers: &'a HashMap<BindingKey, TranspilerHelperKind>,
-    tslib_namespaces: &'a HashSet<BindingKey>,
+    local_helpers: &'a LocalHelperContext,
     cross_module_namespaces: &'a HashMap<BindingKey, HashMap<String, TranspilerHelperKind>>,
     found: bool,
 }
@@ -2018,12 +2120,12 @@ impl Visit for ObjectRestSpreadCandidateVisitor<'_> {
         if extract_named_owp_args(
             &spread.expr,
             self.named_helpers,
-            self.tslib_namespaces,
-            &HashSet::new(),
+            self.local_helpers,
+            &HashSet::default(),
             self.cross_module_namespaces,
-            &HashMap::new(),
+            &HashMap::default(),
         )
-        .or_else(|| try_extract_owp_call(&spread.expr, &HashMap::new()))
+        .or_else(|| try_extract_owp_call(&spread.expr, &HashMap::default()))
         .is_some()
         {
             self.found = true;
@@ -2037,7 +2139,7 @@ impl Visit for ObjectRestSpreadCandidateVisitor<'_> {
 fn reattach_elided_object_rest_in_stmt(
     stmt: &mut Stmt,
     named_helpers: &HashMap<BindingKey, TranspilerHelperKind>,
-    tslib_namespaces: &HashSet<BindingKey>,
+    local_helpers: &LocalHelperContext,
     cross_module_namespaces: &HashMap<BindingKey, HashMap<String, TranspilerHelperKind>>,
     unresolved_mark: Mark,
 ) {
@@ -2055,7 +2157,7 @@ fn reattach_elided_object_rest_in_stmt(
             let mut replacer = ElidedRestSpreadReplacer {
                 rest_binding: &rest_binding,
                 named_helpers,
-                tslib_namespaces,
+                local_helpers,
                 cross_module_namespaces,
                 preceding: None,
                 unresolved_mark,
@@ -2078,7 +2180,7 @@ fn reattach_elided_object_rest_in_stmt(
 struct ElidedRestSpreadReplacer<'a> {
     rest_binding: &'a BindingIdent,
     named_helpers: &'a HashMap<BindingKey, TranspilerHelperKind>,
-    tslib_namespaces: &'a HashSet<BindingKey>,
+    local_helpers: &'a LocalHelperContext,
     cross_module_namespaces: &'a HashMap<BindingKey, HashMap<String, TranspilerHelperKind>>,
     preceding: Option<&'a [Stmt]>,
     unresolved_mark: Mark,
@@ -2086,6 +2188,8 @@ struct ElidedRestSpreadReplacer<'a> {
 }
 
 impl VisitMut for ElidedRestSpreadReplacer<'_> {
+    fn visit_mut_with_stmt(&mut self, _stmt: &mut swc_core::ecma::ast::WithStmt) {}
+
     fn visit_mut_prop_or_spread(&mut self, prop: &mut PropOrSpread) {
         if self.replacement_init.is_some() {
             return;
@@ -2099,12 +2203,12 @@ impl VisitMut for ElidedRestSpreadReplacer<'_> {
         let extraction = extract_named_owp_args(
             &spread.expr,
             self.named_helpers,
-            self.tslib_namespaces,
-            &HashSet::new(),
+            self.local_helpers,
+            &HashSet::default(),
             self.cross_module_namespaces,
-            &HashMap::new(),
+            &HashMap::default(),
         )
-        .or_else(|| try_extract_owp_call(&spread.expr, &HashMap::new()));
+        .or_else(|| try_extract_owp_call(&spread.expr, &HashMap::default()));
         let Some((source, excluded_keys)) = extraction else {
             spread.visit_mut_children_with(self);
             return;
@@ -2247,7 +2351,7 @@ fn try_extract_owp_iife(
 fn try_extract_owp_named_call(
     stmt: &Stmt,
     helpers: &HashMap<BindingKey, TranspilerHelperKind>,
-    tslib_namespaces: &HashSet<BindingKey>,
+    local_helpers: &LocalHelperContext,
     swc_numeric_helper_namespaces: &HashSet<BindingKey>,
     cross_module_namespaces: &HashMap<BindingKey, HashMap<String, TranspilerHelperKind>>,
     exclusion_arrays: &HashMap<BindingKey, Vec<Atom>>,
@@ -2260,7 +2364,9 @@ fn try_extract_owp_named_call(
     Vec<VarDeclarator>,
 )> {
     if helpers.is_empty()
-        && tslib_namespaces.is_empty()
+        && local_helpers.tslib_namespaces().is_empty()
+        && !local_helpers
+            .has_tslib_require_member_call(TranspilerHelperKind::ObjectWithoutProperties)
         && swc_numeric_helper_namespaces.is_empty()
         && cross_module_namespaces.is_empty()
     {
@@ -2280,7 +2386,7 @@ fn try_extract_owp_named_call(
         extract_named_owp_args(
             init,
             helpers,
-            tslib_namespaces,
+            local_helpers,
             swc_numeric_helper_namespaces,
             cross_module_namespaces,
             exclusion_arrays,
@@ -2296,7 +2402,7 @@ fn try_extract_owp_named_call(
     let (source, excluded_keys) = extract_named_owp_args(
         init,
         helpers,
-        tslib_namespaces,
+        local_helpers,
         swc_numeric_helper_namespaces,
         cross_module_namespaces,
         exclusion_arrays,
@@ -2317,13 +2423,15 @@ fn try_extract_owp_named_call(
 fn try_extract_owp_named_assignment(
     stmt: &Stmt,
     helpers: &HashMap<BindingKey, TranspilerHelperKind>,
-    tslib_namespaces: &HashSet<BindingKey>,
+    local_helpers: &LocalHelperContext,
     swc_numeric_helper_namespaces: &HashSet<BindingKey>,
     cross_module_namespaces: &HashMap<BindingKey, HashMap<String, TranspilerHelperKind>>,
     exclusion_arrays: &HashMap<BindingKey, Vec<Atom>>,
 ) -> Option<(BindingIdent, Box<Expr>, Vec<Atom>)> {
     if helpers.is_empty()
-        && tslib_namespaces.is_empty()
+        && local_helpers.tslib_namespaces().is_empty()
+        && !local_helpers
+            .has_tslib_require_member_call(TranspilerHelperKind::ObjectWithoutProperties)
         && swc_numeric_helper_namespaces.is_empty()
         && cross_module_namespaces.is_empty()
     {
@@ -2345,7 +2453,7 @@ fn try_extract_owp_named_assignment(
     let (source, excluded_keys) = extract_named_owp_args(
         &assign.right,
         helpers,
-        tslib_namespaces,
+        local_helpers,
         swc_numeric_helper_namespaces,
         cross_module_namespaces,
         exclusion_arrays,
@@ -2357,7 +2465,7 @@ fn try_extract_owp_named_assignment(
 fn extract_named_owp_args(
     expr: &Expr,
     helpers: &HashMap<BindingKey, TranspilerHelperKind>,
-    tslib_namespaces: &HashSet<BindingKey>,
+    local_helpers: &LocalHelperContext,
     swc_numeric_helper_namespaces: &HashSet<BindingKey>,
     cross_module_namespaces: &HashMap<BindingKey, HashMap<String, TranspilerHelperKind>>,
     exclusion_arrays: &HashMap<BindingKey, Vec<Atom>>,
@@ -2373,7 +2481,7 @@ fn extract_named_owp_args(
     if !is_named_owp_callee(
         callee,
         helpers,
-        tslib_namespaces,
+        local_helpers,
         swc_numeric_helper_namespaces,
         cross_module_namespaces,
     ) {
@@ -2389,7 +2497,7 @@ fn extract_named_owp_args(
 fn is_named_owp_callee(
     callee: &Expr,
     helpers: &HashMap<BindingKey, TranspilerHelperKind>,
-    tslib_namespaces: &HashSet<BindingKey>,
+    local_helpers: &LocalHelperContext,
     swc_numeric_helper_namespaces: &HashSet<BindingKey>,
     cross_module_namespaces: &HashMap<BindingKey, HashMap<String, TranspilerHelperKind>>,
 ) -> bool {
@@ -2397,7 +2505,7 @@ fn is_named_owp_callee(
         Expr::Ident(id) => helpers.contains_key(&(id.sym.clone(), id.ctxt)),
         Expr::Member(_) => {
             matches!(
-                tslib_member_helper_kind(callee, tslib_namespaces),
+                local_helpers.helper_callee_kind(callee),
                 Some(TranspilerHelperKind::ObjectWithoutProperties)
             ) || is_swc_numeric_object_rest_member(callee, swc_numeric_helper_namespaces)
                 || cross_module_member_helper_kind(callee, cross_module_namespaces)
@@ -2455,7 +2563,7 @@ fn extract_exclusion_keys_from_array(arr: &swc_core::ecma::ast::ArrayLit) -> Opt
 fn collect_exclusion_arrays_from_module_items(
     items: &[ModuleItem],
 ) -> HashMap<BindingKey, Vec<Atom>> {
-    let mut arrays = HashMap::new();
+    let mut arrays = HashMap::default();
     for item in items {
         if let ModuleItem::Stmt(stmt) = item {
             collect_exclusion_arrays_from_stmt(stmt, &mut arrays);
@@ -2489,7 +2597,7 @@ fn remove_unused_exclusion_array_decls(
     body: &mut Vec<ModuleItem>,
     exclusion_arrays: &HashMap<BindingKey, Vec<Atom>>,
 ) {
-    let mut unused = HashSet::new();
+    let mut unused = HashSet::default();
     for key in exclusion_arrays.keys() {
         let ident = Ident::new(key.0.clone(), DUMMY_SP, key.1);
         if !ident_used_in_module_items(body, &ident) {
@@ -2669,6 +2777,27 @@ fn stmt_has_member_prop(stmt: &Stmt, prop: &str) -> bool {
     finder.found
 }
 
+// Both statement lists and module-item lists can be inspected without copying
+// their ASTs. Module declarations terminate a statement run.
+trait PrecedingStatement {
+    fn statement(&self) -> Option<&Stmt>;
+}
+
+impl PrecedingStatement for Stmt {
+    fn statement(&self) -> Option<&Stmt> {
+        Some(self)
+    }
+}
+
+impl PrecedingStatement for ModuleItem {
+    fn statement(&self) -> Option<&Stmt> {
+        match self {
+            ModuleItem::Stmt(stmt) => Some(stmt),
+            ModuleItem::ModuleDecl(_) => None,
+        }
+    }
+}
+
 /// Scan backward from the end of `preceding` for statements that access `source`.
 /// Returns (count_absorbed, merged_prop_info).
 fn scan_preceding(
@@ -2687,8 +2816,8 @@ struct PrecedingScan {
     source_init: Option<AssignExpr>,
 }
 
-fn scan_preceding_detailed(
-    preceding: &[Stmt],
+fn scan_preceding_detailed<T: PrecedingStatement>(
+    preceding: &[T],
     source: &Expr,
     excluded_keys: &[Atom],
     unresolved_mark: Mark,
@@ -2711,7 +2840,9 @@ fn scan_preceding_detailed(
 
     while idx > 0 {
         idx -= 1;
-        let stmt = &preceding[idx];
+        let Some(stmt) = preceding[idx].statement() else {
+            break;
+        };
 
         if let Some((access, init_assign)) =
             try_match_preceding_detailed(stmt, source_name, excluded_keys)
@@ -2726,13 +2857,12 @@ fn scan_preceding_detailed(
 
         // Two-statement pair: ternary default (current) + extraction (previous)
         if idx > 0 {
-            if let Some(access) = try_match_default_pair(
-                &preceding[idx - 1],
-                stmt,
-                source_name,
-                excluded_keys,
-                unresolved_mark,
-            ) {
+            let Some(previous) = preceding[idx - 1].statement() else {
+                break;
+            };
+            if let Some(access) =
+                try_match_default_pair(previous, stmt, source_name, excluded_keys, unresolved_mark)
+            {
                 absorbed += 2;
                 idx -= 1;
                 accesses.push(access);
@@ -2751,8 +2881,8 @@ fn scan_preceding_detailed(
     }
 }
 
-fn has_jsx_tag_default_pair(
-    preceding: &[Stmt],
+fn has_jsx_tag_default_pair<T: PrecedingStatement>(
+    preceding: &[T],
     source: &Expr,
     excluded_keys: &[Atom],
     future_jsx_tag_bindings: &HashSet<BindingKey>,
@@ -2765,14 +2895,20 @@ fn has_jsx_tag_default_pair(
         Expr::Ident(id) => &id.sym,
         _ => return false,
     };
+    let (Some(previous), Some(current)) = (
+        preceding[preceding.len() - 2].statement(),
+        preceding[preceding.len() - 1].statement(),
+    ) else {
+        return false;
+    };
     let Some(PrecedingAccess::PropAccessWithDefault {
         prop,
         binding,
         ctxt,
         ..
     }) = try_match_default_pair(
-        &preceding[preceding.len() - 2],
-        &preceding[preceding.len() - 1],
+        previous,
+        current,
         source_name,
         excluded_keys,
         unresolved_mark,
@@ -3145,7 +3281,7 @@ fn extract_default_assignment(
             if !matches!(alt.as_ref(), Expr::Ident(id) if id.sym == tmp_name) {
                 return None;
             }
-            let default_value = if matches!(cons.as_ref(), Expr::Ident(id) if id.sym.as_ref() == "undefined" && (id.ctxt.outer() == unresolved_mark || id.ctxt == SyntaxContext::empty()))
+            let default_value = if matches!(cons.as_ref(), Expr::Ident(id) if id.sym.as_ref() == "undefined" && id.ctxt.outer() == unresolved_mark)
             {
                 None
             } else {
@@ -3206,9 +3342,7 @@ fn match_undefined_check(
     if undef_id.sym.as_ref() != "undefined" {
         return None;
     }
-    let is_global =
-        undef_id.ctxt.outer() == unresolved_mark || undef_id.ctxt == SyntaxContext::empty();
-    if !is_global {
+    if undef_id.ctxt.outer() != unresolved_mark {
         return None;
     }
     Some((tmp.sym.clone(), tmp.ctxt))
@@ -3226,10 +3360,10 @@ fn build_rest_destructuring(
     // Build a map from prop key → (local binding name, SyntaxContext) from preceding accesses.
     // Preserving the original SyntaxContext is critical so that downstream SmartRename
     // can match the destructuring binding to the body references via BindingRenamer.
-    let mut key_to_binding: std::collections::HashMap<Atom, (Atom, SyntaxContext)> =
-        std::collections::HashMap::new();
-    let mut key_to_default: std::collections::HashMap<Atom, Box<Expr>> =
-        std::collections::HashMap::new();
+    let mut key_to_binding: crate::collections::HashMap<Atom, (Atom, SyntaxContext)> =
+        crate::collections::HashMap::default();
+    let mut key_to_default: crate::collections::HashMap<Atom, Box<Expr>> =
+        crate::collections::HashMap::default();
     for access in merged {
         match access {
             PrecedingAccess::Destructuring(pairs) => {
@@ -3263,7 +3397,8 @@ fn build_rest_destructuring(
     }
 
     // Track generated aliases to avoid collisions between them
-    let mut used_aliases: std::collections::HashSet<Atom> = std::collections::HashSet::new();
+    let mut used_aliases: crate::collections::HashSet<Atom> =
+        crate::collections::HashSet::default();
 
     // Build destructuring props for each excluded key
     let mut props: Vec<ObjectPatProp> = Vec::new();
@@ -3354,18 +3489,42 @@ fn build_rest_destructuring(
     })))
 }
 
-fn build_rest_assignment(
+fn build_rest_assignment_with_declarations<T: PrecedingStatement>(
+    preceding: &[T],
     original_span: Span,
     rest_binding: &BindingIdent,
     source: &Expr,
     excluded_keys: &[Atom],
     merged: &[PrecedingAccess],
-    scope_names: &std::collections::HashSet<Atom>,
-) -> Option<Stmt> {
-    let mut key_to_binding: std::collections::HashMap<Atom, (Atom, SyntaxContext)> =
-        std::collections::HashMap::new();
-    let mut key_to_default: std::collections::HashMap<Atom, Box<Expr>> =
-        std::collections::HashMap::new();
+    scope_names: &crate::collections::HashSet<Atom>,
+) -> Option<Vec<Stmt>> {
+    let mut declarations = Vec::new();
+    for stmt in preceding {
+        let stmt = stmt.statement()?;
+        if let Stmt::Decl(Decl::Var(var)) = stmt {
+            // Assignment recovery must not erase the local bindings it writes.
+            // Only plain var property reads can be split into hoisted declarations
+            // and assignments here. Keep lexical initialization and more complex
+            // patterns intact rather than changing their TDZ/default semantics.
+            if var.kind != VarDeclKind::Var
+                || var.decls.iter().any(|decl| {
+                    !matches!(decl.name, Pat::Ident(_))
+                        || !matches!(decl.init.as_deref(), Some(Expr::Member(_)))
+                })
+            {
+                return None;
+            }
+            let mut declaration = var.clone();
+            for decl in &mut declaration.decls {
+                decl.init = None;
+            }
+            declarations.push(Stmt::Decl(Decl::Var(declaration)));
+        }
+    }
+    let mut key_to_binding: crate::collections::HashMap<Atom, (Atom, SyntaxContext)> =
+        crate::collections::HashMap::default();
+    let mut key_to_default: crate::collections::HashMap<Atom, Box<Expr>> =
+        crate::collections::HashMap::default();
     for access in merged {
         match access {
             PrecedingAccess::Destructuring(pairs) => {
@@ -3448,7 +3607,7 @@ fn build_rest_assignment(
     } else {
         DUMMY_SP
     };
-    Some(Stmt::Expr(ExprStmt {
+    declarations.push(Stmt::Expr(ExprStmt {
         span: stmt_span,
         expr: Box::new(Expr::Assign(AssignExpr {
             span: stmt_span,
@@ -3461,7 +3620,8 @@ fn build_rest_assignment(
             })),
             right: Box::new((*source).clone()),
         })),
-    }))
+    }));
+    Some(declarations)
 }
 
 /// Verify the for-in body references `indexOf` and `hasOwnProperty` —
@@ -3532,7 +3692,7 @@ impl AliasNameConflicts<'_> {
 fn find_non_conflicting_alias(
     base: &str,
     conflicts: AliasNameConflicts<'_>,
-    used_aliases: &std::collections::HashSet<Atom>,
+    used_aliases: &crate::collections::HashSet<Atom>,
 ) -> Atom {
     let base_atom = Atom::from(base);
     if !conflicts.contains(&base_atom) && !used_aliases.contains(&base_atom) {
@@ -3572,11 +3732,11 @@ fn generated_alias_base(key: &str) -> String {
 }
 
 /// Collect all binding names from a list of statements (top-level idents only).
-fn collect_scope_names(stmts: &[Stmt]) -> std::collections::HashSet<Atom> {
+fn collect_scope_names(stmts: &[Stmt]) -> crate::collections::HashSet<Atom> {
     use swc_core::ecma::visit::{Visit, VisitWith};
 
     struct BindingCollector {
-        names: std::collections::HashSet<Atom>,
+        names: crate::collections::HashSet<Atom>,
     }
     impl Visit for BindingCollector {
         fn visit_ident(&mut self, id: &Ident) {
@@ -3584,7 +3744,7 @@ fn collect_scope_names(stmts: &[Stmt]) -> std::collections::HashSet<Atom> {
         }
     }
     let mut collector = BindingCollector {
-        names: std::collections::HashSet::new(),
+        names: crate::collections::HashSet::default(),
     };
     for stmt in stmts {
         stmt.visit_with(&mut collector);
@@ -3592,11 +3752,11 @@ fn collect_scope_names(stmts: &[Stmt]) -> std::collections::HashSet<Atom> {
     collector.names
 }
 
-fn collect_scope_names_module(items: &[ModuleItem]) -> std::collections::HashSet<Atom> {
+fn collect_scope_names_module(items: &[ModuleItem]) -> crate::collections::HashSet<Atom> {
     use swc_core::ecma::visit::{Visit, VisitWith};
 
     struct BindingCollector {
-        names: std::collections::HashSet<Atom>,
+        names: crate::collections::HashSet<Atom>,
     }
     impl Visit for BindingCollector {
         fn visit_ident(&mut self, id: &Ident) {
@@ -3604,7 +3764,7 @@ fn collect_scope_names_module(items: &[ModuleItem]) -> std::collections::HashSet
         }
     }
     let mut collector = BindingCollector {
-        names: std::collections::HashSet::new(),
+        names: crate::collections::HashSet::default(),
     };
     for item in items {
         item.visit_with(&mut collector);

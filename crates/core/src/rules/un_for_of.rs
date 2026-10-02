@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::common::{Mark, Span, Spanned, SyntaxContext, DUMMY_SP};
@@ -9,15 +9,19 @@ use swc_core::ecma::ast::{
     Pat, SimpleAssignTarget, Stmt, TryStmt, UnaryExpr, UnaryOp, UpdateExpr, UpdateOp, VarDecl,
     VarDeclKind, VarDeclOrExpr, VarDeclarator,
 };
+use swc_core::ecma::utils::find_pat_ids;
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use crate::analysis::binding_uses::BindingUseIndex;
 use crate::facts::{ModuleFactsMap, TypeScriptHelperKind};
 
+use super::eval_utils::{js_source_mentions_binding, module_has_with_stmt, DirectEvalAnalyzer};
 use super::helper_matcher::{binding_key, static_member_prop_name, BindingKey};
+use super::rename_utils::{rename_bindings, BindingRename};
 use super::transpiler_helper_utils::{
     tslib_member_ts_helper_kind, tslib_require_ts_helper_kind, LocalHelperContext, TsHelperKind,
 };
+use super::un_for_await;
 use super::RewriteLevel;
 
 use crate::utils::paren::strip_parens;
@@ -100,19 +104,52 @@ impl<'a> UnForOf<'a> {
         );
         let previous = std::mem::replace(&mut self.helper_context, helper_context);
         module.visit_mut_children_with(self);
-        self.helper_context = previous;
-        local_helpers.remove_unused_inline_ts_helpers(module, &[TsHelperKind::Values]);
+        let helper_context = std::mem::replace(&mut self.helper_context, previous);
+        // Dependency-aware cleanup first: it walks the top-level reference
+        // graph from the adapter helper, so the helper must still be declared.
+        if helper_context.rewrote_async_iterator_loop.get() {
+            un_for_await::remove_consumed_async_iterator_helpers(
+                module,
+                local_helpers,
+                &helper_context,
+            );
+        }
+        local_helpers.remove_unused_inline_ts_helpers(
+            module,
+            &[TsHelperKind::Values, TsHelperKind::AsyncValues],
+        );
     }
 }
 
 #[derive(Clone, Default)]
-struct ForOfHelperContext {
+pub(super) struct ForOfHelperContext {
     values_helpers: HashSet<BindingKey>,
+    /// tslib `__asyncValues` bindings (inline, imported, or required).
+    pub(super) async_values_helpers: HashSet<BindingKey>,
+    /// Babel `_asyncIterator` / SWC `_async_iterator` callee identities live in
+    /// the shared helper context; kept whole so member callee forms resolve.
+    pub(super) local_helpers: LocalHelperContext,
+    /// esbuild `__forAwait` adapters and the `__knownSymbol` lookup they call,
+    /// matched by body shape (the names are mangled in minified output).
+    pub(super) esbuild_for_await_helpers: HashSet<BindingKey>,
+    pub(super) esbuild_known_symbol_helpers: HashSet<BindingKey>,
+    /// Set when an async iterator protocol was folded into `for await`, so the
+    /// consumed helper declarations are removed once the walk is done.
+    pub(super) rewrote_async_iterator_loop: std::cell::Cell<bool>,
+    /// Protocol temporaries proven private to a folded `for await` whose
+    /// declarations live in an enclosing statement list (state-machine
+    /// decoders hoist them); that list drops them when it is processed.
+    pub(super) orphaned_protocol_temps: std::cell::RefCell<HashSet<BindingKey>>,
     tslib_namespaces: HashSet<BindingKey>,
     cross_module_values_namespaces: HashMap<BindingKey, HashSet<String>>,
     closure_jscomp_namespaces: HashSet<BindingKey>,
-    binding_uses: BindingUseIndex,
+    pub(super) binding_uses: BindingUseIndex,
     unresolved_mark: Option<Mark>,
+    /// Module-wide `with` / unknown direct `eval`, plus known eval sources.
+    /// Used when dropping a function-scoped (`var`) for-of left.
+    module_has_with: bool,
+    unknown_direct_eval: bool,
+    known_direct_eval_sources: Vec<String>,
 }
 
 impl ForOfHelperContext {
@@ -128,14 +165,38 @@ impl ForOfHelperContext {
             .unwrap_or_default();
         let mut values_helpers = local_helpers.ts_helpers_of_kind(TsHelperKind::Values);
         values_helpers.extend(cross_module_values.direct);
+        let mut eval = DirectEvalAnalyzer::default();
+        module.visit_with(&mut eval);
+        let (esbuild_for_await_helpers, esbuild_known_symbol_helpers) =
+            un_for_await::collect_esbuild_for_await_helpers(module);
         Self {
             values_helpers,
+            async_values_helpers: local_helpers.ts_helpers_of_kind(TsHelperKind::AsyncValues),
+            local_helpers: local_helpers.clone(),
+            esbuild_for_await_helpers,
+            esbuild_known_symbol_helpers,
+            rewrote_async_iterator_loop: std::cell::Cell::new(false),
+            orphaned_protocol_temps: std::cell::RefCell::new(HashSet::default()),
             tslib_namespaces: local_helpers.tslib_namespaces().clone(),
             cross_module_values_namespaces: cross_module_values.namespaces,
             closure_jscomp_namespaces: collect_closure_jscomp_namespaces(module),
             binding_uses: BindingUseIndex::collect(module),
             unresolved_mark,
+            module_has_with: module_has_with_stmt(module),
+            unknown_direct_eval: eval.unknown_direct_eval,
+            known_direct_eval_sources: eval.known_direct_eval_sources,
         }
+    }
+
+    /// A `var` for-of left is visible to `with` and direct `eval` anywhere
+    /// in the module. Known eval sources only block when they mention `name`.
+    pub(super) fn dynamic_scope_can_observe_name(&self, name: &Atom) -> bool {
+        self.module_has_with
+            || self.unknown_direct_eval
+            || self
+                .known_direct_eval_sources
+                .iter()
+                .any(|source| js_source_mentions_binding(source, name))
     }
 
     fn is_ts_values_callee(&self, callee: &Callee) -> bool {
@@ -154,6 +215,22 @@ impl ForOfHelperContext {
                     || tslib_require_ts_helper_kind(expr, self.unresolved_mark)
                         == Some(TsHelperKind::Values)
                     || is_cross_module_values_member(expr, &self.cross_module_values_namespaces)
+            }
+            _ => false,
+        }
+    }
+
+    /// tslib `__asyncValues(iterable)` callee: inline declaration, tslib
+    /// import specifier, or a `tslib.__asyncValues` member on a proven
+    /// namespace. Cross-module facts are not consulted for the async helper.
+    pub(super) fn is_ts_async_values_callee_expr(&self, expr: &Expr) -> bool {
+        match strip_parens(expr) {
+            Expr::Ident(id) => self.async_values_helpers.contains(&binding_key(id)),
+            Expr::Member(_) => {
+                tslib_member_ts_helper_kind(expr, &self.tslib_namespaces)
+                    == Some(TsHelperKind::AsyncValues)
+                    || tslib_require_ts_helper_kind(expr, self.unresolved_mark)
+                        == Some(TsHelperKind::AsyncValues)
             }
             _ => false,
         }
@@ -238,7 +315,7 @@ fn collect_closure_jscomp_namespaces(module: &Module) -> HashSet<BindingKey> {
     }
 
     let mut collector = Collector {
-        namespaces: HashSet::new(),
+        namespaces: HashSet::default(),
     };
     module.visit_with(&mut collector);
     collector.namespaces
@@ -256,7 +333,7 @@ fn collect_cross_module_values_refs(
     current_filename: Option<&str>,
 ) -> CrossModuleValuesRefs {
     let mut refs = CrossModuleValuesRefs::default();
-    let mut namespace_factories: HashMap<BindingKey, HashSet<String>> = HashMap::new();
+    let mut namespace_factories: HashMap<BindingKey, HashSet<String>> = HashMap::default();
 
     for item in &module.body {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
@@ -454,7 +531,7 @@ impl UnForOf<'_> {
                 if self.found {
                     return;
                 }
-                if matches!(stmt, Stmt::For(_) | Stmt::Try(_)) {
+                if matches!(stmt, Stmt::For(_) | Stmt::ForOf(_) | Stmt::Try(_)) {
                     self.found = true;
                     return;
                 }
@@ -508,6 +585,9 @@ impl VisitMut for UnForOf<'_> {
         if let Some(for_of) = try_convert_for_of(stmt, &self.helper_context) {
             *stmt = Stmt::ForOf(for_of);
         }
+        if let Stmt::ForOf(for_of) = stmt {
+            try_fold_for_of_entry_slots(for_of, &self.helper_context);
+        }
     }
 }
 
@@ -530,9 +610,11 @@ fn has_for_of_sequence_candidates(stmts: &[Stmt]) -> bool {
 }
 
 fn process_stmt_vec(stmts: &mut Vec<Stmt>, helper_context: &ForOfHelperContext) {
+    un_for_await::remove_orphaned_temp_declarations(stmts, helper_context);
     if !has_for_of_sequence_candidates(stmts) {
         return;
     }
+    un_for_await::rewrite_async_iterator_loops(stmts, helper_context);
     let old = std::mem::take(stmts);
     let mut i = 0;
     while i < old.len() {
@@ -554,20 +636,20 @@ fn process_stmt_vec(stmts: &mut Vec<Stmt>, helper_context: &ForOfHelperContext) 
             continue;
         }
 
-        if let Some(rewrite) = try_convert_swc_iterator_sequence(&old[i..]) {
+        if let Some(rewrite) = try_convert_swc_iterator_sequence(&old[i..], helper_context) {
             stmts.push(Stmt::ForOf(rewrite.for_of));
             i += rewrite.consumed_stmts;
             continue;
         }
 
-        if let Some(rewrite) = try_convert_iterator_helper_sequence(&old[i..]) {
+        if let Some(rewrite) = try_convert_iterator_helper_sequence(&old[i..], helper_context) {
             stmts.extend(rewrite.preserved_stmts);
             stmts.push(Stmt::ForOf(rewrite.for_of));
             i += rewrite.consumed_stmts;
             continue;
         }
 
-        if let Some(rewrite) = try_convert_loose_iterator_sequence(&old[i..]) {
+        if let Some(rewrite) = try_convert_loose_iterator_sequence(&old[i..], helper_context) {
             stmts.push(Stmt::ForOf(rewrite.for_of));
             i += rewrite.consumed_stmts;
             continue;
@@ -622,6 +704,7 @@ fn try_convert_closure_iterator_sequence(
         result_decl.init.as_deref()?,
         init.iterable,
         stmts[0].span(),
+        helper_context,
     )?;
     Some(SequenceRewrite {
         consumed_stmts: 2,
@@ -660,6 +743,7 @@ fn try_convert_closure_iterator_for_stmt(
         result_decl.init.as_deref()?,
         iterable,
         stmts[0].span(),
+        helper_context,
     )?;
     Some(SequenceRewrite {
         consumed_stmts: 1,
@@ -676,6 +760,7 @@ fn build_closure_iterator_for_of(
     result_init: &Expr,
     iterable: Box<Expr>,
     span: Span,
+    helper_context: &ForOfHelperContext,
 ) -> Option<ForOfStmt> {
     if !is_iterator_next_call(result_init, iterator_ident)
         || !is_not_done_test(for_stmt.test.as_deref()?, result_ident)
@@ -701,7 +786,14 @@ fn build_closure_iterator_for_of(
             stmts: vec![body.clone()],
         },
     };
-    build_helper_for_of(loop_body, iterable, result_ident.clone(), span)
+    build_helper_for_of(
+        loop_body,
+        iterable,
+        result_ident.clone(),
+        span,
+        helper_context,
+        false,
+    )
 }
 
 fn extract_closure_iterator_init(
@@ -759,8 +851,11 @@ fn extract_closure_make_iterator_arg(
     Some(arg.expr.clone())
 }
 
-fn try_convert_iterator_helper_sequence(stmts: &[Stmt]) -> Option<SequenceRewrite> {
-    if let Some(rewrite) = try_convert_iterator_helper_decl_first_sequence(stmts) {
+fn try_convert_iterator_helper_sequence(
+    stmts: &[Stmt],
+    helper_context: &ForOfHelperContext,
+) -> Option<SequenceRewrite> {
+    if let Some(rewrite) = try_convert_iterator_helper_decl_first_sequence(stmts, helper_context) {
         return Some(rewrite);
     }
 
@@ -798,7 +893,14 @@ fn try_convert_iterator_helper_sequence(stmts: &[Stmt]) -> Option<SequenceRewrit
         return None;
     }
 
-    let for_of = build_helper_for_of(helper_loop, iterable, item_ident, stmts[0].span())?;
+    let for_of = build_helper_for_of(
+        helper_loop,
+        iterable,
+        item_ident,
+        stmts[0].span(),
+        helper_context,
+        false,
+    )?;
     Some(SequenceRewrite {
         consumed_stmts,
         preserved_stmts,
@@ -806,7 +908,10 @@ fn try_convert_iterator_helper_sequence(stmts: &[Stmt]) -> Option<SequenceRewrit
     })
 }
 
-fn try_convert_iterator_helper_decl_first_sequence(stmts: &[Stmt]) -> Option<SequenceRewrite> {
+fn try_convert_iterator_helper_decl_first_sequence(
+    stmts: &[Stmt],
+    helper_context: &ForOfHelperContext,
+) -> Option<SequenceRewrite> {
     let helper_decl = stmt_as_single_var_decl(stmts.first()?)?;
     let helper_ident = pat_as_ident(&helper_decl.decls[0].name)?.id.clone();
     let iterable = extract_single_call_arg(helper_decl.decls[0].init.as_ref()?)?;
@@ -820,7 +925,14 @@ fn try_convert_iterator_helper_decl_first_sequence(stmts: &[Stmt]) -> Option<Seq
         return None;
     }
 
-    let for_of = build_helper_for_of(helper_loop, iterable, item_ident, stmts[0].span())?;
+    let for_of = build_helper_for_of(
+        helper_loop,
+        iterable,
+        item_ident,
+        stmts[0].span(),
+        helper_context,
+        false,
+    )?;
     Some(SequenceRewrite {
         consumed_stmts: 3,
         preserved_stmts: Vec::new(),
@@ -828,7 +940,10 @@ fn try_convert_iterator_helper_decl_first_sequence(stmts: &[Stmt]) -> Option<Seq
     })
 }
 
-fn try_convert_loose_iterator_sequence(stmts: &[Stmt]) -> Option<SequenceRewrite> {
+fn try_convert_loose_iterator_sequence(
+    stmts: &[Stmt],
+    helper_context: &ForOfHelperContext,
+) -> Option<SequenceRewrite> {
     let item_ident = empty_single_var_ident(stmts.first()?)?;
     let Stmt::For(for_stmt) = stmts.get(1)? else {
         return None;
@@ -856,7 +971,14 @@ fn try_convert_loose_iterator_sequence(stmts: &[Stmt]) -> Option<SequenceRewrite
     let Stmt::Block(body) = &*for_stmt.body else {
         return None;
     };
-    let for_of = build_helper_for_of(body.clone(), iterable, item_ident, stmts[0].span())?;
+    let for_of = build_helper_for_of(
+        body.clone(),
+        iterable,
+        item_ident,
+        stmts[0].span(),
+        helper_context,
+        false,
+    )?;
     Some(SequenceRewrite {
         consumed_stmts: 2,
         preserved_stmts: Vec::new(),
@@ -884,6 +1006,8 @@ fn try_convert_ts_values_sequence(
         helper_loop.iterable,
         helper_loop.result_ident,
         stmts[0].span(),
+        helper_context,
+        false,
     )?;
     Some(SequenceRewrite {
         consumed_stmts: 3,
@@ -892,7 +1016,10 @@ fn try_convert_ts_values_sequence(
     })
 }
 
-fn try_convert_swc_iterator_sequence(stmts: &[Stmt]) -> Option<SequenceRewrite> {
+fn try_convert_swc_iterator_sequence(
+    stmts: &[Stmt],
+    helper_context: &ForOfHelperContext,
+) -> Option<SequenceRewrite> {
     let normal_ident = single_var_ident_with_bool(stmts.first()?, true)?;
     let did_error_ident = single_var_ident_with_bool(stmts.get(1)?, false)?;
     let error_ident = empty_single_var_ident(stmts.get(2)?)?;
@@ -924,6 +1051,8 @@ fn try_convert_swc_iterator_sequence(stmts: &[Stmt]) -> Option<SequenceRewrite> 
         helper_loop.iterable,
         helper_loop.result_ident,
         stmts[0].span(),
+        helper_context,
+        false,
     )?;
     Some(SequenceRewrite {
         consumed_stmts: 4,
@@ -1066,11 +1195,13 @@ fn extract_swc_iterator_loop(try_stmt: &TryStmt, normal_ident: &Ident) -> Option
     })
 }
 
-fn build_helper_for_of(
+pub(super) fn build_helper_for_of(
     mut body: BlockStmt,
     iterable: Box<Expr>,
     item_ident: Ident,
     span: Span,
+    helper_context: &ForOfHelperContext,
+    is_await: bool,
 ) -> Option<ForOfStmt> {
     let mut element = extract_iterator_value_element(&body.stmts, &item_ident);
     if element.is_none() {
@@ -1089,57 +1220,89 @@ fn build_helper_for_of(
         }
         replace_iterator_value_refs(&mut body, &item_ident);
     }
-    let (pat, bindings, kind, consumed_stmts, temp_ident) = if let Some(element) = element {
-        (
-            element.pat,
-            element.bindings,
-            element.kind,
-            element.consumed_stmts,
-            element.temp_ident,
-        )
+    let mut element = if let Some(element) = element {
+        element
     } else {
-        (
-            Pat::Ident(BindingIdent {
+        LoopElement {
+            pat: Pat::Ident(BindingIdent {
                 id: item_ident.clone(),
                 type_ann: None,
             }),
-            vec![item_ident.clone()],
-            VarDeclKind::Const,
-            0,
-            None,
-        )
+            bindings: vec![item_ident.clone()],
+            kind: VarDeclKind::Const,
+            temp_ident: None,
+            consumed_stmts: 0,
+            allow_ident_fallback: false,
+            temp_kind: VarDeclKind::Const,
+        }
     };
 
-    let mut remaining_body = body.stmts[consumed_stmts..].to_vec();
-    if consumed_stmts > 0
+    // Remaining-body uses / eval must be checked against the ArrayPat
+    // remainder before any ident fallback, so `eval("pair")` still
+    // fail-closes the whole helper.
+    if let Some(id) = element.temp_ident.clone() {
+        let remaining_after_pat = &body.stmts[element.consumed_stmts..];
+        if remaining_after_pat
+            .iter()
+            .any(|stmt| stmt_uses_ident(stmt, &id))
+            || dynamic_scope_observes_binding(remaining_after_pat, &id)
+        {
+            return None;
+        }
+        let var_temp = body
+            .stmts
+            .first()
+            .and_then(stmt_as_single_var_decl)
+            .is_some_and(|decl| decl.kind == VarDeclKind::Var);
+        if array_pat_left_is_unsound(
+            helper_context,
+            &iterable,
+            &body.stmts,
+            &id,
+            &element.pat,
+            &element.bindings,
+            var_temp,
+        ) && (!element.fallback_to_temp_ident()
+            || ident_fallback_tdz_in_iterable(&iterable, &element))
+        {
+            return None;
+        }
+    } else if matches!(element.pat, Pat::Array(_))
+        && expr_observes_lifted_names(&iterable, &element.bindings)
+    {
+        return None;
+    }
+
+    let mut remaining_body = body.stmts[element.consumed_stmts..].to_vec();
+    if element.consumed_stmts > 0
         && remaining_body
             .iter()
             .any(|stmt| stmt_uses_ident_key(stmt, &item_ident))
     {
         return None;
     }
-    if temp_ident
-        .as_ref()
-        .is_some_and(|id| remaining_body.iter().any(|stmt| stmt_uses_ident(stmt, id)))
-    {
+
+    let body_uses = BindingUseIndex::collect_stmts(&remaining_body);
+    if writes_consumed_const(&body.stmts[..element.consumed_stmts], &body_uses) {
         return None;
     }
-
-    let is_reassigned = remaining_body
+    let is_reassigned = element
+        .bindings
         .iter()
-        .any(|stmt| bindings.iter().any(|id| stmt_assigns_ident(stmt, id)));
-    let kind = if kind == VarDeclKind::Var {
+        .any(|id| body_uses.has_direct_write(&id.to_id()));
+    let kind = if element.kind == VarDeclKind::Var {
         VarDeclKind::Var
     } else if is_reassigned {
         VarDeclKind::Let
     } else {
         VarDeclKind::Const
     };
+    rename_lifted_bindings_shadowing_iterable(&iterable, kind, &mut element, &mut remaining_body)?;
 
     let for_span = if span.lo.0 != 0 { span } else { DUMMY_SP };
     Some(ForOfStmt {
         span: for_span,
-        is_await: false,
+        is_await,
         left: ForHead::VarDecl(Box::new(VarDecl {
             span: DUMMY_SP,
             ctxt: Default::default(),
@@ -1147,7 +1310,7 @@ fn build_helper_for_of(
             declare: false,
             decls: vec![VarDeclarator {
                 span: DUMMY_SP,
-                name: pat,
+                name: element.pat,
                 init: None,
                 definite: false,
             }],
@@ -1175,51 +1338,17 @@ fn extract_iterator_call_destructuring_element(
     }
 
     let temp_ident = &temp_binding.id;
-    let mut elems = Vec::new();
-    let mut bindings = Vec::new();
-    let mut kind = VarDeclKind::Const;
-    let mut consumed_stmts = 1;
-
-    for stmt in &stmts[1..] {
-        let Some(decl) = stmt_as_single_var_decl(stmt) else {
-            break;
-        };
-        let declarator = &decl.decls[0];
-        let expected_index = elems.len() as f64;
-        let Pat::Ident(binding) = &declarator.name else {
-            break;
-        };
-        let Some(init) = declarator.init.as_ref() else {
-            break;
-        };
-        if !is_numeric_index_access(init, &temp_ident.sym, expected_index) {
-            break;
-        }
-
-        elems.push(Some(Pat::Ident(BindingIdent {
-            id: binding.id.clone(),
-            type_ann: binding.type_ann.clone(),
-        })));
-        bindings.push(binding.id.clone());
-        kind = join_recovered_binding_kind(kind, decl.kind);
-        consumed_stmts += 1;
-    }
-
-    if elems.is_empty() {
-        return None;
-    }
+    let slots = consume_index_slots(&stmts[1..], temp_ident);
+    let (pat, bindings, kind, slot_consumed) = array_pat_from_index_slots(slots)?;
 
     Some(LoopElement {
-        pat: Pat::Array(ArrayPat {
-            span: DUMMY_SP,
-            elems,
-            optional: false,
-            type_ann: None,
-        }),
+        pat,
         bindings,
         kind,
         temp_ident: Some(temp_ident.clone()),
-        consumed_stmts,
+        consumed_stmts: 1 + slot_consumed,
+        allow_ident_fallback: false,
+        temp_kind: first_decl.kind,
     })
 }
 
@@ -1252,6 +1381,8 @@ fn extract_iterator_destructuring_decl_element(
         kind: first_decl.kind,
         temp_ident: None,
         consumed_stmts: 1,
+        allow_ident_fallback: false,
+        temp_kind: first_decl.kind,
     })
 }
 
@@ -1266,48 +1397,16 @@ fn extract_iterator_value_element(stmts: &[Stmt], item_ident: &Ident) -> Option<
     }
 
     let temp_ident = &binding.id;
-    let mut elems = Vec::new();
-    let mut bindings = Vec::new();
-    let mut kind = VarDeclKind::Const;
-    let mut consumed_stmts = 1;
-
-    for stmt in &stmts[1..] {
-        let Some(decl) = stmt_as_single_var_decl(stmt) else {
-            break;
-        };
-        let declarator = &decl.decls[0];
-        let expected_index = elems.len() as f64;
-        let Pat::Ident(binding) = &declarator.name else {
-            break;
-        };
-        let Some(init) = declarator.init.as_ref() else {
-            break;
-        };
-        if !is_numeric_index_access(init, &temp_ident.sym, expected_index) {
-            break;
-        }
-
-        elems.push(Some(Pat::Ident(BindingIdent {
-            id: binding.id.clone(),
-            type_ann: binding.type_ann.clone(),
-        })));
-        bindings.push(binding.id.clone());
-        kind = join_recovered_binding_kind(kind, decl.kind);
-        consumed_stmts += 1;
-    }
-
-    if !elems.is_empty() {
+    let slots = consume_index_slots(&stmts[1..], temp_ident);
+    if let Some((pat, bindings, kind, slot_consumed)) = array_pat_from_index_slots(slots) {
         return Some(LoopElement {
-            pat: Pat::Array(ArrayPat {
-                span: DUMMY_SP,
-                elems,
-                optional: false,
-                type_ann: None,
-            }),
+            pat,
             bindings,
             kind,
             temp_ident: Some(temp_ident.clone()),
-            consumed_stmts,
+            consumed_stmts: 1 + slot_consumed,
+            allow_ident_fallback: true,
+            temp_kind: first_decl.kind,
         });
     }
 
@@ -1317,6 +1416,8 @@ fn extract_iterator_value_element(stmts: &[Stmt], item_ident: &Ident) -> Option<
         kind: first_decl.kind,
         temp_ident: None,
         consumed_stmts: 1,
+        allow_ident_fallback: true,
+        temp_kind: first_decl.kind,
     })
 }
 
@@ -1361,7 +1462,7 @@ fn single_for_stmt(block: &BlockStmt) -> Option<&swc_core::ecma::ast::ForStmt> {
     Some(for_stmt)
 }
 
-fn empty_single_var_ident(stmt: &Stmt) -> Option<Ident> {
+pub(super) fn empty_single_var_ident(stmt: &Stmt) -> Option<Ident> {
     let decl = stmt_as_single_var_decl(stmt)?;
     let declarator = &decl.decls[0];
     if declarator.init.is_some() {
@@ -1370,7 +1471,7 @@ fn empty_single_var_ident(stmt: &Stmt) -> Option<Ident> {
     Some(pat_as_ident(&declarator.name)?.id.clone())
 }
 
-fn single_var_ident_with_bool(stmt: &Stmt, value: bool) -> Option<Ident> {
+pub(super) fn single_var_ident_with_bool(stmt: &Stmt, value: bool) -> Option<Ident> {
     let decl = stmt_as_single_var_decl(stmt)?;
     let declarator = &decl.decls[0];
     if !declarator.init.as_deref().is_some_and(
@@ -1381,14 +1482,14 @@ fn single_var_ident_with_bool(stmt: &Stmt, value: bool) -> Option<Ident> {
     Some(pat_as_ident(&declarator.name)?.id.clone())
 }
 
-fn pat_as_ident(pat: &Pat) -> Option<&BindingIdent> {
+pub(super) fn pat_as_ident(pat: &Pat) -> Option<&BindingIdent> {
     let Pat::Ident(ident) = pat else {
         return None;
     };
     Some(ident)
 }
 
-fn stmt_as_try(stmt: &Stmt) -> Option<&TryStmt> {
+pub(super) fn stmt_as_try(stmt: &Stmt) -> Option<&TryStmt> {
     let Stmt::Try(try_stmt) = stmt else {
         return None;
     };
@@ -1499,7 +1600,7 @@ fn is_not_done_test(expr: &Expr, result_ident: &Ident) -> bool {
     is_ident_key(done_obj, result_ident)
 }
 
-fn extract_done_obj(expr: &Expr) -> Option<&Expr> {
+pub(super) fn extract_done_obj(expr: &Expr) -> Option<&Expr> {
     let Expr::Member(MemberExpr { obj, prop, .. }) = expr else {
         return None;
     };
@@ -1512,7 +1613,7 @@ fn extract_done_obj(expr: &Expr) -> Option<&Expr> {
     Some(strip_parens(obj))
 }
 
-fn is_assign_ident(assign: &AssignExpr, ident: &Ident) -> bool {
+pub(super) fn is_assign_ident(assign: &AssignExpr, ident: &Ident) -> bool {
     if assign.op != AssignOp::Assign {
         return false;
     }
@@ -1522,7 +1623,7 @@ fn is_assign_ident(assign: &AssignExpr, ident: &Ident) -> bool {
     )
 }
 
-fn is_iterator_next_call(expr: &Expr, iterator_ident: &Ident) -> bool {
+pub(super) fn is_iterator_next_call(expr: &Expr, iterator_ident: &Ident) -> bool {
     is_helper_method_call(expr, iterator_ident, "next")
 }
 
@@ -1533,7 +1634,7 @@ fn is_iterator_next_update(expr: &Expr, result_ident: &Ident, iterator_ident: &I
     is_assign_ident(assign, result_ident) && is_iterator_next_call(&assign.right, iterator_ident)
 }
 
-fn is_assign_bool(expr: &Expr, ident: &Ident, value: bool) -> bool {
+pub(super) fn is_assign_bool(expr: &Expr, ident: &Ident, value: bool) -> bool {
     let Expr::Assign(assign) = expr else {
         return false;
     };
@@ -1541,7 +1642,7 @@ fn is_assign_bool(expr: &Expr, ident: &Ident, value: bool) -> bool {
         && matches!(&*assign.right, Expr::Lit(Lit::Bool(bool_lit)) if bool_lit.value == value)
 }
 
-fn is_helper_method_call(expr: &Expr, helper_ident: &Ident, method: &str) -> bool {
+pub(super) fn is_helper_method_call(expr: &Expr, helper_ident: &Ident, method: &str) -> bool {
     let Expr::Call(CallExpr { callee, args, .. }) = expr else {
         return false;
     };
@@ -1635,7 +1736,7 @@ fn swc_catch_matches(try_stmt: &TryStmt, did_error_ident: &Ident, error_ident: &
     is_assign_ident(assign, error_ident) && is_ident_key(&assign.right, &param.id)
 }
 
-fn is_value_member(expr: &Expr, item_ident: &Ident) -> bool {
+pub(super) fn is_value_member(expr: &Expr, item_ident: &Ident) -> bool {
     let Expr::Member(MemberExpr { obj, prop, .. }) = expr else {
         return false;
     };
@@ -1714,10 +1815,14 @@ fn replace_iterator_value_refs(block: &mut BlockStmt, item_ident: &Ident) {
 
     impl VisitMut for Replacer {
         fn visit_mut_expr(&mut self, expr: &mut Expr) {
-            expr.visit_mut_children_with(self);
+            // Match before descending: once `step.value` has become `step`,
+            // an enclosing `.value` read (`step.value.value`, the element's
+            // own `value` property) would otherwise match a second time.
             if is_value_member(expr, &self.ident) {
                 *expr = Expr::Ident(self.ident.clone());
+                return;
             }
+            expr.visit_mut_children_with(self);
         }
     }
 
@@ -1812,11 +1917,11 @@ fn try_convert_for_of(stmt: &Stmt, helper_context: &ForOfHelperContext) -> Optio
     if block.stmts.is_empty() {
         return None;
     }
-    let element = extract_loop_element(&block.stmts, &access_obj, &idx_ident.sym)?;
+    let mut element = extract_loop_element(&block.stmts, &access_obj, &idx_ident.sym)?;
 
     // --- Safety: generated index/temp bindings must not be used in remaining body statements ---
-    let remaining_body = &block.stmts[element.consumed_stmts..];
-    for body_stmt in remaining_body {
+    let remaining_after_pat = &block.stmts[element.consumed_stmts..];
+    for body_stmt in remaining_after_pat {
         if stmt_uses_ident(body_stmt, idx_ident) {
             return None;
         }
@@ -1834,14 +1939,54 @@ fn try_convert_for_of(stmt: &Stmt, helper_context: &ForOfHelperContext) -> Optio
             return None;
         }
     }
+    if temp_ident
+        .as_ref()
+        .is_some_and(|id| dynamic_scope_observes_binding(remaining_after_pat, id))
+        || element
+            .temp_ident
+            .as_ref()
+            .is_some_and(|id| dynamic_scope_observes_binding(remaining_after_pat, id))
+    {
+        return None;
+    }
+    if let Some(id) = element.temp_ident.clone() {
+        let var_temp = block
+            .stmts
+            .first()
+            .and_then(stmt_as_single_var_decl)
+            .is_some_and(|decl| decl.kind == VarDeclKind::Var);
+        // Body-only liveness: a read in the for-init iterable is live for a
+        // function-scoped element temp, not an "inside" use of this loop.
+        if array_pat_left_is_unsound(
+            helper_context,
+            &iterable,
+            &block.stmts,
+            &id,
+            &element.pat,
+            &element.bindings,
+            var_temp,
+        ) && (!element.fallback_to_temp_ident()
+            || ident_fallback_tdz_in_iterable(&iterable, &element))
+        {
+            return None;
+        }
+    } else if matches!(element.pat, Pat::Array(_))
+        && expr_observes_lifted_names(&iterable, &element.bindings)
+    {
+        return None;
+    }
+    let remaining_body = &block.stmts[element.consumed_stmts..];
 
-    // Use `let` if the element variable is reassigned in the loop body, `const` otherwise
-    let elem_is_reassigned = remaining_body.iter().any(|stmt| {
-        element
-            .bindings
-            .iter()
-            .any(|id| stmt_assigns_ident(stmt, id))
-    });
+    // Analyze the remaining body after consuming the element declaration.
+    // Shared write analysis includes nested targets and distinguishes shadowed bindings.
+    let body_uses = BindingUseIndex::collect_stmts(remaining_body);
+    if writes_consumed_const(&block.stmts[..element.consumed_stmts], &body_uses) {
+        return None;
+    }
+    let elem_is_reassigned = element
+        .bindings
+        .iter()
+        .any(|id| body_uses.has_direct_write(&id.to_id()));
     let elem_kind = if element.kind == VarDeclKind::Var {
         VarDeclKind::Var
     } else if elem_is_reassigned {
@@ -1849,6 +1994,13 @@ fn try_convert_for_of(stmt: &Stmt, helper_context: &ForOfHelperContext) -> Optio
     } else {
         VarDeclKind::Const
     };
+    let mut remaining_body = remaining_body.to_vec();
+    rename_lifted_bindings_shadowing_iterable(
+        &iterable,
+        elem_kind,
+        &mut element,
+        &mut remaining_body,
+    )?;
 
     // --- Build for...of ---
     let for_of_left = ForHead::VarDecl(Box::new(VarDecl {
@@ -1867,7 +2019,7 @@ fn try_convert_for_of(stmt: &Stmt, helper_context: &ForOfHelperContext) -> Optio
     let new_body = Stmt::Block(swc_core::ecma::ast::BlockStmt {
         span: DUMMY_SP,
         ctxt: Default::default(),
-        stmts: remaining_body.to_vec(),
+        stmts: remaining_body,
     });
 
     Some(ForOfStmt {
@@ -1891,6 +2043,48 @@ struct LoopElement {
     kind: VarDeclKind,
     temp_ident: Option<Ident>,
     consumed_stmts: usize,
+    /// Ident fallback is only valid when `temp` *is* the iterator value
+    /// (`step.value` / `arr[i]`). A helper-call temp (`_slicedToArray`) is a
+    /// converted array; dropping the call would change the observable value.
+    allow_ident_fallback: bool,
+    /// Kind of the original temp declaration (`const pair`), not the slot
+    /// join (`var value`). Ident fallback must restore this kind.
+    temp_kind: VarDeclKind,
+}
+
+impl LoopElement {
+    fn fallback_to_temp_ident(&mut self) -> bool {
+        if !self.allow_ident_fallback {
+            return false;
+        }
+        let Some(id) = self.temp_ident.take() else {
+            return false;
+        };
+        self.pat = Pat::Ident(BindingIdent {
+            id: id.clone(),
+            type_ann: None,
+        });
+        self.bindings = vec![id];
+        self.kind = self.temp_kind;
+        self.consumed_stmts = 1;
+        true
+    }
+}
+
+/// Recovery must not turn an existing const-write error into a valid write.
+/// Check individual declarations before their kinds are joined: a mixed
+/// const/let destructuring group cannot preserve both kinds in one loop head.
+fn writes_consumed_const(stmts: &[Stmt], body_uses: &BindingUseIndex) -> bool {
+    stmts.iter().any(|stmt| {
+        let Stmt::Decl(Decl::Var(decl)) = stmt else {
+            return false;
+        };
+        decl.kind == VarDeclKind::Const
+            && decl.decls.iter().any(|declarator| {
+                let bindings: Vec<BindingKey> = find_pat_ids(&declarator.name);
+                bindings.iter().any(|id| body_uses.has_direct_write(id))
+            })
+    })
 }
 
 /// Join declaration kinds for the bindings that survive in a recovered loop
@@ -1965,61 +2159,424 @@ fn extract_loop_element(stmts: &[Stmt], access_obj: &Expr, idx_sym: &Atom) -> Op
         return None;
     }
 
-    let mut elems = Vec::new();
-    let mut bindings = Vec::new();
-    let mut kind = VarDeclKind::Const;
-    let mut consumed_stmts = 1;
-
-    for stmt in &stmts[1..] {
-        let Some(decl) = stmt_as_single_var_decl(stmt) else {
-            break;
-        };
-        let declarator = &decl.decls[0];
-        let expected_index = elems.len() as f64;
-        let Pat::Ident(binding) = &declarator.name else {
-            break;
-        };
-        let Some(init) = declarator.init.as_ref() else {
-            break;
-        };
-        if !is_numeric_index_access(init, &temp_ident.sym, expected_index) {
-            break;
-        }
-
-        elems.push(Some(Pat::Ident(BindingIdent {
-            id: binding.id.clone(),
-            type_ann: binding.type_ann.clone(),
-        })));
-        bindings.push(binding.id.clone());
-        kind = join_recovered_binding_kind(kind, decl.kind);
-        consumed_stmts += 1;
-    }
-
-    if elems.is_empty() {
+    let slots = consume_index_slots(&stmts[1..], temp_ident);
+    if let Some((pat, bindings, kind, slot_consumed)) = array_pat_from_index_slots(slots) {
         return Some(LoopElement {
-            pat: Pat::Ident(temp_binding.clone()),
-            bindings: vec![temp_binding.id.clone()],
-            kind: first_decl.kind,
-            temp_ident: None,
-            consumed_stmts,
+            pat,
+            bindings,
+            kind,
+            temp_ident: Some(temp_ident.clone()),
+            consumed_stmts: 1 + slot_consumed,
+            allow_ident_fallback: true,
+            temp_kind: first_decl.kind,
         });
     }
 
     Some(LoopElement {
-        pat: Pat::Array(ArrayPat {
-            span: DUMMY_SP,
-            elems,
-            optional: false,
-            type_ann: None,
-        }),
-        bindings,
-        kind,
-        temp_ident: Some(temp_ident.clone()),
-        consumed_stmts,
+        pat: Pat::Ident(temp_binding.clone()),
+        bindings: vec![temp_binding.id.clone()],
+        kind: first_decl.kind,
+        temp_ident: None,
+        consumed_stmts: 1,
+        allow_ident_fallback: true,
+        temp_kind: first_decl.kind,
     })
 }
 
-fn stmt_as_single_var_decl(stmt: &Stmt) -> Option<&VarDecl> {
+enum IndexSlot {
+    Binding { ident: Ident, kind: VarDeclKind },
+    Hole,
+}
+
+struct ConsumedIndexSlots {
+    elems: Vec<Option<Pat>>,
+    bindings: Vec<Ident>,
+    kind: VarDeclKind,
+    consumed: usize,
+}
+
+/// Consecutive `temp[0]`, `temp[1]`, … on one binding identity.
+/// `const x = temp[i]` becomes a pattern slot; a bare `temp[i];` is a hole.
+/// Stop at the first non-slot. Holes do not invent a name.
+fn consume_index_slots(stmts: &[Stmt], temp: &Ident) -> ConsumedIndexSlots {
+    let mut elems = Vec::new();
+    let mut bindings = Vec::new();
+    let mut kind = VarDeclKind::Const;
+    let mut consumed = 0;
+
+    for stmt in stmts {
+        let expected = elems.len() as f64;
+        let Some(slot) = take_index_slot(stmt, temp, expected) else {
+            break;
+        };
+        match slot {
+            IndexSlot::Binding {
+                ident,
+                kind: slot_kind,
+            } => {
+                elems.push(Some(Pat::Ident(BindingIdent {
+                    id: ident.clone(),
+                    // A declaration-level TypeScript annotation is not valid
+                    // on an individual ArrayPat element.
+                    type_ann: None,
+                })));
+                bindings.push(ident);
+                kind = join_recovered_binding_kind(kind, slot_kind);
+            }
+            IndexSlot::Hole => elems.push(None),
+        }
+        consumed += 1;
+    }
+
+    ConsumedIndexSlots {
+        elems,
+        bindings,
+        kind,
+        consumed,
+    }
+}
+
+fn array_pat_from_index_slots(
+    slots: ConsumedIndexSlots,
+) -> Option<(Pat, Vec<Ident>, VarDeclKind, usize)> {
+    if slots.elems.is_empty() || slots.bindings.is_empty() {
+        return None;
+    }
+    Some((
+        Pat::Array(ArrayPat {
+            span: DUMMY_SP,
+            elems: slots.elems,
+            optional: false,
+            type_ann: None,
+        }),
+        slots.bindings,
+        slots.kind,
+        slots.consumed,
+    ))
+}
+
+fn take_index_slot(stmt: &Stmt, temp: &Ident, expected: f64) -> Option<IndexSlot> {
+    if let Some(decl) = stmt_as_single_var_decl(stmt) {
+        let declarator = &decl.decls[0];
+        let Pat::Ident(binding) = &declarator.name else {
+            return None;
+        };
+        let init = declarator.init.as_ref()?;
+        if !is_numeric_index_access_key(init, temp, expected) {
+            return None;
+        }
+        return Some(IndexSlot::Binding {
+            ident: binding.id.clone(),
+            kind: decl.kind,
+        });
+    }
+
+    let Stmt::Expr(ExprStmt { expr, .. }) = stmt else {
+        return None;
+    };
+    if is_numeric_index_access_key(expr, temp, expected) {
+        return Some(IndexSlot::Hole);
+    }
+    None
+}
+
+/// Direct `eval` / `with` in `stmts` can observe `ident` by printed name.
+/// Unknown eval sources and any `with` fail closed; a known string blocks
+/// only when it mentions the binding (same contract as `dead_decls`).
+/// A lexical element lifted into the loop head is in TDZ while the iterable
+/// is evaluated, so `for (const e of e)` throws where the lowered loop read
+/// the enclosing `e`. Rename the lifted bindings that share a printed name
+/// with the iterable to a fresh name inside the loop. `var` is hoisted and
+/// already resolved to the same function-scoped binding, so it is left alone.
+/// Fails closed when direct `eval` or `with` in the body could observe the
+/// original name.
+fn rename_lifted_bindings_shadowing_iterable(
+    iterable: &Expr,
+    kind: VarDeclKind,
+    element: &mut LoopElement,
+    body: &mut [Stmt],
+) -> Option<()> {
+    if kind == VarDeclKind::Var {
+        return Some(());
+    }
+    let colliding: Vec<Ident> = element
+        .bindings
+        .iter()
+        .filter(|id| {
+            let names: HashSet<Atom> = [id.sym.clone()].into_iter().collect();
+            expr_observes_printed_names(iterable, &names)
+        })
+        .cloned()
+        .collect();
+    if colliding.is_empty() {
+        return Some(());
+    }
+    if colliding
+        .iter()
+        .any(|id| dynamic_scope_observes_binding(body, id))
+    {
+        return None;
+    }
+
+    let mut used = HashSet::default();
+    collect_printed_names(iterable, &mut used);
+    for stmt in body.iter() {
+        collect_printed_names(stmt, &mut used);
+    }
+    collect_printed_names(&element.pat, &mut used);
+    let renames: Vec<BindingRename> = colliding
+        .iter()
+        .map(|id| BindingRename {
+            old: (id.sym.clone(), id.ctxt),
+            new: fresh_printed_name(&id.sym, &mut used),
+        })
+        .collect();
+    rename_bindings(&mut element.pat, &renames);
+    for stmt in body.iter_mut() {
+        rename_bindings(stmt, &renames);
+    }
+    for binding in element.bindings.iter_mut() {
+        if let Some(rename) = renames
+            .iter()
+            .find(|rename| rename.old.0 == binding.sym && rename.old.1 == binding.ctxt)
+        {
+            binding.sym = rename.new.clone();
+        }
+    }
+    Some(())
+}
+
+fn collect_printed_names<N>(node: &N, names: &mut HashSet<Atom>)
+where
+    N: for<'a> VisitWith<PrintedNameCollector<'a>>,
+{
+    let mut collector = PrintedNameCollector { names };
+    node.visit_with(&mut collector);
+}
+
+struct PrintedNameCollector<'a> {
+    names: &'a mut HashSet<Atom>,
+}
+
+impl Visit for PrintedNameCollector<'_> {
+    fn visit_ident(&mut self, ident: &Ident) {
+        self.names.insert(ident.sym.clone());
+    }
+}
+
+fn fresh_printed_name(base: &Atom, used: &mut HashSet<Atom>) -> Atom {
+    for suffix in 1usize.. {
+        let candidate: Atom = format!("{base}_{suffix}").into();
+        if !used.contains(&candidate) {
+            used.insert(candidate.clone());
+            return candidate;
+        }
+    }
+    unreachable!("an unused suffix always exists")
+}
+
+fn dynamic_scope_observes_binding(stmts: &[Stmt], ident: &Ident) -> bool {
+    struct WithFinder {
+        found: bool,
+    }
+    impl Visit for WithFinder {
+        fn visit_with_stmt(&mut self, _: &swc_core::ecma::ast::WithStmt) {
+            self.found = true;
+        }
+        fn visit_stmt(&mut self, stmt: &Stmt) {
+            if !self.found {
+                stmt.visit_children_with(self);
+            }
+        }
+    }
+
+    let mut withs = WithFinder { found: false };
+    for stmt in stmts {
+        stmt.visit_with(&mut withs);
+        if withs.found {
+            return true;
+        }
+    }
+
+    let mut eval = DirectEvalAnalyzer::default();
+    for stmt in stmts {
+        stmt.visit_with(&mut eval);
+    }
+    eval.unknown_direct_eval
+        || eval
+            .known_direct_eval_sources
+            .iter()
+            .any(|source| js_source_mentions_binding(source, &ident.sym))
+}
+
+/// ArrayPat left is unsound when the original temp still escapes, a `var`
+/// temp is visible to module-level eval/`with`, or lifting the recovered
+/// bindings would put those names in TDZ while the iterable runs.
+fn array_pat_left_is_unsound(
+    helper_context: &ForOfHelperContext,
+    iterable: &Expr,
+    inside: &[Stmt],
+    temp: &Ident,
+    pat: &Pat,
+    lifted: &[Ident],
+    var_temp: bool,
+) -> bool {
+    helper_context.binding_is_used_outside(inside, temp)
+        || (var_temp && helper_context.dynamic_scope_can_observe_name(&temp.sym))
+        || (matches!(pat, Pat::Array(_)) && expr_observes_lifted_names(iterable, lifted))
+}
+
+fn expr_observes_lifted_names(expr: &Expr, lifted: &[Ident]) -> bool {
+    let names: HashSet<Atom> = lifted.iter().map(|id| id.sym.clone()).collect();
+    expr_observes_printed_names(expr, &names)
+}
+
+/// Ident fallback of a lexical temp puts that name in TDZ on the iterable.
+/// Unknown eval is treated the same. `var` is hoisted, so it is not TDZ.
+fn ident_fallback_tdz_in_iterable(iterable: &Expr, element: &LoopElement) -> bool {
+    if element.kind == VarDeclKind::Var {
+        return false;
+    }
+    let Pat::Ident(binding) = &element.pat else {
+        return false;
+    };
+    let names: HashSet<Atom> = [binding.id.sym.clone()].into_iter().collect();
+    expr_observes_printed_names(iterable, &names)
+}
+
+/// Lifting body bindings into the for-of head puts those names in TDZ while
+/// the iterable runs. Fail closed if the RHS already mentions a dropped or
+/// lifted printed name, or a direct eval/`with` that could.
+fn for_of_right_observes_fold_names(right: &Expr, dropped: &Ident, lifted: &[Ident]) -> bool {
+    let mut names: HashSet<Atom> = lifted.iter().map(|id| id.sym.clone()).collect();
+    names.insert(dropped.sym.clone());
+    expr_observes_printed_names(right, &names)
+}
+
+fn expr_observes_printed_names(expr: &Expr, names: &HashSet<Atom>) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+
+    struct Finder<'a> {
+        names: &'a HashSet<Atom>,
+        found: bool,
+    }
+    impl Visit for Finder<'_> {
+        fn visit_ident(&mut self, ident: &Ident) {
+            if !self.found && self.names.contains(&ident.sym) {
+                self.found = true;
+            }
+        }
+        fn visit_with_stmt(&mut self, _: &swc_core::ecma::ast::WithStmt) {
+            self.found = true;
+        }
+        fn visit_stmt(&mut self, stmt: &Stmt) {
+            if !self.found {
+                stmt.visit_children_with(self);
+            }
+        }
+    }
+
+    let mut finder = Finder {
+        names,
+        found: false,
+    };
+    expr.visit_with(&mut finder);
+    if finder.found {
+        return true;
+    }
+
+    let mut eval = DirectEvalAnalyzer::default();
+    expr.visit_with(&mut eval);
+    eval.unknown_direct_eval
+        || eval.known_direct_eval_sources.iter().any(|source| {
+            names
+                .iter()
+                .any(|name| js_source_mentions_binding(source, name))
+        })
+}
+
+fn try_fold_for_of_entry_slots(for_of: &mut ForOfStmt, helper_context: &ForOfHelperContext) {
+    let ForHead::VarDecl(decl) = &for_of.left else {
+        return;
+    };
+    if decl.decls.len() != 1 {
+        return;
+    }
+    let declarator = &decl.decls[0];
+    if declarator.init.is_some() {
+        return;
+    }
+    let Pat::Ident(binding) = &declarator.name else {
+        return;
+    };
+    let left_kind = decl.kind;
+    let temp = binding.id.clone();
+
+    let Stmt::Block(body) = &*for_of.body else {
+        return;
+    };
+    // Count only body uses as "inside". The iterable / after-loop reads of a
+    // function-scoped left binding are live and must keep the ident.
+    if helper_context.binding_is_used_outside(&body.stmts, &temp) {
+        return;
+    }
+    // `var` leaks past the loop. `with` / unknown direct eval anywhere in
+    // the module, or a known eval source that mentions the name, can still
+    // observe it after we drop the left ident.
+    if left_kind == VarDeclKind::Var && helper_context.dynamic_scope_can_observe_name(&temp.sym) {
+        return;
+    }
+    let slots = consume_index_slots(&body.stmts, &temp);
+    let Some((pat, bindings, slot_kind, consumed)) = array_pat_from_index_slots(slots) else {
+        return;
+    };
+    let remaining = body.stmts[consumed..].to_vec();
+    if remaining.iter().any(|stmt| stmt_uses_ident(stmt, &temp))
+        || dynamic_scope_observes_binding(&remaining, &temp)
+        || for_of_right_observes_fold_names(&for_of.right, &temp, &bindings)
+    {
+        return;
+    }
+
+    let body_uses = BindingUseIndex::collect_stmts(&remaining);
+    if writes_consumed_const(&body.stmts[..consumed], &body_uses) {
+        return;
+    }
+    let is_reassigned = bindings
+        .iter()
+        .any(|id| body_uses.has_direct_write(&id.to_id()));
+    let kind = if slot_kind == VarDeclKind::Var {
+        VarDeclKind::Var
+    } else if is_reassigned {
+        VarDeclKind::Let
+    } else {
+        slot_kind
+    };
+
+    let body_span = body.span;
+    let body_ctxt = body.ctxt;
+    for_of.left = ForHead::VarDecl(Box::new(VarDecl {
+        span: DUMMY_SP,
+        ctxt: Default::default(),
+        kind,
+        declare: false,
+        decls: vec![VarDeclarator {
+            span: DUMMY_SP,
+            name: pat,
+            init: None,
+            definite: false,
+        }],
+    }));
+    *for_of.body = Stmt::Block(BlockStmt {
+        span: body_span,
+        ctxt: body_ctxt,
+        stmts: remaining,
+    });
+}
+
+pub(super) fn stmt_as_single_var_decl(stmt: &Stmt) -> Option<&VarDecl> {
     let Stmt::Decl(Decl::Var(decl)) = stmt else {
         return None;
     };
@@ -2039,11 +2596,16 @@ fn is_index_access(expr: &Expr, obj_expr: &Expr, idx_sym: &Atom) -> bool {
     is_ident(&computed.expr, idx_sym)
 }
 
-fn is_numeric_index_access(expr: &Expr, obj_sym: &Atom, index: f64) -> bool {
-    let Expr::Member(MemberExpr { obj, prop, .. }) = expr else {
+fn is_numeric_index_access_key(expr: &Expr, obj: &Ident, index: f64) -> bool {
+    let Expr::Member(MemberExpr {
+        obj: member_obj,
+        prop,
+        ..
+    }) = strip_parens(expr)
+    else {
         return false;
     };
-    if !is_ident(obj, obj_sym) {
+    if !is_ident_key(member_obj, obj) {
         return false;
     }
     let MemberProp::Computed(computed) = prop else {
@@ -2060,7 +2622,7 @@ fn is_ident(expr: &Expr, sym: &Atom) -> bool {
     matches!(expr, Expr::Ident(id) if &id.sym == sym)
 }
 
-fn is_ident_key(expr: &Expr, ident: &Ident) -> bool {
+pub(super) fn is_ident_key(expr: &Expr, ident: &Ident) -> bool {
     matches!(expr, Expr::Ident(id) if id.sym == ident.sym && id.ctxt == ident.ctxt)
 }
 
@@ -2071,46 +2633,8 @@ fn same_ident_expr(left: &Expr, right: &Expr) -> bool {
     }
 }
 
-/// Check if a statement assigns to a specific binding (by sym + ctxt).
-fn stmt_assigns_ident(stmt: &Stmt, target: &Ident) -> bool {
-    use swc_core::ecma::ast::{AssignTarget, SimpleAssignTarget};
-    use swc_core::ecma::visit::Visit;
-
-    struct AssignFinder {
-        sym: Atom,
-        ctxt: SyntaxContext,
-        found: bool,
-    }
-
-    impl Visit for AssignFinder {
-        fn visit_assign_expr(&mut self, assign: &swc_core::ecma::ast::AssignExpr) {
-            if let AssignTarget::Simple(SimpleAssignTarget::Ident(id)) = &assign.left {
-                if id.sym == self.sym && id.ctxt == self.ctxt {
-                    self.found = true;
-                }
-            }
-        }
-
-        fn visit_update_expr(&mut self, update: &UpdateExpr) {
-            if let Expr::Ident(id) = &*update.arg {
-                if id.sym == self.sym && id.ctxt == self.ctxt {
-                    self.found = true;
-                }
-            }
-        }
-    }
-
-    let mut finder = AssignFinder {
-        sym: target.sym.clone(),
-        ctxt: target.ctxt,
-        found: false,
-    };
-    finder.visit_stmt(stmt);
-    finder.found
-}
-
 /// Check if a statement references a specific binding (by sym + ctxt).
-fn stmt_uses_ident(stmt: &Stmt, target: &Ident) -> bool {
+pub(super) fn stmt_uses_ident(stmt: &Stmt, target: &Ident) -> bool {
     use swc_core::ecma::visit::Visit;
 
     struct IdentFinder {
@@ -2137,7 +2661,7 @@ fn stmt_uses_ident(stmt: &Stmt, target: &Ident) -> bool {
 }
 
 /// Check if a statement references the exact identifier binding.
-fn stmt_uses_ident_key(stmt: &Stmt, ident: &Ident) -> bool {
+pub(super) fn stmt_uses_ident_key(stmt: &Stmt, ident: &Ident) -> bool {
     use swc_core::ecma::visit::Visit;
 
     struct IdentFinder {

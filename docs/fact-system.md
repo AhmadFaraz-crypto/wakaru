@@ -1,6 +1,7 @@
 # Cross-Module Fact System
 
-See also: [Architecture](architecture.md) for the multi-module pipeline design,
+See also: [Architecture](architecture.md) for the pipeline overview,
+[Unpacking](unpacking.md) for detector and extraction boundaries,
 [Rule dependency inventory](rule-dependency-inventory.md) for where fact-reading
 rules fit in the pipeline.
 
@@ -36,7 +37,7 @@ merge step.
 ## Shape
 
 Multi-module unpack runs in two parallel phases with a single barrier between
-them (`crates/core/src/driver/unpack.rs::unpack_multi_module`):
+them (`crates/core/src/driver/unpack/phases.rs`):
 
 ```
 Phase 1 (per module, parallel):
@@ -46,9 +47,11 @@ Phase 1 (per module, parallel):
     rule range through UnEsm
     clone barrier AST → recover webpack factory IIFE ESM shapes
     collect_module_facts(&facts_clone)                ← pure AST → facts
+    collect_import_call_edges(&barrier_ast)           ← imports still under [[Call]]
     retain original barrier AST + Globals + unresolved mark
 
-──── barrier: ModuleFactsMap assembled from all modules ────
+──── barrier: ModuleFactsMap assembled from all modules;
+     CommonJsDefaultObjectCompositionPlan and CallRequiredPlan built ────
 
 Phase 2 (per module, parallel):
     resume retained barrier AST
@@ -59,8 +62,17 @@ Phase 2 (per module, parallel):
     run_namespace_decomposition(&mut module, facts)  ← reads cross-module facts
     downgrade_unused_synthetic_imports(&mut module)  ← preserve require effects
     registry rule range resuming after UnEsm, through UnReturn
+      (UnEs6Class / UnPrototypeClass read this module's CallRequiredPlan pins)
     targeted late cleanup/recovery
 ```
+
+Both phases hand modules to the Rayon pool largest-first by source length
+(`driver/unpack/schedule.rs`). Per-module cost is heavily skewed, and Rayon's
+default range splitting can leave the largest module to start after most
+workers have gone idle, so it becomes the critical path of the phase.
+Dispatching in descending size order is the longest-processing-time-first
+heuristic; results are placed back in input order, so output never depends on
+scheduling.
 
 The normal no-source-map path runs the through-`UnEsm` range once. The retained
 AST crosses the barrier together with the exact `Globals` and unresolved mark
@@ -89,9 +101,12 @@ distinguishable from an authored ESM dependency downstream.
 - `ImportFact { local, source, kind: Default | Namespace | Named(imported) }`
 - `ExportFact { exported, local, kind: Default | Named }`
 - `HelperExportFact { exported, local, kind }`
+- `ReexportFact { exported, imported, source }` — `export { A as B } from`
+- `ImportCallEdge { source, imported, consumed_by_exports }`
 - `ModuleFacts { imports, exports, helper_exports,
   commonjs_default_object, commonjs_default_attached_properties,
-  has_export_all, ts_helper_exports,
+  has_export_all, export_star_sources, reexports, import_call_edges,
+  default_object_ident_properties, ts_helper_exports,
   ts_helper_namespace_factory_exports, passthrough_target }`
 - `ModuleFactsMap` — keyed by normalized module specifier
   (handles `./foo`, `foo`, `foo.js` variants)
@@ -148,6 +163,16 @@ exactly one rewrite must match, and no unresolved CommonJS runtime references
 may remain. Synthetic children from recursive splitting do not inherit the
 proof; `--raw` remains detector passthrough.
 
+For a module consisting solely of a synchronous IIFE called with `exports`,
+normal processing also restores the runtime-created object, passes it to the
+original IIFE, and exports that same mutable object as the CommonJS default.
+The argument must be the entire free CommonJS runtime surface: any other
+`module`, `exports`, or `require` reference, direct eval, or `with` blocks this
+recovery. The IIFE body and its object aliases stay intact; no named exports
+are guessed. Async/generator calls, spread or extra arguments, and conditional
+or deferred calls are excluded. This uses the same detector-owned boundary and
+does not change raw extraction.
+
 That boundary also restores two exact CSS-loader runtime values without
 attempting CSS source recovery. A three- or four-field CSS list tuple whose
 first item is free `module.id` receives the numeric value preserved from its
@@ -172,6 +197,27 @@ expose the detector's extracted factory body unchanged.
 Helper export facts are still pure AST facts. They only record helper identity
 when the exported local binding matches a known helper body shape or runtime
 export shape after Stage 2. They do not speculate from consumer-side usage.
+
+### Same-module recovery boundary
+
+UnEsm also recovers narrowly proven same-module CommonJS reads: a later
+`module.exports` read may use the sole stable default binding, and a later
+`exports.name` read may use a uniquely assigned stable export binding. Direct
+method calls additionally require a receiver-insensitive function. Earlier
+`undefined` export declarations are permitted; multiple value writes, later
+resets, computed writes, value escapes, receiver-sensitive calls, early
+reads, direct eval, and hoisted function declarations remain fail closed.
+
+When a literal unresolved `require()` resolves to the current output module,
+`UnEsm` verifies the recovered self-import against that same module's export
+surface. A synthesized default self-import with no default export rolls the
+whole rule back for that module, keeping its CommonJS boundary visible.
+A matching default export continues through ordinary recovery. A named-only
+self surface may use the existing conservative provider-namespace proof, but
+only when every observed use supports namespace semantics; whole-value,
+mutable, computed, escaping, or otherwise incompatible reads still roll
+back. This does not guess a namespace representation for CommonJS partial
+exports.
 
 Stable same-module `module.exports` / `exports.name` read recovery is not a
 cross-module fact. `UnEsm` proves and consumes that identity within one resolved
@@ -207,6 +253,33 @@ default-bearing surfaces all fail closed. Neither proof creates a default-object
 fact available to consumers.
 
 ## Rules that read facts
+
+- **`UnEs6Class` / `UnPrototypeClass` cross-file `[[Call]]` pins** — a module
+  that still calls an imported constructor with `.call` / `.apply` (including
+  `F.call.apply(G, …)`, whose callee is `G`) needs that export to stay an
+  ordinary function. Phase 1 records these import edges on the barrier AST,
+  before late ESM recovery, because that is the AST class recovery resumes
+  from. `CallRequiredPlan` resolves each edge to its defining export at the
+  barrier: named-import renames, `export { A as B } from`, one `export *`,
+  `export { t as Foo }`, `export default` IIFE returns, and
+  `export default { Foo: local }` members are followed. Cycles, several
+  `export *` sources, computed members, local aliases of an import, external
+  specifiers, and a relative specifier that does not resolve from the
+  importing file do not pin. Phase 2 seeds the pinned bindings into
+  `CallabilityIndex` before alias propagation, so the constructor an exported
+  IIFE returns stays a function too. Single-file `decompile()` has no plan.
+  An edge whose call sits in an `extends` IIFE constructor is a prediction:
+  Phase 1 runs the `UnEs6Class` matcher on the barrier AST, and when that
+  subclass would become a class the call becomes `super()`, so it pins its base
+  only if the subclass export is itself pinned. This is the one fact here that
+  describes a later rewrite instead of the barrier AST. A misprediction that
+  claims conversion leaves the original bug in place (base becomes a class, the
+  consumer keeps `.call`). Keep the probe (`super_params_consumed_by_class_recovery`)
+  in step with `UnEs6Class` and the spread rules that run before it.
+  `Minimal` makes no prediction: every cross-file `.call` / `.apply` target
+  stays a function. At `Standard` and above, the plan remembers definitions it
+  left unpinned only on a prediction; after Phase 2, a module that still calls
+  one of them gets a `cross_module_class_call` warning.
 
 - **`commonjs_default_object_composition`** — builds a monotone fixed point at
   the barrier. A provider seeds it only when the raw assignment is its sole
@@ -303,9 +376,12 @@ normal constructor.
   rewrite replaces `R.foo` with a reference to an *existing* local, stamp the
   existing local's ctxt on the new ident — otherwise later `(sym, ctxt)` passes
   (e.g. `UnImportRename` Stage 6) will rename the binding + original usages but
-  miss yours, leaving an undefined reference. For newly-created import
-  specifiers, `SyntaxContext::empty()` on both binding and usage is fine (they
-  match each other and the resolver isn't re-run).
+  miss yours, leaving an undefined reference. A newly created binding (an
+  import local, an alias) gets its own context from
+  `decl_utils::fresh_binding_ident`; clone that ident for its usages so binding
+  and references share it. The resolver isn't re-run, so a context that is
+  merely equal on both sides also matches, but every empty-context binding in
+  the module then shares one identity.
 
 ## Non-goals
 
@@ -313,7 +389,8 @@ normal constructor.
 - No multi-round merging.
 - No speculative facts ("this might be an X"). A fact holds iff the normalized
   post-Stage-2 AST says it does, or the narrow pre-`UnEsm` collector proves the
-  exact raw CommonJS assignment shape.
+  exact raw CommonJS assignment shape. The one bounded exception is the
+  class-recovery prediction on `ImportCallEdge` described above.
 
 Rules that need heavier semantic conclusions (e.g. "this namespace projection
 is always equivalent to a direct import binding") should derive them inside the

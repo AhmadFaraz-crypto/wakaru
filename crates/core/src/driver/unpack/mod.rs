@@ -1,5 +1,5 @@
+use crate::collections::{HashMap, HashSet};
 use anyhow::{anyhow, Result};
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use swc_core::common::{sync::Lrc, Mark, SourceMap, GLOBALS};
@@ -21,14 +21,16 @@ use crate::rules::{
 };
 use crate::unpacker::{
     scope_hoist, try_prepare_bundle, try_prepare_source, BundleFormat, DetectedBundle,
-    PreparedModuleAst, PreparedSource, UnpackResult, UnpackedModule,
+    PreparedModuleAst, PreparedSource, SourcePositions, UnpackResult, UnpackedModule,
 };
 
 mod dead_module;
 mod filename_recovery;
 mod merge;
 mod phases;
+mod schedule;
 mod scope_split;
+mod source_index;
 mod webpack_commonjs_runtime;
 
 use merge::{
@@ -91,6 +93,8 @@ pub struct PreparedUnpackInput {
     scope_hoisted: Option<UnpackResult>,
     plain_prepared: Option<PreparedModuleAst>,
     public_path_candidate: bool,
+    /// Present only when output source maps were requested.
+    origin: Option<Arc<source_index::InputOrigin>>,
 }
 
 impl PreparedUnpackInput {
@@ -127,6 +131,7 @@ pub fn prepare_unpack_input(
         } else {
             ScopeHoistPolicy::Disabled
         },
+        false,
     )
 }
 
@@ -135,8 +140,12 @@ pub fn prepare_unpack_input_with_policy(
     source: String,
     prepare_plain_ast: bool,
     scope_hoist_policy: ScopeHoistPolicy,
+    output_source_maps: bool,
 ) -> DriverResult<PreparedUnpackInput> {
-    let prepared = match try_prepare_source(&source, &filename, prepare_plain_ast) {
+    let positions = SourcePositions::from_output_source_maps(output_source_maps);
+    let origin = output_source_maps
+        .then(|| Arc::new(source_index::InputOrigin::new(filename.clone(), &source)));
+    let prepared = match try_prepare_source(&source, &filename, prepare_plain_ast, positions) {
         Ok(prepared) => prepared,
         Err(bundle_parse_error) => {
             // Bundle detection deliberately uses the ES/JSX grammar. Preserve
@@ -156,6 +165,7 @@ pub fn prepare_unpack_input_with_policy(
                         scope_hoisted: None,
                         plain_prepared: None,
                         public_path_candidate: false,
+                        origin,
                     });
                 }
                 Err(input_parse_error) => {
@@ -195,6 +205,7 @@ pub fn prepare_unpack_input_with_policy(
                 scope_hoisted: None,
                 plain_prepared: fallback_prepared,
                 public_path_candidate,
+                origin,
             });
         }
         PreparedSource::Plain(prepared) => prepared,
@@ -222,6 +233,7 @@ pub fn prepare_unpack_input_with_policy(
             &source,
             scope_hoist_policy.render_mode(),
             scope_hoist::ScopeHoistSource::DirectAsset,
+            positions,
         )
         .filter(|result| result.modules.len() > 1)
         {
@@ -243,6 +255,7 @@ pub fn prepare_unpack_input_with_policy(
                 scope_hoisted: Some(result),
                 plain_prepared: fallback_prepared,
                 public_path_candidate: true,
+                origin,
             });
         }
     }
@@ -255,6 +268,7 @@ pub fn prepare_unpack_input_with_policy(
         scope_hoisted: None,
         plain_prepared,
         public_path_candidate: false,
+        origin,
     })
 }
 
@@ -286,7 +300,7 @@ fn plan_public_paths(
     }
 
     let absolute_root = common_absolute_input_parent(inputs);
-    let mut claimed = HashSet::new();
+    let mut claimed = HashSet::default();
     // Every physical ESM identity claims its public path before generated
     // names are assigned. This includes reusable facades and plain inputs;
     // script-loaded bundle inputs have no relative-ESM identity in output.
@@ -376,6 +390,8 @@ fn public_boundary_fallback_module(
             inspection_context_ranges: Vec::new(),
             source_input: String::new(),
             generated_source_map: Vec::new(),
+            verbatim_source_offset: Some(0),
+            mapped_in_every_mode: false,
             code: source,
         },
         prepared,
@@ -416,6 +432,7 @@ pub fn unpack_prepared_inputs_with_policy(
     let mut modules = Vec::new();
     let mut detected_formats = Vec::new();
     let mut preparation_warnings = Vec::new();
+    let mut origins = Vec::with_capacity(inputs.len());
     for (input_index, input) in inputs.into_iter().enumerate() {
         let input_id = PreparedInputId::from_index(input_index);
         let PreparedUnpackInput {
@@ -426,7 +443,9 @@ pub fn unpack_prepared_inputs_with_policy(
             scope_hoisted,
             plain_prepared,
             public_path_candidate: _,
+            origin,
         } = input;
+        origins.push(origin);
         match detection {
             PreparedInputDetection::Bundle(format) => {
                 if !detected_formats.contains(&format) {
@@ -472,7 +491,7 @@ pub fn unpack_prepared_inputs_with_policy(
                             .map(|(module, _)| (module.id.clone(), module.filename.clone()))
                             .collect::<HashSet<_>>()
                     } else {
-                        HashSet::new()
+                        HashSet::default()
                     };
                 // Keep this proof on modules whose original detector identity
                 // survives optional recursive splitting. Synthetic children do
@@ -486,7 +505,7 @@ pub fn unpack_prepared_inputs_with_policy(
                             .map(|module| (module.id.clone(), module.filename.clone()))
                             .collect::<HashSet<_>>()
                     } else {
-                        HashSet::new()
+                        HashSet::default()
                     };
                 let webpack_numeric_module_ids = detected
                     .result
@@ -515,6 +534,7 @@ pub fn unpack_prepared_inputs_with_policy(
                         result,
                         scope_hoist_policy.recursive(),
                         scope_hoist_policy.render_mode(),
+                        SourcePositions::Discard,
                     ))
                 } else {
                     maybe_split_detected_bundle(
@@ -525,7 +545,6 @@ pub fn unpack_prepared_inputs_with_policy(
                     )?
                 };
                 let (result, prepared, module_failures) = detected.into_parts();
-                let has_module_failures = !module_failures.is_empty();
                 let report_import_cycle_warnings = result.report_import_cycle_warnings;
                 let external_consumers = result.external_consumers;
                 let input_group = input_group_for_filename(&filename);
@@ -559,11 +578,6 @@ pub fn unpack_prepared_inputs_with_policy(
                             .with_webpack_commonjs_runtime(webpack_commonjs_runtime)
                             .with_webpack_numeric_module_id(webpack_numeric_module_id)
                             .with_webpack_legacy_module_i(webpack_legacy_module_i)
-                            // Intra-container edges were already rewritten by
-                            // the detector. If any local ID is opaque, do not
-                            // let a same-numbered module from another input
-                            // capture the deliberately unresolved call.
-                            .with_cross_chunk_rewrite(!has_module_failures)
                             .with_detector_failure(detector_failure)
                             .with_external_consumers(external_consumers)
                         }),
@@ -622,6 +636,8 @@ pub fn unpack_prepared_inputs_with_policy(
                         inspection_context_ranges: Vec::new(),
                         source_input: String::new(),
                         generated_source_map: Vec::new(),
+                        verbatim_source_offset: Some(0),
+                        mapped_in_every_mode: false,
                         code: source,
                     },
                     (!raw).then_some(plain_prepared).flatten(),
@@ -638,7 +654,7 @@ pub fn unpack_prepared_inputs_with_policy(
     let mut output = if raw {
         emit_raw_modules_with_numeric_rewrites(modules, numeric_rewrite_plan)?
     } else {
-        unpack_multi_module_with_plan(modules, numeric_rewrite_plan, options.clone())?
+        unpack_multi_module_with_plan(modules, numeric_rewrite_plan, options.clone(), &origins)?
     };
     output.warnings.splice(0..0, preparation_warnings);
     output.detected_formats = detected_formats;
@@ -711,8 +727,18 @@ fn unpack_legacy_inputs(
     let prepared = inputs
         .into_iter()
         .map(|input| {
-            prepare_unpack_input(input.filename, input.source, options.heuristic_split, !raw)
-                .map_err(DriverError::into_inner)
+            prepare_unpack_input_with_policy(
+                input.filename,
+                input.source,
+                !raw,
+                if options.heuristic_split {
+                    ScopeHoistPolicy::Fallback
+                } else {
+                    ScopeHoistPolicy::Disabled
+                },
+                options.emit_source_map && !raw,
+            )
+            .map_err(DriverError::into_inner)
         })
         .collect::<Result<Vec<_>>>()?;
     let plain_single = single_input && prepared[0].detection() == PreparedInputDetection::Plain;
@@ -788,7 +814,7 @@ pub(super) fn detect_bundle(source: &str, filename: &str) -> Result<Option<Detec
     let span = tracing::info_span!("detect_bundle");
     let _enter = span.enter();
 
-    match try_prepare_bundle(source) {
+    match try_prepare_bundle(source, SourcePositions::Discard) {
         Ok(result) => Ok(result),
         Err(bundle_parse_error) => {
             // Bundle detection intentionally parses only ES/JSX. Preserve the
@@ -843,7 +869,7 @@ fn recover_late_esm_from_factory_iifes(
     current_filename: &str,
     options: LateEsmRecoveryOptions,
 ) {
-    module.visit_mut_with(&mut ArrowFunction);
+    module.visit_mut_with(&mut ArrowFunction::new(unresolved_mark));
     module.visit_mut_with(&mut ArrowReturn);
     module.visit_mut_with(&mut UnIife::new(level));
     let pipeline_options = RulePipelineOptions::between("UnCurlyBraces", "UnEsm")
@@ -854,7 +880,7 @@ fn recover_late_esm_from_factory_iifes(
         module.visit_mut_with(&mut SmartRename::new(unresolved_mark));
     }
     if options.export_rename {
-        module.visit_mut_with(&mut UnExportRename);
+        module.visit_mut_with(&mut UnExportRename::new(unresolved_mark));
     }
     module.visit_mut_with(&mut ArrowReturn);
 }
@@ -895,6 +921,7 @@ fn maybe_split_detected_bundle(
             true,
             render_mode,
             &excluded,
+            SourcePositions::from_output_source_maps(materialize),
         );
         detected.prepared = std::iter::repeat_with(|| None)
             .take(detected.result.modules.len())

@@ -1,15 +1,17 @@
+use crate::collections::{HashMap, HashSet};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use swc_core::atoms::Atom;
 use swc_core::common::{Mark, DUMMY_SP};
 use swc_core::ecma::ast::{
-    ArrayPat, ArrowExpr, ArrowFunctionBody, AssignPatProp, CallExpr, Callee, ClassDecl, ClassExpr,
-    Decl, Expr, FnDecl, FnExpr, Function, GetterProp, Ident, ImportDecl, ImportSpecifier, JSXAttr,
-    JSXAttrName, JSXAttrOrSpread, JSXAttrValue, JSXElementName, JSXExpr, JSXExprContainer,
+    ArrayPat, ArrowExpr, ArrowFunctionBody, AssignPatProp, BindingIdent, BlockStmt, CallExpr,
+    Callee, Class, ClassDecl, ClassExpr, Constructor, Decl, Expr, FnDecl, FnExpr, ForHead,
+    ForInStmt, ForOfStmt, ForStmt, Function, GetterProp, Ident, ImportDecl, ImportSpecifier,
+    JSXAttr, JSXAttrName, JSXAttrOrSpread, JSXAttrValue, JSXElementName, JSXExpr, JSXExprContainer,
     JSXMemberExpr, JSXObject, KeyValuePatProp, Lit, MemberExpr, MemberProp, Module, ModuleDecl,
-    ModuleItem, ObjectPat, ObjectPatProp, Param, Pat, Prop, PropName, Stmt, VarDecl, VarDeclKind,
+    ModuleItem, ObjectPat, ObjectPatProp, ParamOrTsParamProp, Pat, Prop, PropName, Stmt,
+    SwitchStmt, VarDecl, VarDeclKind, VarDeclOrExpr,
 };
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
@@ -17,12 +19,17 @@ use crate::js_names::{
     is_likely_generated_alias, is_reserved_binding_name, to_valid_identifier_name,
 };
 
+use super::decl_utils::{collect_pat_names, collect_var_decl_names};
+use super::eval_utils::{
+    has_dynamic_scope_construct, js_source_mentions_binding, module_has_with_stmt,
+    DirectEvalAnalyzer,
+};
 use super::expr_utils::is_unresolved_ident;
 use super::extract_inlined_function::SharedExtractedFunctionNames;
 use super::helper_matcher::static_member_prop_name;
 use super::rename_utils::{
-    collect_exported_binding_ids, collect_module_names, rename_bindings, rename_bindings_in_module,
-    starts_with_lowercase, BindingId, BindingRename, RenameShadowIndex,
+    collect_exported_binding_ids, collect_jsx_tag_bindings, collect_module_names, rename_bindings,
+    rename_bindings_in_module, starts_with_lowercase, BindingId, BindingRename, RenameShadowIndex,
 };
 use super::ObjShorthand;
 
@@ -36,8 +43,8 @@ impl SmartRename {
     pub fn new(unresolved_mark: Mark) -> Self {
         Self {
             unresolved_mark,
-            pending_value_position_names: HashMap::new(),
-            extracted_function_names: Rc::new(RefCell::new(HashMap::new())),
+            pending_value_position_names: HashMap::default(),
+            extracted_function_names: Rc::new(RefCell::new(HashMap::default())),
         }
     }
 }
@@ -58,6 +65,7 @@ impl VisitMut for SmartRename {
         );
         destructuring_rename_module_with(module, &mut cached_names, &exported_bindings);
         member_init_rename_module_with(module, &mut cached_names, &exported_bindings);
+        import_snapshot_alias_rename_module(module, &mut cached_names);
         symbol_for_rename_module_with(
             module,
             &mut cached_names,
@@ -70,7 +78,9 @@ impl VisitMut for SmartRename {
         module.visit_mut_children_with(self);
         // Runs once at the module level; uses (sym, ctxt) matching so nested
         // bindings are classified correctly without per-scope recursion.
-        value_position_rename_module(module);
+        let value_named = value_position_rename_module(module);
+        call_site_param_rename_module(module, &value_named);
+        role_rename_module(module, self.unresolved_mark);
         jsx_component_alias_rename_module(module, &exported_bindings);
         self.pending_value_position_names = previous_pending_names;
     }
@@ -81,6 +91,11 @@ impl VisitMut for SmartRename {
         member_init_rename_function(func);
         symbol_for_rename_function(func, self.unresolved_mark);
         func.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_constructor(&mut self, ctor: &mut Constructor) {
+        destructuring_rename_constructor(ctor);
+        ctor.visit_mut_children_with(self);
     }
 
     fn visit_mut_arrow_expr(&mut self, arrow: &mut ArrowExpr) {
@@ -114,7 +129,7 @@ impl SmartRenameSecondPass {
     ) -> Self {
         Self {
             unresolved_mark,
-            pending_value_position_names: HashMap::new(),
+            pending_value_position_names: HashMap::default(),
             extracted_function_names,
         }
     }
@@ -141,6 +156,11 @@ impl VisitMut for SmartRenameSecondPass {
         member_init_rename_function(func);
         symbol_for_rename_function(func, self.unresolved_mark);
         func.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_constructor(&mut self, ctor: &mut Constructor) {
+        destructuring_rename_constructor(ctor);
+        ctor.visit_mut_children_with(self);
     }
 
     fn visit_mut_arrow_expr(&mut self, arrow: &mut ArrowExpr) {
@@ -626,56 +646,211 @@ fn lower_first(input: &str) -> String {
 // Destructuring shorthand renames
 // ============================================================
 
+/// Whether `pat` holds a short object-pattern alias, including inside a
+/// defaulted pattern (`{ a: b } = {}`), an array pattern (`[{ a: b }]`), or a
+/// nested object pattern (`{ a: { b: c } }`).
 fn has_short_obj_pat_alias(pat: &Pat) -> bool {
-    let Pat::Object(obj_pat) = pat else {
-        return false;
-    };
-    obj_pat.props.iter().any(|prop| match prop {
-        ObjectPatProp::KeyValue(kv) => extract_binding_from_pat(&kv.value)
-            .is_some_and(|(sym, _)| is_likely_generated_alias(&sym)),
-        ObjectPatProp::Rest(rest) => extract_binding_from_pat(&rest.arg)
-            .is_some_and(|(sym, _)| is_likely_generated_alias(&sym)),
+    match pat {
+        Pat::Object(obj_pat) => obj_pat.props.iter().any(|prop| match prop {
+            ObjectPatProp::KeyValue(kv) => {
+                has_short_obj_pat_alias(&kv.value)
+                    || extract_binding_from_pat(&kv.value)
+                        .is_some_and(|(sym, _)| is_likely_generated_alias(&sym))
+            }
+            ObjectPatProp::Rest(rest) => extract_binding_from_pat(&rest.arg)
+                .is_some_and(|(sym, _)| is_likely_generated_alias(&sym)),
+            ObjectPatProp::Assign(_) => false,
+        }),
+        Pat::Array(array_pat) => array_pat
+            .elems
+            .iter()
+            .flatten()
+            .any(has_short_obj_pat_alias),
+        Pat::Assign(assign_pat) => has_short_obj_pat_alias(&assign_pat.left),
         _ => false,
-    })
+    }
 }
 
-fn has_destructuring_candidates_in_params(params: &[Param]) -> bool {
-    params.iter().any(|p| has_short_obj_pat_alias(&p.pat))
-}
-
+/// Whether any declaration in `stmts` — at the top level, in a nested block,
+/// or in a `for` head — has a short destructuring alias. Nested functions
+/// and classes are skipped; their own visit handles them.
 fn has_destructuring_candidates_in_stmts(stmts: &[Stmt]) -> bool {
-    stmts.iter().any(|stmt| {
-        let Stmt::Decl(Decl::Var(var)) = stmt else {
-            return false;
-        };
-        var.decls
+    let mut finder = ObjPatAliasFinder::default();
+    stmts.visit_with(&mut finder);
+    finder.found
+}
+
+#[derive(Default)]
+struct ObjPatAliasFinder {
+    found: bool,
+}
+
+impl Visit for ObjPatAliasFinder {
+    fn visit_function(&mut self, _: &Function) {}
+    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+    fn visit_class(&mut self, _: &Class) {}
+
+    fn visit_var_decl(&mut self, var: &VarDecl) {
+        if var
+            .decls
             .iter()
             .any(|decl| has_short_obj_pat_alias(&decl.name))
+        {
+            self.found = true;
+        }
+    }
+}
+
+fn direct_var_decls(stmts: &[Stmt]) -> impl Iterator<Item = &VarDecl> {
+    stmts.iter().filter_map(|stmt| match stmt {
+        Stmt::Decl(Decl::Var(var)) => Some(&**var),
+        _ => None,
     })
+}
+
+/// Collects destructuring renames for declarations below the top level of a
+/// function or module body: nested blocks (`if`/loop/`try`/`switch` bodies)
+/// and `for` heads. The caller handles top-level declarations first and
+/// passes their renames in; nested functions and classes are skipped.
+///
+/// A block-scoped binding can only capture names used inside its own scope,
+/// so its conflict set is the names in that scope plus every new name visible
+/// there: the caller's renames, enclosing scopes' renames, and nested `var`
+/// renames. Disjoint blocks can therefore reuse the same name. A nested `var`
+/// is function-scoped and checks the function-wide set instead. Every chosen
+/// name joins the function-wide set, so a later `var` avoids it too.
+struct NestedObjPatRenameCollector<'a> {
+    function_names: &'a mut HashSet<Atom>,
+    renames: &'a mut Vec<BindingRename>,
+    /// New names visible in the current scope; truncated on scope exit.
+    visible: Vec<Atom>,
+    /// New names of nested `var` renames; visible everywhere.
+    var_names: Vec<Atom>,
+}
+
+impl<'a> NestedObjPatRenameCollector<'a> {
+    fn new(function_names: &'a mut HashSet<Atom>, renames: &'a mut Vec<BindingRename>) -> Self {
+        for rename in renames.iter() {
+            function_names.insert(rename.new.clone());
+        }
+        let visible = renames.iter().map(|rename| rename.new.clone()).collect();
+        Self {
+            function_names,
+            renames,
+            visible,
+            var_names: Vec::new(),
+        }
+    }
+
+    fn collect_scope<'d>(
+        &mut self,
+        decls: impl Iterator<Item = &'d VarDecl>,
+        scope_names: impl FnOnce() -> HashSet<Atom>,
+    ) {
+        let mut block_scoped = Vec::new();
+        for var in decls {
+            if !var
+                .decls
+                .iter()
+                .any(|decl| has_short_obj_pat_alias(&decl.name))
+            {
+                continue;
+            }
+            if var.kind != VarDeclKind::Var {
+                block_scoped.push(var);
+                continue;
+            }
+            let start = self.renames.len();
+            for decl in &var.decls {
+                collect_obj_pat_renames_from_pat(&decl.name, self.renames, self.function_names);
+            }
+            self.var_names.extend(
+                self.renames[start..]
+                    .iter()
+                    .map(|rename| rename.new.clone()),
+            );
+        }
+        if block_scoped.is_empty() {
+            return;
+        }
+        let mut used = scope_names();
+        used.extend(self.visible.iter().cloned());
+        used.extend(self.var_names.iter().cloned());
+        let start = self.renames.len();
+        for var in block_scoped {
+            for decl in &var.decls {
+                collect_obj_pat_renames_from_pat(&decl.name, self.renames, &mut used);
+            }
+        }
+        for rename in &self.renames[start..] {
+            self.function_names.insert(rename.new.clone());
+            self.visible.push(rename.new.clone());
+        }
+    }
+}
+
+fn names_in<N: VisitWith<NameCollector> + ?Sized>(node: &N) -> HashSet<Atom> {
+    let mut collector = NameCollector::default();
+    node.visit_with(&mut collector);
+    collector.names
+}
+
+impl Visit for NestedObjPatRenameCollector<'_> {
+    fn visit_function(&mut self, _: &Function) {}
+    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+    fn visit_class(&mut self, _: &Class) {}
+
+    fn visit_block_stmt(&mut self, block: &BlockStmt) {
+        let mark = self.visible.len();
+        self.collect_scope(direct_var_decls(&block.stmts), || names_in(block));
+        block.visit_children_with(self);
+        self.visible.truncate(mark);
+    }
+
+    fn visit_switch_stmt(&mut self, switch: &SwitchStmt) {
+        let mark = self.visible.len();
+        let decls = switch
+            .cases
+            .iter()
+            .flat_map(|case| direct_var_decls(&case.cons));
+        self.collect_scope(decls, || names_in(switch));
+        switch.visit_children_with(self);
+        self.visible.truncate(mark);
+    }
+
+    fn visit_for_stmt(&mut self, for_stmt: &ForStmt) {
+        let mark = self.visible.len();
+        if let Some(VarDeclOrExpr::VarDecl(var)) = &for_stmt.init {
+            self.collect_scope(std::iter::once(&**var), || names_in(for_stmt));
+        }
+        for_stmt.visit_children_with(self);
+        self.visible.truncate(mark);
+    }
+
+    fn visit_for_of_stmt(&mut self, for_of: &ForOfStmt) {
+        let mark = self.visible.len();
+        if let ForHead::VarDecl(var) = &for_of.left {
+            self.collect_scope(std::iter::once(&**var), || names_in(for_of));
+        }
+        for_of.visit_children_with(self);
+        self.visible.truncate(mark);
+    }
+
+    fn visit_for_in_stmt(&mut self, for_in: &ForInStmt) {
+        let mark = self.visible.len();
+        if let ForHead::VarDecl(var) = &for_in.left {
+            self.collect_scope(std::iter::once(&**var), || names_in(for_in));
+        }
+        for_in.visit_children_with(self);
+        self.visible.truncate(mark);
+    }
 }
 
 fn destructuring_rename_function(func: &mut Function) {
     let Some(body) = &func.body else { return };
-    if !has_destructuring_candidates_in_params(&func.params)
-        && !has_destructuring_candidates_in_stmts(&body.stmts)
-    {
-        return;
-    }
-    let mut all_names = collect_names_in_stmts(&body.stmts);
-    for p in &func.params {
-        collect_names_in_pat(&p.pat, &mut all_names);
-    }
-
-    // Collect renames from both params and body VarDecls.
-    // Feed param-rename targets into all_names so body renames don't
-    // pick names that would shadow a just-renamed parameter.
-    let mut renames = collect_obj_pat_renames_from_params(&func.params, &all_names);
-    for r in &renames {
-        all_names.insert(r.new.clone());
-    }
-    let body_renames = collect_obj_pat_renames_from_stmts(&body.stmts, &all_names);
-    renames.extend(body_renames);
-
+    let param_pats: Vec<&Pat> = func.params.iter().map(|p| &p.pat).collect();
+    let renames =
+        collect_function_destructuring_renames(&param_pats, names_in(&func.params), &body.stmts);
     if renames.is_empty() {
         return;
     }
@@ -692,6 +867,71 @@ fn destructuring_rename_function(func: &mut Function) {
     }
 }
 
+/// Constructors are not `Function` nodes, so `visit_mut_function` never sees
+/// them. TypeScript parameter properties are left alone: their name is also
+/// the property name.
+fn destructuring_rename_constructor(ctor: &mut Constructor) {
+    let Some(body) = &ctor.body else { return };
+    let param_pats: Vec<&Pat> = ctor
+        .params
+        .iter()
+        .filter_map(|p| match p {
+            ParamOrTsParamProp::Param(param) => Some(&param.pat),
+            ParamOrTsParamProp::TsParamProp(_) => None,
+        })
+        .collect();
+    let renames =
+        collect_function_destructuring_renames(&param_pats, names_in(&ctor.params), &body.stmts);
+    if renames.is_empty() {
+        return;
+    }
+    rename_bindings(&mut ctor.params, &renames);
+    if let Some(body) = &mut ctor.body {
+        rename_bindings(&mut body.stmts, &renames);
+    }
+    let mut shorthand = ObjectPatShorthandConverter;
+    ctor.params
+        .iter_mut()
+        .for_each(|p| p.visit_mut_with(&mut shorthand));
+    if let Some(body) = &mut ctor.body {
+        body.visit_mut_with(&mut shorthand);
+    }
+}
+
+/// Destructuring renames for a function-like body: parameters first, then
+/// top-level body declarations, then nested blocks and `for` heads.
+/// `param_names` holds every name in the parameter list.
+fn collect_function_destructuring_renames(
+    param_pats: &[&Pat],
+    param_names: HashSet<Atom>,
+    stmts: &[Stmt],
+) -> Vec<BindingRename> {
+    if !param_pats.iter().any(|p| has_short_obj_pat_alias(p))
+        && !has_destructuring_candidates_in_stmts(stmts)
+    {
+        return Vec::new();
+    }
+    let mut all_names = collect_names_in_stmts(stmts);
+    all_names.extend(param_names);
+
+    // Feed param-rename targets into all_names so body renames don't
+    // pick names that would shadow a just-renamed parameter.
+    let mut renames = Vec::new();
+    let mut used_names = all_names.clone();
+    for pat in param_pats {
+        collect_obj_pat_renames_from_pat(pat, &mut renames, &mut used_names);
+    }
+    for r in &renames {
+        all_names.insert(r.new.clone());
+    }
+    renames.extend(collect_obj_pat_renames_from_stmts(stmts, &all_names));
+    stmts.visit_with(&mut NestedObjPatRenameCollector::new(
+        &mut all_names,
+        &mut renames,
+    ));
+    renames
+}
+
 fn destructuring_rename_module_with(
     module: &mut Module,
     all_names: &mut HashSet<Atom>,
@@ -699,11 +939,14 @@ fn destructuring_rename_module_with(
 ) {
     let mut renames = collect_obj_pat_renames_from_module(&module.body, all_names);
     renames.retain(|rename| !exported_bindings.contains(&rename.old));
+    module
+        .body
+        .visit_with(&mut NestedObjPatRenameCollector::new(
+            all_names,
+            &mut renames,
+        ));
     if renames.is_empty() {
         return;
-    }
-    for r in &renames {
-        all_names.insert(r.new.clone());
     }
     rename_bindings_in_module(module, &renames);
     let mut shorthand = ObjectPatShorthandConverter;
@@ -722,7 +965,7 @@ fn destructuring_rename_arrow(arrow: &mut ArrowExpr) {
     let mut all_names = match arrow.body.as_ref() {
         ArrowFunctionBody::FunctionBody(b) => collect_names_in_stmts(&b.stmts),
         ArrowFunctionBody::Expr(e) => {
-            let mut names = HashSet::new();
+            let mut names = HashSet::default();
             collect_names_in_expr(e, &mut names);
             names
         }
@@ -737,6 +980,10 @@ fn destructuring_rename_arrow(arrow: &mut ArrowExpr) {
     }
     if let ArrowFunctionBody::FunctionBody(b) = arrow.body.as_ref() {
         renames.extend(collect_obj_pat_renames_from_stmts(&b.stmts, &all_names));
+        b.stmts.visit_with(&mut NestedObjPatRenameCollector::new(
+            &mut all_names,
+            &mut renames,
+        ));
     }
     if renames.is_empty() {
         return;
@@ -784,18 +1031,6 @@ fn collect_obj_pat_renames_from_module(
     renames
 }
 
-fn collect_obj_pat_renames_from_params(
-    params: &[Param],
-    all_names: &HashSet<Atom>,
-) -> Vec<BindingRename> {
-    let mut renames = Vec::new();
-    let mut used_names = all_names.clone();
-    for p in params {
-        collect_obj_pat_renames_from_pat(&p.pat, &mut renames, &mut used_names);
-    }
-    renames
-}
-
 fn collect_obj_pat_renames_from_stmts(
     stmts: &[Stmt],
     all_names: &HashSet<Atom>,
@@ -830,10 +1065,31 @@ fn collect_obj_pat_renames_from_pat(
     renames: &mut Vec<BindingRename>,
     used_names: &mut HashSet<Atom>,
 ) {
-    let Pat::Object(obj_pat) = pat else { return };
+    let obj_pat = match pat {
+        Pat::Object(obj_pat) => obj_pat,
+        Pat::Assign(assign_pat) => {
+            collect_obj_pat_renames_from_pat(&assign_pat.left, renames, used_names);
+            return;
+        }
+        Pat::Array(array_pat) => {
+            for elem in array_pat.elems.iter().flatten() {
+                collect_obj_pat_renames_from_pat(elem, renames, used_names);
+            }
+            return;
+        }
+        _ => return,
+    };
     for prop in &obj_pat.props {
         match prop {
             ObjectPatProp::KeyValue(kv) => {
+                let nested = match &*kv.value {
+                    Pat::Assign(assign_pat) => &*assign_pat.left,
+                    value => value,
+                };
+                if matches!(nested, Pat::Object(_) | Pat::Array(_)) {
+                    collect_obj_pat_renames_from_pat(nested, renames, used_names);
+                    continue;
+                }
                 let key_str = match &kv.key {
                     PropName::Ident(i) => i.sym.to_string(),
                     PropName::Str(s) => s.value.as_str().map(|s| s.to_string()).unwrap_or_default(),
@@ -1148,6 +1404,87 @@ fn collect_member_init_var_renames(
             old: (bi.id.sym.clone(), bi.id.ctxt),
             new: new_name.as_str().into(),
         });
+    }
+}
+
+/// Give a module-level snapshot of a named import a readable local name while
+/// keeping the `const` copy intact. This deliberately does not inline the
+/// imported binding: the provider may mutate its live export after this module
+/// captures the value.
+fn import_snapshot_alias_rename_module(module: &mut Module, all_names: &mut HashSet<Atom>) {
+    if module_has_with_stmt(module) {
+        return;
+    }
+    let mut direct_eval = DirectEvalAnalyzer::default();
+    module.visit_with(&mut direct_eval);
+    if direct_eval.unknown_direct_eval {
+        return;
+    }
+
+    let mut named_imports = HashSet::default();
+    for item in &module.body {
+        let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
+            continue;
+        };
+        for specifier in &import.specifiers {
+            let ImportSpecifier::Named(named) = specifier else {
+                continue;
+            };
+            named_imports.insert((named.local.sym.clone(), named.local.ctxt));
+        }
+    }
+    if named_imports.is_empty() {
+        return;
+    }
+
+    let jsx_tags = collect_jsx_tag_bindings(module);
+    let mut renames = Vec::new();
+    for item in &module.body {
+        let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
+            continue;
+        };
+        if var.kind != VarDeclKind::Const {
+            continue;
+        }
+        for decl in &var.decls {
+            let Pat::Ident(alias) = &decl.name else {
+                continue;
+            };
+            if !is_likely_generated_alias(&alias.id.sym) {
+                continue;
+            }
+            let Some(init) = &decl.init else { continue };
+            let Expr::Ident(imported) = init.as_ref() else {
+                continue;
+            };
+            if !named_imports.contains(&(imported.sym.clone(), imported.ctxt))
+                || is_likely_generated_alias(&imported.sym)
+            {
+                continue;
+            }
+            let alias_id = (alias.id.sym.clone(), alias.id.ctxt);
+            if starts_with_lowercase(&imported.sym) && jsx_tags.contains(&alias_id) {
+                continue;
+            }
+
+            let target = find_non_conflicting_name(imported.sym.as_ref(), all_names);
+            let target: Atom = target.into();
+            if direct_eval.known_direct_eval_sources.iter().any(|source| {
+                js_source_mentions_binding(source, &alias.id.sym)
+                    || js_source_mentions_binding(source, &target)
+            }) {
+                continue;
+            }
+            all_names.insert(target.clone());
+            renames.push(BindingRename {
+                old: alias_id,
+                new: target,
+            });
+        }
+    }
+
+    if !renames.is_empty() {
+        rename_bindings_in_module(module, &renames);
     }
 }
 
@@ -1468,29 +1805,41 @@ fn symbol_key_to_const_name(key: &str) -> String {
 // ============================================================
 // Value-position renames
 //
-// A short binding `x` (≤2 chars) used *only* as the value of object-literal
-// KeyValue properties with a valid-identifier key, where every such key
-// agrees on the same target name, is renamed to that name.
+// A short binding `x` used as the value of object-literal KeyValue
+// properties with a valid-identifier key, where every such key agrees on
+// the same target name, is renamed to that name.
 //
 //   (e, t) => ({ ...e, error: t })      → (e, error) => ({ ...e, error })
 //   import r from "m"; export default { Foo: r }
 //                                        → import Foo from "m"; export default { Foo }
 //
 // Disqualified:
-//   - Any non-value-position reference (member access, call arg, spread,
-//     assignment target, export specifier, etc.)
 //   - Multiple distinct target names (e.g. `{ array: e, bool: e }`)
 //   - Computed/numeric/reserved-keyword keys
+//
+// When the binding also has other uses (member access, call arg, writes,
+// ...), the key names one destination of the value rather than the value
+// itself more often, so these are disqualified too:
+//   - Generic keys (`type`, `name`, `value`, `data`, `key`) and `$` keys
+//   - Bindings declared inside a destructuring pattern
+//   - Class declarations and class-valued declarators
+//   - A boolean-valued initializer that tests a property with the key's
+//     name (`const t = !!s.icon` → `{ icon: t }` is a flag about `icon`)
 // ============================================================
 
-fn value_position_rename_module(module: &mut Module) {
+/// Returns the renamed bindings under their new names.
+fn value_position_rename_module(module: &mut Module) -> HashSet<BindingId> {
     let renames = collect_value_position_renames_module(module);
     if renames.is_empty() {
-        return;
+        return HashSet::default();
     }
     rename_bindings_in_module(module, &renames);
     // Collapse `{ Foo: Foo }` created by the rename back to `{ Foo }`.
     module.visit_mut_with(&mut ObjShorthand);
+    renames
+        .into_iter()
+        .map(|rename| (rename.new, rename.old.1))
+        .collect()
 }
 
 fn collect_value_position_rename_map_module(module: &Module) -> HashMap<BindingId, String> {
@@ -1513,8 +1862,11 @@ fn collect_value_position_renames_module(module: &Module) -> Vec<BindingRename> 
 
     // Group candidates by target name. If two bindings map to the same
     // target (e.g. five React type constants all assigned to `$$typeof:`),
-    // the key isn't discriminative — drop the whole group.
-    let mut by_target: HashMap<String, Vec<BindingId>> = HashMap::new();
+    // the key isn't discriminative — drop the whole group. Candidates that
+    // also have other uses form a second tier: they only take a target no
+    // sole-use candidate claims, so relaxing never costs a sole-use rename.
+    let mut by_target: HashMap<String, Vec<BindingId>> = HashMap::default();
+    let mut relaxed_by_target: HashMap<String, Vec<BindingId>> = HashMap::default();
     for (bid, state) in classifier.states {
         let Some(target) = state.single_target() else {
             continue;
@@ -1522,7 +1874,15 @@ fn collect_value_position_renames_module(module: &Module) -> Vec<BindingRename> 
         if target.as_str() == bid.0.as_ref() {
             continue;
         }
-        by_target.entry(target).or_default().push(bid);
+        let tier = if state.other_uses > 0 {
+            &mut relaxed_by_target
+        } else {
+            &mut by_target
+        };
+        tier.entry(target).or_default().push(bid);
+    }
+    for (target, bids) in relaxed_by_target {
+        by_target.entry(target).or_insert(bids);
     }
 
     let top_level_names = collect_module_names(module);
@@ -1561,7 +1921,7 @@ fn collect_value_position_renames_module(module: &Module) -> Vec<BindingRename> 
     // Two-pass assignment: first reserve direct (unsuffixed) target names so
     // a later suffix fallback never steals another binding's natural target.
     let mut renames: Vec<BindingRename> = Vec::new();
-    let mut committed_names: HashSet<Atom> = HashSet::new();
+    let mut committed_names: HashSet<Atom> = HashSet::default();
     let mut needs_suffix: Vec<(String, BindingId)> = Vec::new();
 
     for (target, bid) in candidates {
@@ -1635,9 +1995,9 @@ impl BindingScopeNameIndex {
             fn new(function_scope: bool) -> Self {
                 Self {
                     function_scope,
-                    candidate_bindings: HashSet::new(),
-                    declared_bindings: HashSet::new(),
-                    references: HashSet::new(),
+                    candidate_bindings: HashSet::default(),
+                    declared_bindings: HashSet::default(),
+                    references: HashSet::default(),
                 }
             }
         }
@@ -1919,23 +2279,123 @@ impl BindingScopeNameIndex {
     }
 }
 
+/// Declaration facts that decide whether a value-position key may name a
+/// binding that also has other uses.
+#[derive(Default)]
+struct BindingTraits {
+    destructured: bool,
+    class: bool,
+    /// Property names tested by a boolean-valued initializer.
+    boolean_tested_props: Vec<Atom>,
+}
+
+impl BindingTraits {
+    fn allows_target_with_other_uses(&self, target: &str) -> bool {
+        !matches!(target, "type" | "name" | "value" | "data" | "key")
+            && !target.starts_with('$')
+            && !self.destructured
+            && !self.class
+            && !self
+                .boolean_tested_props
+                .iter()
+                .any(|p| p.as_ref() == target)
+    }
+}
+
 #[derive(Default)]
 struct BindingCollector {
-    short_bindings: HashMap<BindingId, ()>,
+    short_bindings: HashMap<BindingId, BindingTraits>,
+    /// Depth of enclosing object/array patterns, reset at function and
+    /// class boundaries so a nested function's parameters are not counted.
+    pattern_depth: usize,
 }
 
 impl BindingCollector {
-    fn record(&mut self, id: &Ident) {
-        if is_likely_generated_alias(&id.sym) {
-            self.short_bindings.insert((id.sym.clone(), id.ctxt), ());
+    fn record(&mut self, id: &Ident) -> Option<&mut BindingTraits> {
+        if !is_likely_generated_alias(&id.sym) {
+            return None;
         }
+        let destructured = self.pattern_depth > 0;
+        let traits = self
+            .short_bindings
+            .entry((id.sym.clone(), id.ctxt))
+            .or_default();
+        traits.destructured |= destructured;
+        Some(traits)
+    }
+
+    fn with_pattern_depth_reset(&mut self, visit: impl FnOnce(&mut Self)) {
+        let depth = std::mem::take(&mut self.pattern_depth);
+        visit(self);
+        self.pattern_depth = depth;
+    }
+}
+
+/// When `expr` is boolean-valued (`!x`, a comparison, or `&&`/`||` over
+/// boolean operands), the property names it tests: `!!s.icon` → `icon`,
+/// `s.weight > 0` → `weight`, `t && !!s.badge` → `badge`.
+fn boolean_tested_props(expr: &Expr) -> Option<Vec<Atom>> {
+    fn operand_prop(expr: &Expr) -> Option<Atom> {
+        match expr.unwrap_parens() {
+            Expr::Member(member) => static_member_prop_name(&member.prop).map(Atom::from),
+            Expr::OptChain(chain) => match &*chain.base {
+                swc_core::ecma::ast::OptChainBase::Member(member) => {
+                    static_member_prop_name(&member.prop).map(Atom::from)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    fn operand(expr: &Expr) -> Vec<Atom> {
+        boolean_tested_props(expr).unwrap_or_else(|| operand_prop(expr).into_iter().collect())
+    }
+    use swc_core::ecma::ast::{BinaryOp, UnaryOp};
+    match expr.unwrap_parens() {
+        Expr::Unary(unary) if unary.op == UnaryOp::Bang => Some(operand(&unary.arg)),
+        Expr::Bin(bin) => match bin.op {
+            BinaryOp::EqEq
+            | BinaryOp::NotEq
+            | BinaryOp::EqEqEq
+            | BinaryOp::NotEqEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
+            | BinaryOp::InstanceOf
+            | BinaryOp::In => {
+                let mut props = operand(&bin.left);
+                props.extend(operand(&bin.right));
+                Some(props)
+            }
+            BinaryOp::LogicalAnd => boolean_tested_props(&bin.right).map(|mut props| {
+                props.extend(boolean_tested_props(&bin.left).unwrap_or_default());
+                props
+            }),
+            BinaryOp::LogicalOr => {
+                let mut props = boolean_tested_props(&bin.left)?;
+                props.extend(boolean_tested_props(&bin.right)?);
+                Some(props)
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
 impl Visit for BindingCollector {
     fn visit_pat(&mut self, pat: &Pat) {
-        if let Pat::Ident(bi) = pat {
-            self.record(&bi.id);
+        match pat {
+            Pat::Ident(bi) => {
+                self.record(&bi.id);
+            }
+            Pat::Object(_) | Pat::Array(_) => {
+                self.pattern_depth += 1;
+                pat.visit_children_with(self);
+                self.pattern_depth -= 1;
+                return;
+            }
+            _ => {}
         }
         pat.visit_children_with(self);
     }
@@ -1947,13 +2407,42 @@ impl Visit for BindingCollector {
         prop.visit_children_with(self);
     }
 
+    fn visit_var_declarator(&mut self, decl: &swc_core::ecma::ast::VarDeclarator) {
+        decl.visit_children_with(self);
+        let (Pat::Ident(bi), Some(init)) = (&decl.name, &decl.init) else {
+            return;
+        };
+        let is_class = matches!(init.unwrap_parens(), Expr::Class(_));
+        let tested = boolean_tested_props(init);
+        if let Some(traits) = self.record(&bi.id) {
+            traits.class |= is_class;
+            if let Some(props) = tested {
+                traits.boolean_tested_props.extend(props);
+            }
+        }
+    }
+
+    fn visit_function(&mut self, function: &Function) {
+        self.with_pattern_depth_reset(|this| function.visit_children_with(this));
+    }
+
+    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+        self.with_pattern_depth_reset(|this| arrow.visit_children_with(this));
+    }
+
+    fn visit_class(&mut self, class: &Class) {
+        self.with_pattern_depth_reset(|this| class.visit_children_with(this));
+    }
+
     fn visit_fn_decl(&mut self, decl: &FnDecl) {
         self.record(&decl.ident);
         decl.function.visit_with(self);
     }
 
     fn visit_class_decl(&mut self, decl: &ClassDecl) {
-        self.record(&decl.ident);
+        if let Some(traits) = self.record(&decl.ident) {
+            traits.class = true;
+        }
         decl.class.visit_with(self);
     }
 
@@ -1966,7 +2455,9 @@ impl Visit for BindingCollector {
 
     fn visit_class_expr(&mut self, ce: &ClassExpr) {
         if let Some(ident) = &ce.ident {
-            self.record(ident);
+            if let Some(traits) = self.record(ident) {
+                traits.class = true;
+            }
         }
         ce.class.visit_with(self);
     }
@@ -1977,7 +2468,7 @@ impl Visit for BindingCollector {
                 ImportSpecifier::Default(d) => self.record(&d.local),
                 ImportSpecifier::Named(n) => self.record(&n.local),
                 ImportSpecifier::Namespace(ns) => self.record(&ns.local),
-            }
+            };
         }
     }
 
@@ -1998,17 +2489,19 @@ impl Visit for BindingCollector {
 struct ClassificationState {
     value_targets: HashMap<String, usize>,
     other_uses: usize,
+    traits: BindingTraits,
 }
 
 impl ClassificationState {
     fn single_target(&self) -> Option<String> {
-        if self.other_uses > 0 {
-            return None;
-        }
         if self.value_targets.len() != 1 {
             return None;
         }
-        self.value_targets.keys().next().cloned()
+        let target = self.value_targets.keys().next()?;
+        if self.other_uses > 0 && !self.traits.allows_target_with_other_uses(target) {
+            return None;
+        }
+        Some(target.clone())
     }
 }
 
@@ -2017,10 +2510,18 @@ struct ValuePositionClassifier {
 }
 
 impl ValuePositionClassifier {
-    fn new(bindings: HashMap<BindingId, ()>) -> Self {
+    fn new(bindings: HashMap<BindingId, BindingTraits>) -> Self {
         let states = bindings
-            .into_keys()
-            .map(|k| (k, ClassificationState::default()))
+            .into_iter()
+            .map(|(k, traits)| {
+                (
+                    k,
+                    ClassificationState {
+                        traits,
+                        ..Default::default()
+                    },
+                )
+            })
             .collect();
         Self { states }
     }
@@ -2212,6 +2713,1130 @@ fn key_as_ident_target(key: &PropName) -> Option<String> {
         return None;
     }
     Some(raw)
+}
+
+// ============================================================
+// Call-site parameter renames
+//
+// A short parameter of a function whose every reference is a direct call is
+// renamed after the argument all those calls pass at its position:
+//
+//   function f(e) { return e.trim(); }  f(input.text); f(text);
+//                                        → function f(text) { ... }
+//
+// Requirements, each measured against original names:
+//   - The function binding is declared once, never written, not exported,
+//     and never used except as a direct callee (a function that escapes has
+//     callers we cannot see).
+//   - Every call passes a named argument (`x` or `obj.x`) at the position,
+//     and all names agree. A spread at or before the position, a missing
+//     argument, or any other expression disqualifies.
+//   - The name carries meaning: a Wakaru `_N` suffix is dropped; short,
+//     mangled-looking (`kQz`, `J99`), reserved-property, `t_x`-synthesized,
+//     and React ref `current` names are rejected.
+//   - The parameter is used, never written (minifiers reuse parameters as
+//     scratch variables), and not already backed by a shorthand property;
+//     the name does not already occur anywhere inside the function.
+//
+// More callers do not make the name more reliable (widely called helpers take
+// a general parameter while callers pass something specific), and generic
+// names such as `options` or `type` are usually right here, unlike in value
+// position. Runs after value-position renames, which are more precise.
+// ============================================================
+
+/// `value_named` holds bindings value-position renames just named; their
+/// new name can still look short (`fn`) but is the better evidence.
+fn call_site_param_rename_module(module: &mut Module, value_named: &HashSet<BindingId>) {
+    if has_dynamic_scope_construct(module) {
+        return;
+    }
+    let mut functions = CallSiteFunctionCollector::default();
+    module.visit_with(&mut functions);
+    if functions.candidates.iter().all(|c| c.binding.is_none()) {
+        return;
+    }
+
+    let by_binding: HashMap<BindingId, usize> = functions
+        .candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, c)| c.binding.clone().map(|bid| (bid, idx)))
+        .collect();
+    let mut uses = CallSiteUseCollector {
+        functions: &by_binding,
+        uses: HashMap::default(),
+    };
+    module.visit_with(&mut uses);
+    let exported_bindings = collect_exported_binding_ids(module);
+
+    let mut proposals: Vec<(Atom, usize, usize, BindingId)> = Vec::new();
+    for (bid, &idx) in &by_binding {
+        let Some(use_info) = uses.uses.get(bid) else {
+            continue;
+        };
+        if use_info.declarations != 1
+            || use_info.escapes > 0
+            || use_info.calls.is_empty()
+            || exported_bindings.contains(bid)
+        {
+            continue;
+        }
+        let candidate = &functions.candidates[idx];
+        for (position, param) in candidate.params.iter().enumerate() {
+            let Some(param) = param else {
+                continue;
+            };
+            if value_named.contains(param)
+                || functions.keyed_params.contains(param)
+                || functions.param_writes.get(param).copied().unwrap_or(0) > 1
+                || functions.param_refs.get(param).copied().unwrap_or(0) == 0
+            {
+                continue;
+            }
+            let Some(name) = unanimous_call_site_name(&use_info.calls, position) else {
+                continue;
+            };
+            if candidate.names.contains(&name) || name == param.0 {
+                continue;
+            }
+            proposals.push((name, idx, position, param.clone()));
+        }
+    }
+    proposals.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+
+    // Proposals are checked against the names each function already holds;
+    // two proposals of the same name conflict when their functions are the
+    // same or nested, since the inner parameter could capture the outer one.
+    let nested = |a: usize, b: usize| {
+        a == b
+            || functions.candidates[a].ancestors.contains(&b)
+            || functions.candidates[b].ancestors.contains(&a)
+    };
+    let mut accepted: HashMap<Atom, Vec<usize>> = HashMap::default();
+    let mut renames = Vec::new();
+    for (name, idx, _, param) in proposals {
+        let taken = accepted.entry(name.clone()).or_default();
+        if taken.iter().any(|&other| nested(idx, other)) {
+            continue;
+        }
+        taken.push(idx);
+        renames.push(BindingRename {
+            old: param,
+            new: name,
+        });
+    }
+    rename_bindings_in_module(module, &renames);
+}
+
+/// Property names that name a mechanism rather than a value.
+const CALL_SITE_RESERVED_NAMES: &[&str] = &[
+    "default",
+    "length",
+    "prototype",
+    "constructor",
+    "then",
+    "call",
+    "apply",
+    "bind",
+    "value",
+    "exports",
+    "module",
+    "require",
+    "arguments",
+    "undefined",
+    "eval",
+    // React ref containers: `xRef.current` says nothing about the value.
+    "current",
+];
+
+/// A name that reads like a real identifier, with any Wakaru `_N`
+/// disambiguation suffix dropped.
+fn call_site_name(raw: &str) -> Option<Atom> {
+    if is_synthesized_prefixed_name(raw) {
+        return None;
+    }
+    let base = match raw.rsplit_once('_') {
+        Some((base, digits))
+            if !base.is_empty()
+                && !digits.is_empty()
+                && digits.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => raw,
+    };
+    if is_likely_generated_alias(base)
+        || looks_mangled(base)
+        || CALL_SITE_RESERVED_NAMES.contains(&base)
+        || is_reserved_binding_name(base)
+        || !is_valid_js_ident(base)
+    {
+        return None;
+    }
+    Some(Atom::from(base))
+}
+
+/// Short names a minifier emits that `is_likely_generated_alias` does not
+/// cover: one letter plus digits (`J99`) or three letters in mixed case
+/// (`kQz`).
+fn looks_mangled(name: &str) -> bool {
+    name.chars().count() <= 3
+        && (name.chars().any(|c| c.is_ascii_digit())
+            || name.chars().skip(1).any(|c| c.is_ascii_uppercase()))
+}
+
+/// Wakaru keeps a minified stem when it builds a name from a property:
+/// `t_nextValue`, `ab_value`.
+fn is_synthesized_prefixed_name(name: &str) -> bool {
+    let chars: Vec<char> = name.chars().collect();
+    let stem_char = |c: char| c.is_ascii_alphanumeric() || c == '$';
+    let underscore_at = if chars.len() > 2 && chars[1] == '_' {
+        1
+    } else if chars.len() > 3 && chars[2] == '_' && stem_char(chars[1]) {
+        2
+    } else {
+        return false;
+    };
+    (chars[0].is_ascii_alphabetic() || chars[0] == '$')
+        && chars[underscore_at + 1].is_ascii_alphabetic()
+}
+
+fn unanimous_call_site_name(calls: &[Vec<Option<Atom>>], position: usize) -> Option<Atom> {
+    let mut agreed: Option<&Atom> = None;
+    for call in calls {
+        let name = call.get(position)?.as_ref()?;
+        match agreed {
+            Some(previous) if previous != name => return None,
+            _ => agreed = Some(name),
+        }
+    }
+    agreed.cloned()
+}
+
+struct CallSiteFunction {
+    /// The constant binding that names the function, when it has one.
+    binding: Option<BindingId>,
+    /// Short plain-identifier parameters by position.
+    params: Vec<Option<BindingId>>,
+    /// Indices of enclosing named functions.
+    ancestors: Vec<usize>,
+    /// Every identifier spelled inside the function, parameters included.
+    names: HashSet<Atom>,
+}
+
+/// Finds functions declared as `function f() {}` or `const f = ... =>` /
+/// `function () {}`, their short parameters, the names spelled inside them,
+/// and how often each such parameter is referenced.
+#[derive(Default)]
+struct CallSiteFunctionCollector {
+    candidates: Vec<CallSiteFunction>,
+    stack: Vec<usize>,
+    pending_binding: Option<BindingId>,
+    param_refs: HashMap<BindingId, usize>,
+    /// Parameters used as a shorthand property (`{ fn }`): the key already
+    /// backs the current name.
+    keyed_params: HashSet<BindingId>,
+    /// Binding sites per parameter: the parameter itself plus every write.
+    /// Minifiers reuse parameters as scratch variables, so a written
+    /// parameter can hold values unrelated to what the callers pass.
+    param_writes: HashMap<BindingId, usize>,
+}
+
+impl CallSiteFunctionCollector {
+    fn record_name(&mut self, sym: &Atom) {
+        for &idx in &self.stack {
+            self.candidates[idx].names.insert(sym.clone());
+        }
+    }
+
+    fn enter<'a>(&mut self, params: impl Iterator<Item = &'a Pat>) -> Option<usize> {
+        let binding = self.pending_binding.take()?;
+        let params: Vec<Option<BindingId>> = params
+            .map(|pat| match pat {
+                Pat::Ident(b) if is_likely_generated_alias(&b.id.sym) => {
+                    Some((b.id.sym.clone(), b.id.ctxt))
+                }
+                _ => None,
+            })
+            .collect();
+        for param in params.iter().flatten() {
+            self.param_refs.entry(param.clone()).or_default();
+        }
+        let idx = self.candidates.len();
+        self.candidates.push(CallSiteFunction {
+            binding: Some(binding),
+            params,
+            ancestors: self.stack.clone(),
+            names: HashSet::default(),
+        });
+        self.stack.push(idx);
+        Some(idx)
+    }
+
+    fn leave(&mut self, entered: Option<usize>) {
+        if entered.is_some() {
+            self.stack.pop();
+        }
+    }
+}
+
+impl Visit for CallSiteFunctionCollector {
+    fn visit_ident(&mut self, id: &Ident) {
+        self.record_name(&id.sym);
+        if let Some(count) = self.param_refs.get_mut(&(id.sym.clone(), id.ctxt)) {
+            *count += 1;
+        }
+    }
+
+    fn visit_binding_ident(&mut self, binding: &BindingIdent) {
+        self.record_name(&binding.id.sym);
+        let bid = (binding.id.sym.clone(), binding.id.ctxt);
+        if self.param_refs.contains_key(&bid) {
+            *self.param_writes.entry(bid).or_default() += 1;
+        }
+    }
+
+    fn visit_update_expr(&mut self, update: &swc_core::ecma::ast::UpdateExpr) {
+        if let Expr::Ident(id) = update.arg.unwrap_parens() {
+            let bid = (id.sym.clone(), id.ctxt);
+            if self.param_refs.contains_key(&bid) {
+                *self.param_writes.entry(bid).or_default() += 1;
+            }
+        }
+        update.visit_children_with(self);
+    }
+
+    fn visit_prop(&mut self, prop: &Prop) {
+        if let Prop::Shorthand(id) = prop {
+            let bid = (id.sym.clone(), id.ctxt);
+            if self.param_refs.contains_key(&bid) {
+                self.keyed_params.insert(bid);
+            }
+        }
+        prop.visit_children_with(self);
+    }
+
+    fn visit_fn_decl(&mut self, decl: &FnDecl) {
+        self.record_name(&decl.ident.sym);
+        self.pending_binding = Some((decl.ident.sym.clone(), decl.ident.ctxt));
+        decl.function.visit_with(self);
+    }
+
+    fn visit_fn_expr(&mut self, fn_expr: &FnExpr) {
+        if let Some(ident) = &fn_expr.ident {
+            self.record_name(&ident.sym);
+        }
+        fn_expr.function.visit_with(self);
+    }
+
+    fn visit_var_declarator(&mut self, decl: &swc_core::ecma::ast::VarDeclarator) {
+        decl.name.visit_with(self);
+        let Some(init) = &decl.init else {
+            return;
+        };
+        if let Pat::Ident(b) = &decl.name {
+            if matches!(init.unwrap_parens(), Expr::Fn(_) | Expr::Arrow(_)) {
+                self.pending_binding = Some((b.id.sym.clone(), b.id.ctxt));
+            }
+        }
+        init.visit_with(self);
+        self.pending_binding = None;
+    }
+
+    fn visit_function(&mut self, function: &Function) {
+        let entered = self.enter(function.params.iter().map(|p| &p.pat));
+        function.visit_children_with(self);
+        self.leave(entered);
+    }
+
+    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+        let entered = self.enter(arrow.params.iter());
+        arrow.visit_children_with(self);
+        self.leave(entered);
+    }
+
+    fn visit_constructor(&mut self, ctor: &Constructor) {
+        self.pending_binding = None;
+        ctor.visit_children_with(self);
+    }
+}
+
+#[derive(Default)]
+struct CallSiteUses {
+    /// Binding sites: the declaration plus any redeclaration or write.
+    declarations: usize,
+    /// References other than as a direct callee.
+    escapes: usize,
+    /// Per call, the usable name passed at each argument position.
+    calls: Vec<Vec<Option<Atom>>>,
+}
+
+struct CallSiteUseCollector<'a> {
+    functions: &'a HashMap<BindingId, usize>,
+    uses: HashMap<BindingId, CallSiteUses>,
+}
+
+impl CallSiteUseCollector<'_> {
+    fn entry(&mut self, id: &Ident) -> Option<&mut CallSiteUses> {
+        let bid = (id.sym.clone(), id.ctxt);
+        if !self.functions.contains_key(&bid) {
+            return None;
+        }
+        Some(self.uses.entry(bid).or_default())
+    }
+}
+
+impl Visit for CallSiteUseCollector<'_> {
+    fn visit_ident(&mut self, id: &Ident) {
+        if let Some(uses) = self.entry(id) {
+            uses.escapes += 1;
+        }
+    }
+
+    fn visit_binding_ident(&mut self, binding: &BindingIdent) {
+        if let Some(uses) = self.entry(&binding.id) {
+            uses.declarations += 1;
+        }
+    }
+
+    fn visit_fn_decl(&mut self, decl: &FnDecl) {
+        if let Some(uses) = self.entry(&decl.ident) {
+            uses.declarations += 1;
+        }
+        decl.function.visit_with(self);
+    }
+
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if let Callee::Expr(callee) = &call.callee {
+            if let Expr::Ident(id) = callee.as_ref() {
+                if self.functions.contains_key(&(id.sym.clone(), id.ctxt)) {
+                    let mut hidden = false;
+                    let names = call
+                        .args
+                        .iter()
+                        .map(|arg| {
+                            // A spread hides this and every later position.
+                            hidden |= arg.spread.is_some();
+                            if hidden {
+                                return None;
+                            }
+                            let raw = match arg.expr.unwrap_parens() {
+                                Expr::Ident(arg_id) => arg_id.sym.clone(),
+                                Expr::Member(MemberExpr {
+                                    prop: MemberProp::Ident(prop),
+                                    ..
+                                }) => prop.sym.clone(),
+                                _ => return None,
+                            };
+                            call_site_name(&raw)
+                        })
+                        .collect();
+                    if let Some(uses) = self.entry(id) {
+                        uses.calls.push(names);
+                    }
+                    call.args.visit_with(self);
+                    return;
+                }
+            }
+        }
+        call.visit_children_with(self);
+    }
+}
+
+// ============================================================
+// Structural-role renames
+//
+// Some bindings have a role the language or a standard method fixes,
+// whatever the code around them says:
+//
+//   try { ... } catch (e) { report(e); }   → catch (error)
+//   new Promise((e, t) => ...)             → (resolve, reject) => ...
+//   list.reduce((e, t, n) => ..., init)    → (acc, item, index) => ...
+//   for (...; t < rows.length; ...) { const n = rows[t]; }
+//                                          → const row = rows[t];
+//
+// A reduce element is named `key` over `Object.keys(...)` (`entry` over
+// `Object.entries(...)`, also through `.sort()` and similar), the singular of
+// the receiver's name when the plural is unambiguous (`orders` → `order`),
+// and `item` otherwise. A loop element takes the singular of the array it
+// indexes with the loop counter; without an unambiguous singular it keeps
+// its name. Loop counters are left alone: single letters collide with
+// whatever else the minifier spelled, and a letter for a letter adds little.
+//
+// Only short bindings are renamed, and only when the new name does not
+// already occur inside the scope (catch clause, callback, or loop). A catch
+// parameter must be read. Catch, executor, reduce element and index, and
+// loop element bindings must not be written (minifiers reuse bindings as
+// scratch variables); an accumulator may be, that is its role. Executor
+// and reduce parameters are renamed even when unused, since the name
+// documents the position. `Promise` and `Object` must be the globals.
+//
+// A name that would shadow a binding visible from outside the scope (an
+// import, an outer declaration, or an enclosing role rename) is replaced by
+// a conventional alternative (`err` for a catch parameter, `resolvePromise`
+// and `rejectPromise` as a pair for an executor) or, failing that, a `_N`
+// suffix. A name already spelled inside the scope is an internal
+// collision instead: only the alternative is tried, since `resolve_1` next
+// to a local `resolve` reads worse than the short name.
+// ============================================================
+
+fn role_rename_module(module: &mut Module, unresolved_mark: Mark) {
+    if has_dynamic_scope_construct(module) {
+        return;
+    }
+    let mut collector = RoleCollector {
+        unresolved_mark,
+        scopes: Vec::new(),
+        stack: Vec::new(),
+        tracked: HashMap::default(),
+        frames: Vec::new(),
+        frame_stack: Vec::new(),
+    };
+    module.visit_with(&mut collector);
+
+    let mut chosen: Vec<HashSet<Atom>> = vec![HashSet::default(); collector.scopes.len()];
+    let mut renames = Vec::new();
+    for (idx, scope) in collector.scopes.iter().enumerate() {
+        // Which alternative the previous parameter took (0 = the role name).
+        let mut previous_choice: Option<usize> = None;
+        for param in &scope.params {
+            let paired = param.pair_with_previous;
+            let follow = previous_choice.filter(|&k| paired && k > 0);
+            previous_choice = None;
+            let uses = collector
+                .tracked
+                .get(&param.binding)
+                .copied()
+                .unwrap_or_default();
+            if (param.forbid_writes && uses.writes > 1) || (param.require_read && uses.refs == 0) {
+                continue;
+            }
+            let visible_outside = |name: &Atom| {
+                scope
+                    .frames
+                    .iter()
+                    .any(|&frame| collector.frames[frame].contains(name))
+                    || scope
+                        .ancestors
+                        .iter()
+                        .chain(std::iter::once(&idx))
+                        .any(|&other| chosen[other].contains(name))
+            };
+            let free = |name: &Atom| !scope.names.contains(name) && !visible_outside(name);
+            let candidates: Vec<Atom> = std::iter::once(param.target.clone())
+                .chain(param.alternates.iter().map(|alt| Atom::from(*alt)))
+                .collect();
+            let order = follow
+                .into_iter()
+                .chain(0..candidates.len())
+                .filter(|&k| k < candidates.len());
+            let mut pick = None;
+            for k in order {
+                if free(&candidates[k]) {
+                    pick = Some(candidates[k].clone());
+                    previous_choice = Some(k);
+                    break;
+                }
+            }
+            if pick.is_none() && !scope.names.contains(&param.target) {
+                pick = (1..=10)
+                    .map(|i| Atom::from(format!("{}_{i}", param.target)))
+                    .find(|name| free(name));
+            }
+            let Some(name) = pick else {
+                continue;
+            };
+            chosen[idx].insert(name.clone());
+            renames.push(BindingRename {
+                old: param.binding.clone(),
+                new: name,
+            });
+        }
+    }
+    rename_bindings_in_module(module, &renames);
+}
+
+struct RoleParam {
+    binding: BindingId,
+    target: Atom,
+    /// Conventional names to try before a `_N` suffix.
+    alternates: &'static [&'static str],
+    /// Follow the previous parameter of the scope onto its alternative, so
+    /// `resolvePromise` pairs with `rejectPromise`.
+    pair_with_previous: bool,
+    require_read: bool,
+    forbid_writes: bool,
+}
+
+impl RoleParam {
+    fn new(binding: BindingId, target: &str) -> Self {
+        Self {
+            binding,
+            target: Atom::from(target),
+            alternates: &[],
+            pair_with_previous: false,
+            require_read: false,
+            forbid_writes: true,
+        }
+    }
+}
+
+struct RoleScope {
+    params: Vec<RoleParam>,
+    /// Indices of enclosing role scopes.
+    ancestors: Vec<usize>,
+    /// Every identifier spelled inside the scope, parameters included.
+    names: HashSet<Atom>,
+    /// Lexical frames enclosing the scope, for names visible from outside.
+    frames: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RoleParamUses {
+    refs: usize,
+    /// Binding sites: the declaration plus every write.
+    writes: usize,
+}
+
+struct RoleCollector {
+    unresolved_mark: Mark,
+    scopes: Vec<RoleScope>,
+    stack: Vec<usize>,
+    tracked: HashMap<BindingId, RoleParamUses>,
+    /// Names declared per lexical frame (module, function, block, catch,
+    /// for head). Complete once the traversal ends, so hoisted and later
+    /// declarations count too.
+    frames: Vec<HashSet<Atom>>,
+    /// Open frames, innermost last, with whether each is a function frame
+    /// (the target of `var`).
+    frame_stack: Vec<(usize, bool)>,
+}
+
+impl RoleCollector {
+    fn record_name(&mut self, sym: &Atom) {
+        for &idx in &self.stack {
+            self.scopes[idx].names.insert(sym.clone());
+        }
+    }
+
+    /// Visits `node` inside a new role scope when there are parameters to
+    /// name, and plainly otherwise.
+    fn with_scope(&mut self, params: Vec<RoleParam>, visit: impl FnOnce(&mut Self)) {
+        if params.is_empty() {
+            visit(self);
+            return;
+        }
+        for param in &params {
+            self.tracked.entry(param.binding.clone()).or_default();
+        }
+        let idx = self.scopes.len();
+        self.scopes.push(RoleScope {
+            params,
+            ancestors: self.stack.clone(),
+            names: HashSet::default(),
+            frames: self.frame_stack.iter().map(|&(frame, _)| frame).collect(),
+        });
+        self.stack.push(idx);
+        visit(self);
+        self.stack.pop();
+    }
+
+    fn with_frame(&mut self, function: bool, visit: impl FnOnce(&mut Self)) {
+        let frame = self.frames.len();
+        self.frames.push(HashSet::default());
+        self.frame_stack.push((frame, function));
+        visit(self);
+        self.frame_stack.pop();
+    }
+
+    fn declare(&mut self, names: HashSet<Atom>, function_scoped: bool) {
+        let target = if function_scoped {
+            self.frame_stack
+                .iter()
+                .rev()
+                .find(|(_, function)| *function)
+        } else {
+            self.frame_stack.last()
+        };
+        if let Some(&(frame, _)) = target {
+            self.frames[frame].extend(names);
+        }
+    }
+
+    fn declare_pats<'a>(&mut self, pats: impl IntoIterator<Item = &'a Pat>) {
+        let mut names = HashSet::default();
+        for pat in pats {
+            collect_pat_names(pat, &mut names);
+        }
+        self.declare(names, false);
+    }
+
+    fn short_param(pat: &Pat) -> Option<BindingId> {
+        match pat {
+            Pat::Ident(b) if is_likely_generated_alias(&b.id.sym) => {
+                Some((b.id.sym.clone(), b.id.ctxt))
+            }
+            _ => None,
+        }
+    }
+
+    fn callback_params(expr: &Expr) -> Option<Vec<&Pat>> {
+        match expr.unwrap_parens() {
+            Expr::Arrow(arrow) => Some(arrow.params.iter().collect()),
+            Expr::Fn(f) => Some(f.function.params.iter().map(|p| &p.pat).collect()),
+            _ => None,
+        }
+    }
+
+    /// The element name an `Object` enumeration gives its array:
+    /// `Object.keys(x)` / `getOwnPropertyNames` → `key`, `Object.entries(x)`
+    /// → `entry`, with the global `Object`. Looks through calls that keep
+    /// the elements (`Object.keys(x).sort()`).
+    fn object_enumeration_element(&self, expr: &Expr) -> Option<&'static str> {
+        let Expr::Call(call) = expr.unwrap_parens() else {
+            return None;
+        };
+        let Callee::Expr(callee) = &call.callee else {
+            return None;
+        };
+        let Expr::Member(MemberExpr {
+            obj,
+            prop: MemberProp::Ident(prop),
+            ..
+        }) = callee.as_ref()
+        else {
+            return None;
+        };
+        if matches!(obj.as_ref(), Expr::Ident(id) if is_unresolved_ident(id, "Object", self.unresolved_mark))
+        {
+            return match prop.sym.as_ref() {
+                "keys" | "getOwnPropertyNames" => Some("key"),
+                "entries" => Some("entry"),
+                _ => None,
+            };
+        }
+        match prop.sym.as_ref() {
+            "sort" | "filter" | "slice" | "reverse" => self.object_enumeration_element(obj),
+            _ => None,
+        }
+    }
+
+    fn reduce_element_name(&self, receiver: &Expr) -> String {
+        if let Some(name) = self.object_enumeration_element(receiver) {
+            return name.to_string();
+        }
+        role_tail_name(receiver)
+            .and_then(|name| singular_name(&name))
+            .unwrap_or_else(|| "item".to_string())
+    }
+
+    /// Loop elements of `for (let t = 0; t < ARR.length; t++) { const n =
+    /// ARR[t]; }`, also through a cached `r = ARR.length` in the init.
+    fn loop_element_params(for_stmt: &ForStmt) -> Vec<RoleParam> {
+        let Some(VarDeclOrExpr::VarDecl(init)) = &for_stmt.init else {
+            return Vec::new();
+        };
+        let Some(Pat::Ident(counter)) = init.decls.first().map(|d| &d.name) else {
+            return Vec::new();
+        };
+        let counter_id = (counter.id.sym.clone(), counter.id.ctxt);
+        let is_counter = |e: &Expr| matches!(e.unwrap_parens(), Expr::Ident(id) if (id.sym.clone(), id.ctxt) == counter_id);
+        let Some(Expr::Bin(test)) = for_stmt.test.as_deref() else {
+            return Vec::new();
+        };
+        use swc_core::ecma::ast::BinaryOp;
+        if !matches!(
+            test.op,
+            BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+        ) {
+            return Vec::new();
+        }
+        let bound = if is_counter(&test.left) {
+            test.right.as_ref()
+        } else if is_counter(&test.right) {
+            test.left.as_ref()
+        } else {
+            return Vec::new();
+        };
+        let length_of = |e: &Expr| match e.unwrap_parens() {
+            Expr::Member(MemberExpr {
+                obj,
+                prop: MemberProp::Ident(prop),
+                ..
+            }) if prop.sym == "length" => Some(obj.as_ref().clone()),
+            _ => None,
+        };
+        let array = length_of(bound).or_else(|| {
+            let Expr::Ident(bound_id) = bound.unwrap_parens() else {
+                return None;
+            };
+            init.decls
+                .iter()
+                .find_map(|d| match (&d.name, d.init.as_deref()) {
+                    (Pat::Ident(b), Some(value))
+                        if b.id.sym == bound_id.sym && b.id.ctxt == bound_id.ctxt =>
+                    {
+                        length_of(value)
+                    }
+                    _ => None,
+                })
+        });
+        let Some(array) = array else {
+            return Vec::new();
+        };
+        if !is_plain_access_path(&array) {
+            return Vec::new();
+        }
+        let Some(target) = role_tail_name(&array)
+            .filter(|name| name != "arguments")
+            .and_then(|name| singular_name(&name))
+        else {
+            return Vec::new();
+        };
+        let Stmt::Block(body) = for_stmt.body.as_ref() else {
+            return Vec::new();
+        };
+        let mut params = Vec::new();
+        for stmt in &body.stmts {
+            let Stmt::Decl(Decl::Var(var)) = stmt else {
+                continue;
+            };
+            for decl in &var.decls {
+                let (Some(binding), Some(Expr::Member(member))) = (
+                    Self::short_param(&decl.name),
+                    decl.init.as_deref().map(Expr::unwrap_parens),
+                ) else {
+                    continue;
+                };
+                let MemberProp::Computed(index) = &member.prop else {
+                    continue;
+                };
+                if is_counter(&index.expr) && same_access_path(&member.obj, &array) {
+                    let mut param = RoleParam::new(binding, &target);
+                    param.require_read = true;
+                    params.push(param);
+                }
+            }
+        }
+        params
+    }
+}
+
+/// `a`, `a.b`, `a.b.c` — reads with no side effects to compare by shape.
+fn is_plain_access_path(expr: &Expr) -> bool {
+    match expr.unwrap_parens() {
+        Expr::Ident(_) | Expr::This(_) => true,
+        Expr::Member(MemberExpr {
+            obj,
+            prop: MemberProp::Ident(_),
+            ..
+        }) => is_plain_access_path(obj),
+        _ => false,
+    }
+}
+
+fn same_access_path(a: &Expr, b: &Expr) -> bool {
+    match (a.unwrap_parens(), b.unwrap_parens()) {
+        (Expr::Ident(x), Expr::Ident(y)) => x.sym == y.sym && x.ctxt == y.ctxt,
+        (Expr::This(_), Expr::This(_)) => true,
+        (
+            Expr::Member(MemberExpr {
+                obj: xo,
+                prop: MemberProp::Ident(xp),
+                ..
+            }),
+            Expr::Member(MemberExpr {
+                obj: yo,
+                prop: MemberProp::Ident(yp),
+                ..
+            }),
+        ) => xp.sym == yp.sym && same_access_path(xo, yo),
+        _ => false,
+    }
+}
+
+/// The name an access path ends in (`e.rows` → `rows`), without the
+/// minified stem Wakaru keeps on names it builds (`e_rows` → `rows`).
+fn role_tail_name(expr: &Expr) -> Option<String> {
+    let raw = match expr.unwrap_parens() {
+        Expr::Ident(id) => id.sym.to_string(),
+        Expr::Member(MemberExpr {
+            prop: MemberProp::Ident(prop),
+            ..
+        }) => prop.sym.to_string(),
+        _ => return None,
+    };
+    let name = if is_synthesized_prefixed_name(&raw) {
+        raw.split_once('_').map(|(_, rest)| rest.to_string())?
+    } else {
+        raw
+    };
+    Some(name)
+}
+
+/// Singular of a plural identifier, only when the plural is unambiguous.
+/// camelCase names change their last word (`nodeIndices` → `nodeIndex`).
+fn singular_name(name: &str) -> Option<String> {
+    let split = name
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_ascii_uppercase())
+        .map_or(0, |(i, _)| i);
+    let (head, word) = name.split_at(split);
+    let lower = word.to_ascii_lowercase();
+    let singular = match lower.as_str() {
+        "children" => "child".to_string(),
+        "people" => "person".to_string(),
+        "indices" => "index".to_string(),
+        "vertices" => "vertex".to_string(),
+        "matrices" => "matrix".to_string(),
+        "caches" => "cache".to_string(),
+        "leaves" => "leaf".to_string(),
+        "halves" => "half".to_string(),
+        "lives" => "life".to_string(),
+        "aliases" => "alias".to_string(),
+        "movies" => "movie".to_string(),
+        "cookies" => "cookie".to_string(),
+        // Ambiguous or not a plural.
+        "axes" | "series" | "species" | "news" | "analyses" => return None,
+        w if w.ends_with("uses") || w.ends_with("oes") => return None,
+        w if w.ends_with("ies") && w.len() > 4 => format!("{}y", &w[..w.len() - 3]),
+        w if ["ches", "shes", "xes", "sses", "zzes"]
+            .iter()
+            .any(|suffix| w.ends_with(suffix)) =>
+        {
+            w[..w.len() - 2].to_string()
+        }
+        w if w.ends_with('s') && !w.ends_with("ss") && !w.ends_with("us") && !w.ends_with("is") => {
+            w[..w.len() - 1].to_string()
+        }
+        _ => return None,
+    };
+    // Restore the word's leading capital (`SheetNames` → `SheetName`).
+    let singular = if word.starts_with(|c: char| c.is_ascii_uppercase()) {
+        let mut chars = singular.chars();
+        chars
+            .next()
+            .map(|c| c.to_ascii_uppercase().to_string() + chars.as_str())?
+    } else {
+        singular
+    };
+    let result = format!("{head}{singular}");
+    (!is_likely_generated_alias(&result)
+        && !looks_mangled(&result)
+        && is_valid_js_ident(&result)
+        && !is_reserved_binding_name(&result))
+    .then_some(result)
+}
+
+impl Visit for RoleCollector {
+    fn visit_ident(&mut self, id: &Ident) {
+        self.record_name(&id.sym);
+        if let Some(uses) = self.tracked.get_mut(&(id.sym.clone(), id.ctxt)) {
+            uses.refs += 1;
+        }
+    }
+
+    fn visit_binding_ident(&mut self, binding: &BindingIdent) {
+        self.record_name(&binding.id.sym);
+        if let Some(uses) = self
+            .tracked
+            .get_mut(&(binding.id.sym.clone(), binding.id.ctxt))
+        {
+            uses.writes += 1;
+        }
+    }
+
+    fn visit_update_expr(&mut self, update: &swc_core::ecma::ast::UpdateExpr) {
+        if let Expr::Ident(id) = update.arg.unwrap_parens() {
+            if let Some(uses) = self.tracked.get_mut(&(id.sym.clone(), id.ctxt)) {
+                uses.writes += 1;
+            }
+        }
+        update.visit_children_with(self);
+    }
+
+    fn visit_catch_clause(&mut self, catch: &swc_core::ecma::ast::CatchClause) {
+        let params = catch
+            .param
+            .as_ref()
+            .and_then(Self::short_param)
+            .map(|binding| {
+                let mut param = RoleParam::new(binding, "error");
+                param.alternates = &["err"];
+                param.require_read = true;
+                param
+            })
+            .into_iter()
+            .collect();
+        self.with_scope(params, |this| {
+            this.with_frame(false, |this| {
+                this.declare_pats(catch.param.iter());
+                catch.visit_children_with(this);
+            })
+        });
+    }
+
+    fn visit_new_expr(&mut self, new: &swc_core::ecma::ast::NewExpr) {
+        let executor = match (new.callee.as_ref(), new.args.as_deref()) {
+            (Expr::Ident(callee), Some([first, ..]))
+                if first.spread.is_none()
+                    && is_unresolved_ident(callee, "Promise", self.unresolved_mark) =>
+            {
+                Self::callback_params(&first.expr).map(|params| (params, first.expr.as_ref()))
+            }
+            _ => None,
+        };
+        let Some((params, executor)) = executor else {
+            new.visit_children_with(self);
+            return;
+        };
+        let roles = params
+            .iter()
+            .zip(["resolve", "reject"])
+            .filter_map(|(pat, role)| {
+                Self::short_param(pat).map(|b| {
+                    let mut param = RoleParam::new(b, role);
+                    if role == "resolve" {
+                        param.alternates = &["resolvePromise"];
+                    } else {
+                        param.alternates = &["rejectPromise"];
+                        param.pair_with_previous = true;
+                    }
+                    param
+                })
+            })
+            .collect();
+        new.callee.visit_with(self);
+        self.with_scope(roles, |this| executor.visit_with(this));
+        for arg in new.args.iter().flatten().skip(1) {
+            arg.visit_with(self);
+        }
+    }
+
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        let reduce = match (&call.callee, call.args.first()) {
+            (Callee::Expr(callee), Some(first)) if first.spread.is_none() => {
+                match callee.as_ref() {
+                    Expr::Member(MemberExpr {
+                        obj,
+                        prop: MemberProp::Ident(prop),
+                        ..
+                    }) if matches!(prop.sym.as_ref(), "reduce" | "reduceRight") => {
+                        Self::callback_params(&first.expr)
+                            .map(|params| (obj.as_ref(), params, first.expr.as_ref()))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some((receiver, params, callback)) = reduce else {
+            call.visit_children_with(self);
+            return;
+        };
+        let element = self.reduce_element_name(receiver);
+        let roles = params
+            .iter()
+            .zip(["acc", element.as_str(), "index"])
+            .enumerate()
+            .filter_map(|(position, (pat, role))| {
+                Self::short_param(pat).map(|b| {
+                    let mut param = RoleParam::new(b, role);
+                    param.forbid_writes = position != 0;
+                    param
+                })
+            })
+            .collect();
+        call.callee.visit_with(self);
+        self.with_scope(roles, |this| callback.visit_with(this));
+        for arg in call.args.iter().skip(1) {
+            arg.visit_with(self);
+        }
+    }
+
+    fn visit_for_stmt(&mut self, for_stmt: &ForStmt) {
+        let params = Self::loop_element_params(for_stmt);
+        self.with_scope(params, |this| {
+            this.with_frame(false, |this| for_stmt.visit_children_with(this))
+        });
+    }
+
+    fn visit_for_in_stmt(&mut self, for_in: &ForInStmt) {
+        self.with_frame(false, |this| for_in.visit_children_with(this));
+    }
+
+    fn visit_for_of_stmt(&mut self, for_of: &ForOfStmt) {
+        self.with_frame(false, |this| for_of.visit_children_with(this));
+    }
+
+    fn visit_module(&mut self, module: &Module) {
+        self.with_frame(true, |this| module.visit_children_with(this));
+    }
+
+    fn visit_function(&mut self, function: &Function) {
+        self.with_frame(true, |this| {
+            this.declare_pats(function.params.iter().map(|p| &p.pat));
+            function.visit_children_with(this);
+        });
+    }
+
+    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+        self.with_frame(true, |this| {
+            this.declare_pats(arrow.params.iter());
+            arrow.visit_children_with(this);
+        });
+    }
+
+    fn visit_constructor(&mut self, ctor: &Constructor) {
+        self.with_frame(true, |this| {
+            let pats: Vec<&Pat> = ctor
+                .params
+                .iter()
+                .filter_map(|p| match p {
+                    ParamOrTsParamProp::Param(param) => Some(&param.pat),
+                    ParamOrTsParamProp::TsParamProp(_) => None,
+                })
+                .collect();
+            this.declare_pats(pats);
+            ctor.visit_children_with(this);
+        });
+    }
+
+    fn visit_block_stmt(&mut self, block: &BlockStmt) {
+        self.with_frame(false, |this| block.visit_children_with(this));
+    }
+
+    fn visit_var_decl(&mut self, var: &VarDecl) {
+        let mut names = HashSet::default();
+        collect_var_decl_names(var, &mut names);
+        self.declare(names, var.kind == VarDeclKind::Var);
+        var.visit_children_with(self);
+    }
+
+    fn visit_fn_decl(&mut self, decl: &FnDecl) {
+        self.declare(std::iter::once(decl.ident.sym.clone()).collect(), false);
+        decl.visit_children_with(self);
+    }
+
+    fn visit_class_decl(&mut self, decl: &ClassDecl) {
+        self.declare(std::iter::once(decl.ident.sym.clone()).collect(), false);
+        decl.visit_children_with(self);
+    }
+
+    fn visit_import_decl(&mut self, decl: &ImportDecl) {
+        let names = decl
+            .specifiers
+            .iter()
+            .map(|spec| match spec {
+                ImportSpecifier::Default(d) => d.local.sym.clone(),
+                ImportSpecifier::Named(n) => n.local.sym.clone(),
+                ImportSpecifier::Namespace(ns) => ns.local.sym.clone(),
+            })
+            .collect();
+        self.declare(names, false);
+        decl.visit_children_with(self);
+    }
 }
 
 // ============================================================
@@ -2871,7 +4496,7 @@ fn jsx_component_alias_rename_module(module: &mut Module, exported_bindings: &Ha
             !exported_bindings.contains(bid) && state.other_uses == 0 && state.jsx_uses > 0
         })
         .collect();
-    let mut target_counts = HashMap::new();
+    let mut target_counts = HashMap::default();
     for (_, state) in &eligible {
         *target_counts.entry(state.target.clone()).or_insert(0usize) += 1;
     }
@@ -3140,7 +4765,7 @@ mod tests {
 
     #[test]
     fn find_non_conflicting_name_uses_next_available_suffix() {
-        let used_names = HashSet::from([
+        let used_names = HashSet::from_iter([
             Atom::from("rest"),
             Atom::from("rest_1"),
             Atom::from("rest_2"),

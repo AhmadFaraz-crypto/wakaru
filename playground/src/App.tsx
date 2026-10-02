@@ -13,10 +13,11 @@ import type { WakaruWarning } from "./wasm/types";
 import type { Level } from "./lib/constants";
 import { DEFAULT_EXAMPLE } from "./lib/examples";
 import { createShareUrl, readShareState, SHARE_LIMIT_MESSAGE } from "./lib/share";
+import { readEmbedFlag, standaloneUrl } from "./lib/embed";
 import { parseMappings, lineColorClass, lineColorActiveClass, generateMappingCSS, LINE_COLORS_RGB } from "./lib/sourcemap";
 import type { MappingData } from "./lib/sourcemap";
 import { applyVuePreviewResult, resetVuePreview } from "./lib/vuePreview";
-import type { OutputView } from "./lib/vuePreview";
+import { resolveOutputPaneView, type OutputPaneView } from "./lib/outputPane";
 import {
   getProducerDescriptor,
   ROUND_TRIP_EXAMPLE,
@@ -29,6 +30,7 @@ const WAKARU_VERSION = import.meta.env.VITE_WAKARU_VERSION;
 const WAKARU_GIT_HASH = import.meta.env.VITE_WAKARU_GIT_HASH;
 const VERSION_LABEL = `v${WAKARU_VERSION}+${WAKARU_GIT_HASH}`;
 const INITIAL_SHARE_STATE = readShareState();
+const EMBED = readEmbedFlag(window.location.search);
 const INITIAL_AUTO_RUN_DELAY_MS = 80;
 const MIN_AUTO_RUN_DELAY_MS = 60;
 const MAX_AUTO_RUN_DELAY_MS = 300;
@@ -73,6 +75,7 @@ export function App() {
   const [vueSfcEnabled, setVueSfcEnabled] = useState(
     INITIAL_SHARE_STATE?.vueSfc ?? false
   );
+  const [diffView, setDiffView] = useState(false);
   const [warnings, setWarnings] = useState<WakaruWarning[]>([]);
   const [level, setLevel] = useState<Level>(INITIAL_SHARE_STATE?.level ?? "standard");
   const [formatter, setFormatter] = useState(
@@ -84,8 +87,9 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState<number | null>(null);
   const [shareStatus, setShareStatus] = useState<string | null>(null);
-  const [mappingEnabled, setMappingEnabled] = useState(false);
-  const formatterEnabled = formatter && !mappingEnabled;
+  const [mappingEnabled, setMappingEnabled] = useState(
+    INITIAL_SHARE_STATE?.mapping ?? false
+  );
   const [sourceMapJson, setSourceMapJson] = useState<string | undefined>();
   const [hoveredOutputLine, setHoveredOutputLine] = useState<number | null>(null);
   const [hoveredInputLine, setHoveredInputLine] = useState<number | null>(null);
@@ -105,7 +109,7 @@ export function App() {
   const latestInputRef = useRef({
     source: wakaruSource,
     level,
-    formatter: formatterEnabled,
+    formatter,
     vueSfc: vueSfcEnabled,
   });
   const shareStatusTimeoutRef = useRef<number | null>(null);
@@ -225,11 +229,11 @@ export function App() {
     latestInputRef.current = {
       source: wakaruSource,
       level,
-      formatter: formatterEnabled,
+      formatter,
       vueSfc: vueSfcEnabled,
     };
     inputVersionRef.current += 1;
-  }, [wakaruSource, level, formatterEnabled, vueSfcEnabled]);
+  }, [wakaruSource, level, formatter, vueSfcEnabled]);
 
   useEffect(() => {
     if (!wasmReady) return;
@@ -238,7 +242,7 @@ export function App() {
       void runDecompile();
     }, autoRunDelayRef.current);
     return () => window.clearTimeout(timeoutId);
-  }, [wakaruSource, level, formatterEnabled, vueSfcEnabled, wasmReady, runDecompile]);
+  }, [wakaruSource, level, formatter, vueSfcEnabled, wasmReady, runDecompile]);
 
   useEffect(() => {
     if (!isLoading) {
@@ -271,7 +275,8 @@ export function App() {
         mode,
         producer,
         level,
-        formatter: formatterEnabled,
+        formatter,
+        mapping: mappingEnabled,
         vueSfc: vueSfcEnabled,
         version: VERSION_LABEL,
       });
@@ -291,7 +296,7 @@ export function App() {
     } catch {
       showShareStatus("URL updated");
     }
-  }, [decompileSource, formatterEnabled, level, mode, producer, roundTripSource, showShareStatus, vueSfcEnabled]);
+  }, [decompileSource, formatter, level, mappingEnabled, mode, producer, roundTripSource, showShareStatus, vueSfcEnabled]);
 
   const handleVueSfcChange = useCallback((enabled: boolean) => {
     setVueSfcEnabled(enabled);
@@ -315,9 +320,19 @@ export function App() {
     }
   }, [sourceMapJson, output]);
 
-  const activeOutputView: OutputView = outputView === "vue" && vueSfc
-    ? "vue"
-    : "javascript";
+  const handleOutputViewChange = useCallback((view: OutputPaneView) => {
+    setDiffView(view === "diff");
+    if (view !== "diff") {
+      setVuePreview((current) => ({ ...current, view }));
+    }
+  }, []);
+
+  const activeOutputView = resolveOutputPaneView({
+    diffRequested: diffView,
+    diffAvailable: mode === "roundtrip",
+    vueRequested: outputView === "vue",
+    vueAvailable: vueSfc !== null,
+  });
   const mappingActive = mappingEnabled && activeOutputView === "javascript";
   const producerDescriptor = getProducerDescriptor(producer);
 
@@ -491,16 +506,17 @@ export function App() {
 
   return (
     <div className="app">
-      <Header
-        version={WAKARU_VERSION}
-        gitHash={WAKARU_GIT_HASH}
-      />
-      <Controls
+      {!EMBED && (
+        <Header
+          version={WAKARU_VERSION}
+          gitHash={WAKARU_GIT_HASH}
+        />
+      )}
+      {!EMBED && <Controls
         mode={mode}
         producer={producer}
         level={level}
-        formatter={formatterEnabled}
-        formatterDisabled={mappingEnabled}
+        formatter={formatter}
         mapping={mappingEnabled}
         vueSfc={vueSfcEnabled}
         onModeChange={setMode}
@@ -509,13 +525,14 @@ export function App() {
         onFormatterChange={setFormatter}
         onMappingChange={setMappingEnabled}
         onVueSfcChange={handleVueSfcChange}
+        onLoadExample={setDecompileSource}
         onShare={handleShare}
         isLoading={showRunningStatus}
         wasmReady={wasmReady}
         elapsed={elapsed}
         shareStatus={shareStatus}
         coveragePct={mappingData?.coveragePct ?? null}
-      />
+      />}
       <div ref={editorWrapRef} style={{ position: "relative", flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
         <canvas
           ref={canvasRef}
@@ -558,14 +575,24 @@ export function App() {
             javascriptLabel={mode === "roundtrip" ? "Wakaru restored" : "JavaScript"}
             vueSfcEnabled={vueSfcEnabled}
             vueSfc={vueSfc}
-            view={outputView}
-            onViewChange={(view: OutputView) => {
-              setVuePreview((current) => ({ ...current, view }));
-            }}
+            diffAvailable={mode === "roundtrip"}
+            diffOriginal={roundTripSource}
+            view={activeOutputView}
+            onViewChange={handleOutputViewChange}
             isLoading={isLoading}
             decorations={outputDecorations}
             onHoverLine={handleOutputHover}
             onEditorReady={(ed) => { outputEditorRef.current = ed; }}
+            trailing={EMBED ? (
+              <a
+                className="embed-open"
+                href={standaloneUrl(window.location.href)}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Open in playground ↗
+              </a>
+            ) : undefined}
           />
         </SplitLayout>
       </div>

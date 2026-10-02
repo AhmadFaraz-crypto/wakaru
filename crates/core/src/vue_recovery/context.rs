@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use swc_core::atoms::Atom;
@@ -335,7 +335,7 @@ fn object_bool_prop(object: &ObjectLit, name: &str, expected: bool) -> bool {
 /// that reuses the (minified) name; alias renaming uses it to build
 /// `SyntaxContext`-keyed `BindingRename`s for `rename_utils::BindingRenamer`.
 fn top_level_binding_ctxts(module: &Module) -> HashMap<Atom, SyntaxContext> {
-    let mut ctxts = HashMap::new();
+    let mut ctxts = HashMap::default();
     for item in &module.body {
         match item {
             ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
@@ -662,7 +662,7 @@ fn is_number_lit(expr: &Expr, value: f64) -> bool {
 }
 
 fn default_exported_bindings(module: &Module) -> HashSet<Atom> {
-    let mut bindings = HashSet::new();
+    let mut bindings = HashSet::default();
 
     for item in &module.body {
         let ModuleItem::ModuleDecl(decl) = item else {
@@ -724,7 +724,7 @@ pub(super) fn collect_script_local_context(
 }
 
 fn script_local_reserved_bindings(module: &Module, ctx: &VueRecoveryContext) -> HashSet<Atom> {
-    let mut reserved = HashSet::new();
+    let mut reserved = HashSet::default();
     reserved.extend(
         ctx.setup_script_bindings
             .iter()
@@ -785,7 +785,7 @@ fn emitted_decl_bindings(source: &str, ctx: &VueRecoveryContext) -> Vec<Atom> {
         return Vec::new();
     };
 
-    let mut bindings = HashSet::new();
+    let mut bindings = HashSet::default();
     for item in &module.body {
         match item {
             ModuleItem::Stmt(Stmt::Decl(decl)) => collect_decl_bindings(decl, &mut bindings),
@@ -830,7 +830,7 @@ fn collect_script_local_decl(
                 }) {
                     continue;
                 }
-                let mut bindings = HashSet::new();
+                let mut bindings = HashSet::default();
                 collect_pat_bindings(&declarator.name, &mut bindings);
                 if bindings.is_empty() {
                     continue;
@@ -1056,7 +1056,7 @@ fn colliding_import_aliases(
     used_bindings: &mut HashSet<Atom>,
 ) -> HashMap<Atom, Atom> {
     let import_refs = stmt_import_refs(stmt, &ctx.script_imports);
-    let mut aliases = HashMap::new();
+    let mut aliases = HashMap::default();
     for import_ref in import_refs {
         if !reserved_bindings.contains(&import_ref) {
             continue;

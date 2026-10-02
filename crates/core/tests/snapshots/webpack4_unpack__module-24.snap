@@ -55,8 +55,9 @@ HashRouter.propTypes = {
 };
 const x = (e)=>!!(e.metaKey || e.altKey || e.ctrlKey || e.shiftKey);
 export class Link extends Component {
-    constructor(...i){
-        super(...i);
+    constructor(...i_1){
+        super(...i_1);
+        var r = this;
         this.handleClick = (e)=>{
             if (r.props.onClick) {
                 r.props.onClick(e);
@@ -65,11 +66,11 @@ export class Link extends Component {
                 e.preventDefault();
                 const t = r.context.router.history;
                 const n = r.props;
-                const { replace: o, to: i } = n;
-                if (o) {
-                    t.replace(i);
+                const { replace, to } = n;
+                if (replace) {
+                    t.replace(to);
                 } else {
-                    t.push(i);
+                    t.push(to);
                 }
             }
         };
@@ -129,7 +130,7 @@ MemoryRouter.propTypes = {
     keyLength: u.number,
     children: u.node
 };
-const R = (e)=>Children.count(e) === 0;
+const R = (children)=>Children.count(children) === 0;
 export class Route extends Component {
     constructor(...i){
         super(...i);
@@ -231,7 +232,7 @@ Route.contextTypes = {
 Route.childContextTypes = {
     router: u.object.isRequired
 };
-export const NavLink = ({ to, exact, strict, location, activeClassName, className, activeStyle, style, isActive, "aria-current": aria_current, ...rest })=>{
+export const NavLink = function({ to, exact, strict, location, activeClassName, className, activeStyle, style, isActive, "aria-current": aria_current, ...rest }) {
     const p = (to === undefined ? "undefined" : typeof to) === "object" ? to.pathname : to;
     const h = p && p.replace(/([.+*?=^!:${}()[\]|/\\])/g, "\\$1");
     return <Route path={h} exact={exact} strict={strict} location={location} children={({ location, match })=>{
@@ -322,7 +323,7 @@ Prompt.contextTypes = {
 };
 const W = {};
 let $ = 0;
-export const generatePath = (e = "/", t = {})=>{
+export const generatePath = function(e = "/", t = {}) {
     if (e === "/") {
         return e;
     }
@@ -419,11 +420,11 @@ const X = (e)=>{
     }
     return `/${e}`;
 };
-const J = (e, t)=>{
-    if (e) {
+const J = (basename, t)=>{
+    if (basename) {
         return {
             ...t,
-            pathname: X(e) + t.pathname
+            pathname: X(basename) + t.pathname
         };
     }
     return t;
@@ -441,6 +442,7 @@ const te = ()=>{};
 export class StaticRouter extends Component {
     constructor(...i){
         super(...i);
+        var r = this;
         this.createHref = (e)=>X(r.props.basename + Z(e));
         this.handlePush = (e)=>{
             const r_props = r.props;
@@ -525,16 +527,16 @@ export class Switch extends Component {
     render() {
         const route = this.context.router.route;
         const children = this.props.children;
-        const n = this.props.location || route.location;
-        let r;
+        const location = this.props.location || route.location;
+        let computedMatch;
         let o;
         Children.forEach(children, (t)=>{
-            if (r == null && isValidElement(t)) {
+            if (computedMatch == null && isValidElement(t)) {
                 const i = t.props;
-                const { path: u, exact, strict, sensitive, from: f } = i;
-                const d = u || f;
+                const { path, exact, strict, sensitive, from } = i;
+                const d = path || from;
                 o = t;
-                r = a(n.pathname, {
+                computedMatch = a(location.pathname, {
                     path: d,
                     exact,
                     strict,
@@ -542,10 +544,10 @@ export class Switch extends Component {
                 }, route.match);
             }
         });
-        if (r) {
+        if (computedMatch) {
             return cloneElement(o, {
-                location: n,
-                computedMatch: r
+                location,
+                computedMatch
             });
         }
         return null;
@@ -561,7 +563,7 @@ Switch.propTypes = {
     location: u.object
 };
 export const matchPath = a;
-export const withRouter = (e)=>{
+export const withRouter = function(e) {
     const TComponent = ({ wrappedComponentRef, ...rest })=><Route children={(t)=>createElement(e, {
                 ...rest,
                 ...t,

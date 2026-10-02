@@ -1,31 +1,29 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::common::{Mark, Span, Spanned, DUMMY_SP};
 use swc_core::ecma::ast::{
     ArrayLit, ArrowExpr, ArrowFunctionBody, AssignExpr, AssignOp, AssignTarget, AwaitExpr,
-    BlockStmt, CallExpr, Callee, Decl, Expr, ExprOrSpread, ExprStmt, FnDecl, FnExpr, Function,
-    FunctionBody, Ident, ImportSpecifier, Lit, MemberExpr, MemberProp, Module, ModuleDecl,
-    ModuleItem, Number, ObjectLit, Param, ParenExpr, Pat, Prop, PropName, PropOrSpread, ReturnStmt,
-    SimpleAssignTarget, Stmt, SwitchCase, VarDeclarator, WhileStmt, YieldExpr,
+    BindingIdent, BlockStmt, CallExpr, Callee, Decl, Expr, ExprOrSpread, ExprStmt, FnDecl, FnExpr,
+    Function, FunctionBody, Ident, ImportSpecifier, Lit, MemberExpr, MemberProp, Module,
+    ModuleDecl, ModuleItem, Number, ObjectLit, Param, ParenExpr, Pat, Prop, PropName, PropOrSpread,
+    ReturnStmt, SimpleAssignTarget, Stmt, SwitchCase, VarDecl, VarDeclKind, VarDeclarator,
+    WhileStmt, YieldExpr,
 };
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use crate::facts::{HelperKind, ModuleFactsMap};
 
-use super::decl_utils::collect_pat_names;
-use super::helper_matcher::{
-    binding_key, count_binding_refs, member_prop_name, remove_fn_decls_by_binding,
-    remove_var_declarators_by_binding,
-};
+use super::decl_utils::{collect_pat_names, fresh_binding_ident};
+use super::eval_utils::module_has_with_stmt;
+use super::helper_matcher::{binding_key, member_prop_name, remove_unused_helper_declarations};
+use super::remove_void::finalize_synthesized_undefined;
 use super::state_machine::{
-    invert_condition, stmts_contain_state_opcode_return, ForwardJumpJoin, IndexLoopContinueMode,
-    OpcodeReturnScan, StateMachineProgram,
+    invert_condition, stmts_contain_state_opcode_return, CatchBindings, ForwardJumpJoin,
+    IndexLoopContinueMode, OpcodeReturnScan, StateMachineProgram,
 };
-use super::transpiler_helper_utils::{
-    BindingKey, LocalHelperContext, TranspilerHelperKind, TsHelperKind,
-};
-use super::un_async_await::try_transform_ts_generator_body;
+use super::transpiler_helper_utils::{BindingKey, LocalHelperContext, TranspilerHelperKind};
+use super::un_async_await::{try_transform_ts_generator_body, AsyncHelperContext};
 
 use crate::js_names::is_likely_generated_alias;
 use crate::utils::paren::strip_parens;
@@ -82,6 +80,7 @@ impl VisitMut for UnRegenerator<'_> {
             self.current_filename,
             &local_helpers,
         );
+        finalize_synthesized_undefined(module, self.unresolved_mark);
     }
 }
 
@@ -99,6 +98,22 @@ fn run_un_regenerator(
         .filter(|(_, kind)| **kind == TranspilerHelperKind::AsyncToGenerator)
         .map(|((sym, ctxt), _)| (sym.clone(), *ctxt))
         .collect();
+    let mut swc_members: Vec<_> = local_helpers
+        .swc_member_helpers_of_kind(TranspilerHelperKind::AsyncToGenerator)
+        .into_keys()
+        .collect();
+    if !swc_members.is_empty() {
+        let mut eval = super::eval_utils::DirectEvalPresence::default();
+        module.visit_with(&mut eval);
+        if eval.found || module_has_with_stmt(module) {
+            swc_members.clear();
+        } else {
+            let uses = crate::analysis::binding_uses::BindingUseIndex::collect(module);
+            swc_members.retain(|key| {
+                uses.has_single_declaration(key) && uses.has_only_static_member_reads(key, "_")
+            });
+        }
+    }
     let mut async_to_gen_default_members = Vec::new();
     if let Some(module_facts) = module_facts {
         let imported_helpers = collect_cross_module_async_helpers(
@@ -113,11 +128,11 @@ fn run_un_regenerator(
     let async_to_gen_callees = AsyncToGenCallees {
         direct: &async_to_gen_bindings,
         default_members: &async_to_gen_default_members,
+        swc_members: &swc_members,
     };
-    let generator_helpers: Vec<BindingKey> = local_helpers
-        .ts_helpers_of_kind(TsHelperKind::Generator)
-        .into_iter()
-        .collect();
+    let mut generator_helpers =
+        AsyncHelperContext::from_local_helpers(local_helpers, Some(unresolved_mark));
+    generator_helpers.record_module_hazards(module);
     let regenerator_runtime_helpers = collect_regenerator_runtime_helpers(module);
     let esbuild_async_helpers = collect_esbuild_async_helpers(module, unresolved_mark);
     let esbuild_yield_star_helpers = collect_esbuild_yield_star_helpers(module);
@@ -162,8 +177,8 @@ fn run_un_regenerator(
     remove_consumed_mark_declarations(module, &consumed_marks);
 
     // Phase 4: Remove _asyncToGenerator helper if no longer referenced
-    if !async_to_gen_bindings.is_empty() {
-        let roots: HashMap<BindingKey, TranspilerHelperKind> = helpers
+    if !async_to_gen_bindings.is_empty() || !swc_members.is_empty() {
+        let mut roots: HashMap<BindingKey, TranspilerHelperKind> = helpers
             .iter()
             .filter(|(key, kind)| {
                 **kind == TranspilerHelperKind::AsyncToGenerator
@@ -171,6 +186,11 @@ fn run_un_regenerator(
             })
             .map(|(key, kind)| (key.clone(), *kind))
             .collect();
+        roots.extend(
+            swc_members
+                .into_iter()
+                .map(|key| (key, TranspilerHelperKind::AsyncToGenerator)),
+        );
         local_helpers.remove_helpers_with_dependencies(module, roots);
     }
     if !regenerator_runtime_helpers.is_empty() {
@@ -184,6 +204,7 @@ fn run_un_regenerator(
 struct AsyncToGenCallees<'a> {
     direct: &'a [BindingKey],
     default_members: &'a [BindingKey],
+    swc_members: &'a [BindingKey],
 }
 
 #[derive(Default)]
@@ -291,7 +312,7 @@ fn module_exports_helper(
 fn collect_regenerator_runtime_helpers(
     module: &Module,
 ) -> HashMap<BindingKey, TranspilerHelperKind> {
-    let mut helpers = HashMap::new();
+    let mut helpers = HashMap::default();
     for item in &module.body {
         match item {
             ModuleItem::Stmt(Stmt::Decl(Decl::Fn(fn_decl)))
@@ -462,7 +483,7 @@ fn require_source(expr: &Expr, unresolved_mark: Mark) -> Option<Atom> {
 fn transform_babel_async_trampolines(
     module: &mut Module,
     async_to_gen_callees: &AsyncToGenCallees,
-    generator_helpers: &[BindingKey],
+    generator_helpers: &AsyncHelperContext,
     consumed_marks: &mut Vec<BindingKey>,
 ) {
     let mut index = 0;
@@ -589,7 +610,7 @@ fn extract_private_trampoline_body(
     item: &ModuleItem,
     private_key: &BindingKey,
     async_to_gen_callees: &AsyncToGenCallees,
-    generator_helpers: &[BindingKey],
+    generator_helpers: &AsyncHelperContext,
 ) -> Option<(Vec<Param>, Vec<Stmt>, Option<BindingKey>)> {
     let ModuleItem::Stmt(Stmt::Decl(Decl::Fn(fn_decl))) = item else {
         return None;
@@ -717,7 +738,7 @@ fn extract_async_assignment_arg_from_returned_apply(
 
 fn extract_async_to_gen_body_with_params(
     gen_fn_arg: Expr,
-    generator_helpers: &[BindingKey],
+    generator_helpers: &AsyncHelperContext,
 ) -> Option<(Vec<Param>, Vec<Stmt>, Option<BindingKey>)> {
     match gen_fn_arg {
         Expr::Fn(fn_expr) => {
@@ -810,7 +831,7 @@ impl Visit for BindingUseFinder {
 struct FunctionTransformer<'a> {
     unresolved_mark: Mark,
     async_to_gen_callees: &'a AsyncToGenCallees<'a>,
-    generator_helpers: &'a [BindingKey],
+    generator_helpers: &'a AsyncHelperContext,
     esbuild_async_helpers: &'a [BindingKey],
     esbuild_yield_star_helpers: &'a [BindingKey],
     consumed_marks: &'a mut Vec<BindingKey>,
@@ -994,7 +1015,7 @@ impl VisitMut for FunctionTransformer<'_> {
 
 /// Returns the consumed mark binding key (sym + ctxt) on success.
 fn try_transform_regenerator_wrap(body: &mut FunctionBody) -> Option<Option<BindingKey>> {
-    try_transform_regenerator_wrap_with_reserved(body, &HashSet::new())
+    try_transform_regenerator_wrap_with_reserved(body, &HashSet::default())
 }
 
 fn try_transform_regenerator_wrap_with_reserved(
@@ -1013,7 +1034,7 @@ fn try_transform_regenerator_wrap_with_reserved(
     let mark_name = extract_wrap_mark_key(&body.stmts[return_idx]);
 
     let ret_stmt = body.stmts[return_idx].clone();
-    let (state_name, cases, try_regions, hoisted_locals) = extract_wrap_args(ret_stmt)?;
+    let (state_param, cases, try_regions, hoisted_locals) = extract_wrap_args(ret_stmt)?;
 
     let mut name_collector = IdentifierNameCollector::default();
     for (idx, stmt) in body.stmts.iter().enumerate() {
@@ -1026,7 +1047,7 @@ fn try_transform_regenerator_wrap_with_reserved(
         outer_names.insert(mark_key.0.clone());
     }
 
-    let mut local_names = HashSet::new();
+    let mut local_names = HashSet::default();
     for stmt in &hoisted_locals {
         let Stmt::Decl(Decl::Var(var)) = stmt else {
             unreachable!("state-machine locals are restricted to var declarations")
@@ -1040,7 +1061,20 @@ fn try_transform_regenerator_wrap_with_reserved(
     }
 
     let mut new_stmts = hoisted_locals;
-    new_stmts.extend(decode_babel_state_machine(&state_name, cases, try_regions));
+    new_stmts.extend(decode_babel_state_machine(&state_param, cases, try_regions));
+    // Values that must survive a yield are parked in `_ctx.tN` slots. The
+    // state callback and its parameter are gone once the machine is decoded,
+    // so each slot becomes a local of the recovered function. Any other
+    // surviving reference to the state parameter has no object to reach;
+    // leave the function un-recovered rather than emit it.
+    let mut used_names = outer_names.clone();
+    used_names.extend(local_names.iter().cloned());
+    let mut body_names = IdentifierNameCollector::default();
+    new_stmts.visit_with(&mut body_names);
+    used_names.extend(body_names.names);
+    if !lower_state_temp_slots(&state_param, &mut new_stmts, &mut used_names) {
+        return None;
+    }
     // Safety net: if a forward conditional jump could not be structured, an
     // opcode goto (`return [3, N]`) leaks into the output. Rather than emit
     // broken control flow, leave the function un-recovered.
@@ -1052,8 +1086,160 @@ fn try_transform_regenerator_wrap_with_reserved(
     Some(mark_name)
 }
 
+/// Turn every `state.tN` slot in the decoded statements into a fresh local
+/// declared with `var` at the front of `stmts`. Returns `false` when a
+/// reference to the state parameter other than a slot survives.
+fn lower_state_temp_slots(
+    state_param: &Ident,
+    stmts: &mut Vec<Stmt>,
+    used_names: &mut HashSet<Atom>,
+) -> bool {
+    struct SlotCollector<'a> {
+        state_param: &'a Ident,
+        slots: Vec<Atom>,
+        other_state_reference: bool,
+    }
+
+    impl Visit for SlotCollector<'_> {
+        fn visit_member_expr(&mut self, member: &MemberExpr) {
+            if is_state_param_ref(&member.obj, self.state_param) {
+                match &member.prop {
+                    MemberProp::Ident(prop) if is_state_temp_slot_name(&prop.sym) => {
+                        if !self.slots.contains(&prop.sym) {
+                            self.slots.push(prop.sym.clone());
+                        }
+                    }
+                    MemberProp::Computed(computed) => {
+                        self.other_state_reference = true;
+                        computed.visit_with(self);
+                    }
+                    _ => self.other_state_reference = true,
+                }
+                return;
+            }
+            member.visit_children_with(self);
+        }
+
+        fn visit_ident(&mut self, ident: &Ident) {
+            if ident.sym == self.state_param.sym && ident.ctxt == self.state_param.ctxt {
+                self.other_state_reference = true;
+            }
+        }
+    }
+
+    let mut collector = SlotCollector {
+        state_param,
+        slots: Vec::new(),
+        other_state_reference: false,
+    };
+    stmts.visit_with(&mut collector);
+    if collector.other_state_reference {
+        return false;
+    }
+    if collector.slots.is_empty() {
+        return true;
+    }
+
+    let locals: HashMap<Atom, Ident> = collector
+        .slots
+        .iter()
+        .map(|slot| {
+            let mut candidate = slot.clone();
+            let mut counter = 1usize;
+            while used_names.contains(&candidate) {
+                candidate = Atom::from(format!("{slot}_{counter}"));
+                counter += 1;
+            }
+            used_names.insert(candidate.clone());
+            (slot.clone(), fresh_binding_ident(candidate, DUMMY_SP))
+        })
+        .collect();
+
+    struct SlotRewriter<'a> {
+        state_param: &'a Ident,
+        locals: &'a HashMap<Atom, Ident>,
+    }
+
+    impl SlotRewriter<'_> {
+        fn local_for(&self, member: &MemberExpr) -> Option<&Ident> {
+            if !is_state_param_ref(&member.obj, self.state_param) {
+                return None;
+            }
+            let MemberProp::Ident(prop) = &member.prop else {
+                return None;
+            };
+            self.locals.get(&prop.sym)
+        }
+    }
+
+    impl VisitMut for SlotRewriter<'_> {
+        fn visit_mut_expr(&mut self, expr: &mut Expr) {
+            expr.visit_mut_children_with(self);
+            if let Expr::Member(member) = expr {
+                if let Some(local) = self.local_for(member) {
+                    *expr = Expr::Ident(local.clone());
+                }
+            }
+        }
+
+        fn visit_mut_simple_assign_target(&mut self, target: &mut SimpleAssignTarget) {
+            target.visit_mut_children_with(self);
+            if let SimpleAssignTarget::Member(member) = target {
+                if let Some(local) = self.local_for(member) {
+                    *target = SimpleAssignTarget::Ident(BindingIdent {
+                        id: local.clone(),
+                        type_ann: None,
+                    });
+                }
+            }
+        }
+    }
+
+    stmts.visit_mut_with(&mut SlotRewriter {
+        state_param,
+        locals: &locals,
+    });
+
+    let decls = collector
+        .slots
+        .iter()
+        .map(|slot| VarDeclarator {
+            span: DUMMY_SP,
+            name: Pat::Ident(BindingIdent {
+                id: locals[slot].clone(),
+                type_ann: None,
+            }),
+            init: None,
+            definite: false,
+        })
+        .collect();
+    stmts.insert(
+        0,
+        Stmt::Decl(Decl::Var(Box::new(VarDecl {
+            span: DUMMY_SP,
+            ctxt: Default::default(),
+            kind: VarDeclKind::Var,
+            declare: false,
+            decls,
+        }))),
+    );
+    true
+}
+
+/// The state callback's parameter by resolver identity: a nested generator
+/// whose state parameter shares the minified name is a different binding.
+fn is_state_param_ref(expr: &Expr, state_param: &Ident) -> bool {
+    matches!(expr, Expr::Ident(id) if id.sym == state_param.sym && id.ctxt == state_param.ctxt)
+}
+
+/// Regenerator temp slots are spelled `t0`, `t1`, ...
+fn is_state_temp_slot_name(name: &Atom) -> bool {
+    let rest = name.strip_prefix('t').unwrap_or("");
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn binding_names_from_params(params: &[Param]) -> HashSet<Atom> {
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
     for param in params {
         collect_pat_names(&param.pat, &mut names);
     }
@@ -1104,30 +1290,30 @@ fn has_nested_control_flow_in_stmt(stmt: &Stmt) -> bool {
     let fn_expr = &call.args[0].expr;
     let cases = match fn_expr.as_ref() {
         Expr::Fn(f) => {
-            let param_name = match f.function.params.first().map(|p| &p.pat) {
-                Some(Pat::Ident(bi)) => bi.id.sym.clone(),
+            let state_param = match f.function.params.first().map(|p| &p.pat) {
+                Some(Pat::Ident(bi)) => bi.id.clone(),
                 _ => return false,
             };
             let Some(body) = &f.function.body else {
                 return false;
             };
-            extract_switch_cases_ref(body).map(|c| (param_name, c))
+            extract_switch_cases_ref(body).map(|c| (state_param, c))
         }
         Expr::Arrow(a) => {
-            let param_name = match a.params.first() {
-                Some(Pat::Ident(bi)) => bi.id.sym.clone(),
+            let state_param = match a.params.first() {
+                Some(Pat::Ident(bi)) => bi.id.clone(),
                 _ => return false,
             };
             match a.body.as_ref() {
                 swc_core::ecma::ast::ArrowFunctionBody::FunctionBody(body) => {
-                    extract_switch_cases_ref(body).map(|c| (param_name, c))
+                    extract_switch_cases_ref(body).map(|c| (state_param, c))
                 }
                 _ => None,
             }
         }
         _ => None,
     };
-    let Some((state_name, cases)) = cases else {
+    let Some((state_param, cases)) = cases else {
         return false;
     };
     // Check each case's top-level statements for nested blocks that
@@ -1136,8 +1322,8 @@ fn has_nested_control_flow_in_stmt(stmt: &Stmt) -> bool {
     // structurally, so it does not count as unsupported control flow.
     for case in cases {
         for stmt in &case.cons {
-            if has_state_ops_in_nested_block(&state_name, stmt)
-                && !is_supported_nested_state_jump(&state_name, stmt)
+            if has_state_ops_in_nested_block(&state_param, stmt)
+                && !is_supported_nested_state_jump(&state_param, stmt)
             {
                 return true;
             }
@@ -1147,7 +1333,7 @@ fn has_nested_control_flow_in_stmt(stmt: &Stmt) -> bool {
     // as the 4th .wrap() argument.
     if wrap_try_regions.is_empty() {
         for case in cases {
-            if case_uses_catch(&state_name, case) {
+            if case_uses_catch(&state_param, case) {
                 return true;
             }
         }
@@ -1155,44 +1341,44 @@ fn has_nested_control_flow_in_stmt(stmt: &Stmt) -> bool {
     false
 }
 
-fn is_supported_nested_state_jump(state_name: &Atom, stmt: &Stmt) -> bool {
+fn is_supported_nested_state_jump(state_param: &Ident, stmt: &Stmt) -> bool {
     let Stmt::If(if_stmt) = stmt else {
         return false;
     };
     if if_stmt.alt.is_some() {
         return false;
     }
-    extract_next_break_target(state_name, &if_stmt.cons).is_some()
+    extract_next_break_target(state_param, &if_stmt.cons).is_some()
 }
 
 /// Check if a statement contains _ctx.next assignments or break statements
 /// inside nested blocks (if/else, block statements, etc.) — not at the top level.
-fn has_state_ops_in_nested_block(state_name: &Atom, stmt: &Stmt) -> bool {
+fn has_state_ops_in_nested_block(state_param: &Ident, stmt: &Stmt) -> bool {
     match stmt {
         Stmt::If(if_stmt) => {
-            has_state_ops_deep(state_name, &if_stmt.cons)
+            has_state_ops_deep(state_param, &if_stmt.cons)
                 || if_stmt
                     .alt
                     .as_ref()
-                    .is_some_and(|alt| has_state_ops_deep(state_name, alt))
+                    .is_some_and(|alt| has_state_ops_deep(state_param, alt))
         }
         Stmt::Block(block) => block
             .stmts
             .iter()
-            .any(|s| has_state_ops_deep(state_name, s)),
+            .any(|s| has_state_ops_deep(state_param, s)),
         _ => false,
     }
 }
 
-fn has_state_ops_deep(state_name: &Atom, stmt: &Stmt) -> bool {
+fn has_state_ops_deep(state_param: &Ident, stmt: &Stmt) -> bool {
     struct Finder {
-        state_name: Atom,
+        state_param: Ident,
         found: bool,
     }
     impl swc_core::ecma::visit::Visit for Finder {
         fn visit_assign_expr(&mut self, assign: &swc_core::ecma::ast::AssignExpr) {
             if let Some(left_member) = assign.left.as_simple().and_then(|s| s.as_member()) {
-                if is_ident_with_name(&left_member.obj, &self.state_name)
+                if is_state_param_ref(&left_member.obj, &self.state_param)
                     && is_next_prop(&left_member.prop)
                 {
                     self.found = true;
@@ -1206,7 +1392,7 @@ fn has_state_ops_deep(state_name: &Atom, stmt: &Stmt) -> bool {
         }
     }
     let mut f = Finder {
-        state_name: state_name.clone(),
+        state_param: state_param.clone(),
         found: false,
     };
     stmt.visit_with(&mut f);
@@ -1214,16 +1400,16 @@ fn has_state_ops_deep(state_name: &Atom, stmt: &Stmt) -> bool {
 }
 
 /// Check if a switch case contains `_ctx.catch(...)` calls — signals try/catch.
-fn case_uses_catch(state_name: &Atom, case: &SwitchCase) -> bool {
+fn case_uses_catch(state_param: &Ident, case: &SwitchCase) -> bool {
     struct CatchFinder {
-        state_name: Atom,
+        state_param: Ident,
         found: bool,
     }
     impl swc_core::ecma::visit::Visit for CatchFinder {
         fn visit_call_expr(&mut self, call: &swc_core::ecma::ast::CallExpr) {
             if let Some(callee) = call.callee.as_expr() {
                 if let Expr::Member(member) = callee.as_ref() {
-                    if is_ident_with_name(&member.obj, &self.state_name)
+                    if is_state_param_ref(&member.obj, &self.state_param)
                         && member_prop_name(&member.prop, "catch")
                     {
                         self.found = true;
@@ -1235,7 +1421,7 @@ fn case_uses_catch(state_name: &Atom, case: &SwitchCase) -> bool {
         }
     }
     let mut f = CatchFinder {
-        state_name: state_name.clone(),
+        state_param: state_param.clone(),
         found: false,
     };
     for stmt in &case.cons {
@@ -1433,26 +1619,26 @@ fn is_state_machine_fn(expr: &Expr) -> bool {
             if fn_expr.function.params.len() != 1 {
                 return false;
             }
-            let param_name = match &fn_expr.function.params[0].pat {
-                Pat::Ident(bi) => &bi.id.sym,
+            let state_param = match &fn_expr.function.params[0].pat {
+                Pat::Ident(bi) => &bi.id,
                 _ => return false,
             };
             let Some(body) = &fn_expr.function.body else {
                 return false;
             };
-            has_state_machine_structure(body, param_name)
+            has_state_machine_structure(body, state_param)
         }
         Expr::Arrow(arrow) => {
             if arrow.params.len() != 1 {
                 return false;
             }
-            let param_name = match &arrow.params[0] {
-                Pat::Ident(bi) => &bi.id.sym,
+            let state_param = match &arrow.params[0] {
+                Pat::Ident(bi) => &bi.id,
                 _ => return false,
             };
             match arrow.body.as_ref() {
                 swc_core::ecma::ast::ArrowFunctionBody::FunctionBody(body) => {
-                    has_state_machine_structure(body, param_name)
+                    has_state_machine_structure(body, state_param)
                 }
                 _ => false,
             }
@@ -1463,7 +1649,7 @@ fn is_state_machine_fn(expr: &Expr) -> bool {
 
 /// Check for `while(true) { switch(param.prev = param.next) { ... case "end": ... } }`
 /// or `for(;;) { switch(...) { ... } }`
-fn has_state_machine_structure(body: &FunctionBody, param_name: &Atom) -> bool {
+fn has_state_machine_structure(body: &FunctionBody, state_param: &Ident) -> bool {
     // Look for a while(true) or for(;;) loop containing the switch
     for stmt in &body.stmts {
         match stmt {
@@ -1471,7 +1657,7 @@ fn has_state_machine_structure(body: &FunctionBody, param_name: &Atom) -> bool {
                 if !is_true_expr(&while_stmt.test) {
                     continue;
                 }
-                if loop_body_has_state_switch(while_stmt.body.as_ref(), param_name) {
+                if loop_body_has_state_switch(while_stmt.body.as_ref(), state_param) {
                     return true;
                 }
             }
@@ -1480,7 +1666,7 @@ fn has_state_machine_structure(body: &FunctionBody, param_name: &Atom) -> bool {
                 if for_stmt.init.is_some() || for_stmt.test.is_some() || for_stmt.update.is_some() {
                     continue;
                 }
-                if loop_body_has_state_switch(for_stmt.body.as_ref(), param_name) {
+                if loop_body_has_state_switch(for_stmt.body.as_ref(), state_param) {
                     return true;
                 }
             }
@@ -1500,10 +1686,10 @@ fn is_true_expr(expr: &Expr) -> bool {
 
 /// Check if a block contains `switch(param.prev = param.next) { ... }` or
 /// Babel 7.27+ `switch(param.n) { ... }`.
-fn has_state_switch(block: &BlockStmt, param_name: &Atom) -> bool {
+fn has_state_switch(block: &BlockStmt, state_param: &Ident) -> bool {
     for stmt in &block.stmts {
         if let Stmt::Switch(sw) = stmt {
-            if is_state_switch_discriminant(&sw.discriminant, param_name) {
+            if is_state_switch_discriminant(&sw.discriminant, state_param) {
                 return true;
             }
         }
@@ -1511,10 +1697,10 @@ fn has_state_switch(block: &BlockStmt, param_name: &Atom) -> bool {
     false
 }
 
-fn loop_body_has_state_switch(stmt: &Stmt, param_name: &Atom) -> bool {
+fn loop_body_has_state_switch(stmt: &Stmt, state_param: &Ident) -> bool {
     match stmt {
-        Stmt::Switch(sw) => is_state_switch_discriminant(&sw.discriminant, param_name),
-        Stmt::Block(block) => has_state_switch(block, param_name),
+        Stmt::Switch(sw) => is_state_switch_discriminant(&sw.discriminant, state_param),
+        Stmt::Block(block) => has_state_switch(block, state_param),
         _ => false,
     }
 }
@@ -1534,9 +1720,9 @@ fn switch_cases_from_loop_body_ref(stmt: &Stmt) -> Option<&[SwitchCase]> {
     }
 }
 
-fn is_state_switch_discriminant(expr: &Expr, param_name: &Atom) -> bool {
+fn is_state_switch_discriminant(expr: &Expr, state_param: &Ident) -> bool {
     if let Expr::Member(member) = expr {
-        return is_ident_with_name(&member.obj, param_name) && is_next_prop(&member.prop);
+        return is_state_param_ref(&member.obj, state_param) && is_next_prop(&member.prop);
     }
 
     let Expr::Assign(assign) = expr else {
@@ -1549,18 +1735,18 @@ fn is_state_switch_discriminant(expr: &Expr, param_name: &Atom) -> bool {
     let Some(left_member) = assign.left.as_simple().and_then(|s| s.as_member()) else {
         return false;
     };
-    if !is_ident_with_name(&left_member.obj, param_name) || !is_prev_prop(&left_member.prop) {
+    if !is_state_param_ref(&left_member.obj, state_param) || !is_prev_prop(&left_member.prop) {
         return false;
     }
     let Expr::Member(right_member) = assign.right.as_ref() else {
         return false;
     };
-    is_ident_with_name(&right_member.obj, param_name) && is_next_prop(&right_member.prop)
+    is_state_param_ref(&right_member.obj, state_param) && is_next_prop(&right_member.prop)
 }
 
 fn extract_wrap_args(
     stmt: Stmt,
-) -> Option<(Atom, Vec<SwitchCase>, Vec<[Option<usize>; 4]>, Vec<Stmt>)> {
+) -> Option<(Ident, Vec<SwitchCase>, Vec<[Option<usize>; 4]>, Vec<Stmt>)> {
     let Stmt::Return(ret) = stmt else { return None };
     let arg = *ret.arg?;
     let Expr::Call(call) = arg else { return None };
@@ -1580,8 +1766,8 @@ fn extract_wrap_args(
 
     let try_regions = extract_wrap_try_regions_from_call(&call);
     let fn_arg = *call.args.into_iter().next()?.expr;
-    let (state_name, cases, hoisted_locals) = extract_state_machine_parts(fn_arg)?;
-    Some((state_name, cases, try_regions, hoisted_locals))
+    let (state_param, cases, hoisted_locals) = extract_state_machine_parts(fn_arg)?;
+    Some((state_param, cases, try_regions, hoisted_locals))
 }
 
 fn extract_wrap_try_regions_from_call(
@@ -1622,20 +1808,20 @@ fn parse_try_region_array(arr: &ArrayLit) -> Option<[Option<usize>; 4]> {
     Some(region)
 }
 
-fn extract_state_machine_parts(expr: Expr) -> Option<(Atom, Vec<SwitchCase>, Vec<Stmt>)> {
+fn extract_state_machine_parts(expr: Expr) -> Option<(Ident, Vec<SwitchCase>, Vec<Stmt>)> {
     match expr {
         Expr::Fn(fn_expr) => {
-            let param_name = match &fn_expr.function.params.first()?.pat {
-                Pat::Ident(bi) => bi.id.sym.clone(),
+            let state_param = match &fn_expr.function.params.first()?.pat {
+                Pat::Ident(bi) => bi.id.clone(),
                 _ => return None,
             };
             let body = fn_expr.function.body?;
             let (cases, hoisted_locals) = extract_switch_cases_from_body(body)?;
-            Some((param_name, cases, hoisted_locals))
+            Some((state_param, cases, hoisted_locals))
         }
         Expr::Arrow(arrow) => {
-            let param_name = match &arrow.params.first()? {
-                Pat::Ident(bi) => bi.id.sym.clone(),
+            let state_param = match &arrow.params.first()? {
+                Pat::Ident(bi) => bi.id.clone(),
                 _ => return None,
             };
             let body = match *arrow.body {
@@ -1643,7 +1829,7 @@ fn extract_state_machine_parts(expr: Expr) -> Option<(Atom, Vec<SwitchCase>, Vec
                 _ => return None,
             };
             let (cases, hoisted_locals) = extract_switch_cases_from_body(body)?;
-            Some((param_name, cases, hoisted_locals))
+            Some((state_param, cases, hoisted_locals))
         }
         _ => None,
     }
@@ -1704,14 +1890,23 @@ fn switch_cases_from_loop_body(stmt: Stmt) -> Option<Vec<SwitchCase>> {
 // ============================================================
 
 fn decode_babel_state_machine(
-    state_name: &Atom,
+    state_param: &Ident,
     cases: Vec<SwitchCase>,
     mut trys: Vec<[Option<usize>; 4]>,
 ) -> Vec<Stmt> {
     infer_try_region_nexts(&mut trys, &cases);
+    let folded_aliases: HashSet<Atom> = cases
+        .iter()
+        .flat_map(|case| case.cons.iter())
+        .filter_map(|stmt| match extract_catch_value_alias(state_param, stmt)? {
+            CatchValueAlias::LocalIdent((name, _)) => Some(name),
+            CatchValueAlias::StateMember(_) => None,
+        })
+        .collect();
+    let mut catch_bindings = CatchBindings::for_cases(&cases, &folded_aliases);
     // Collect (label_idx, stmt) pairs
     let mut flat: Vec<(usize, Stmt)> = Vec::new();
-    let mut skip_delegate_result_assignments: HashSet<(usize, usize)> = HashSet::new();
+    let mut skip_delegate_result_assignments: HashSet<(usize, usize)> = HashSet::default();
 
     for case in &cases {
         let idx = match case_label_index(case) {
@@ -1721,8 +1916,14 @@ fn decode_babel_state_machine(
         let next_case_label = next_numeric_case_label(&cases, idx);
 
         let mut catch_aliases = Vec::new();
-        let is_catch = is_catch_label(idx, &trys);
+        let catch_binding = catch_bindings.for_label(idx, &trys);
         let stmts = &case.cons;
+        // The label the decoded statements belong to. Regenerator numbers
+        // every instruction but only emits a `case` for jump targets, so a try
+        // entry that nothing jumps to (`_ctx.prev = N` after a guard in the
+        // same case) starts mid-case: statements after it sit at label N of the
+        // try table, not at the case label.
+        let mut label = idx;
         let mut i = 0;
         while i < stmts.len() {
             let stmt = &stmts[i];
@@ -1735,14 +1936,15 @@ fn decode_babel_state_machine(
             // Detect _ctx.next = N; break; pairs. When N < idx (a back-edge),
             // preserve the goto as `return [3, N]` so `recover_index_loops`
             // can reconstruct for-loops. Forward/fallthrough gotos are dropped.
-            if is_next_assign(state_name, stmt) {
-                if let Some(target) = extract_state_next_assign_target(state_name, stmt) {
+            if is_next_assign(state_param, stmt) {
+                if let Some(target) = extract_state_next_assign_target(state_param, stmt) {
                     if i + 1 < stmts.len() && matches!(stmts[i + 1], Stmt::Break(_)) {
                         if target > 0
-                            && (target < idx || (target > idx && Some(target) != next_case_label))
-                            && !is_try_region_exit(idx, target, &trys)
+                            && (target < label
+                                || (target > label && Some(target) != next_case_label))
+                            && !is_try_region_exit(label, target, &trys)
                         {
-                            flat.push((idx, jump_return_stmt(target)));
+                            flat.push((label, jump_return_stmt(target)));
                         }
                         i += 2;
                         continue;
@@ -1752,59 +1954,69 @@ fn decode_babel_state_machine(
                 continue;
             }
 
-            // Skip Babel's `_ctx.prev = N` / `_ctx.p = N` bookkeeping.
-            if is_prev_assign(state_name, stmt) {
+            // Babel's `_ctx.prev = N` / `_ctx.p = N` bookkeeping. A try entry
+            // past the case label relabels the rest of the case (see `label`).
+            if is_prev_assign(state_param, stmt) {
+                if let Some(entry) = extract_prev_assign_target(state_param, stmt) {
+                    if entry > label && trys.iter().any(|region| region[0] == Some(entry)) {
+                        label = entry;
+                    }
+                }
                 i += 1;
                 continue;
             }
 
             // Skip _ctx.label = N (tslib-style, shouldn't appear but be safe)
-            if is_label_assign(state_name, stmt) {
+            if is_label_assign(state_param, stmt) {
                 i += 1;
                 continue;
             }
 
             // Handle _ctx.trys.push([...]) for try/catch regions
-            if let Some(region) = extract_trys_push(state_name, stmt) {
+            if let Some(region) = extract_trys_push(state_param, stmt) {
                 trys.push(region);
                 i += 1;
                 continue;
             }
 
-            if is_catch {
-                if let Some(alias) = extract_catch_value_alias(state_name, stmt) {
+            if catch_binding.is_some() {
+                if let Some(alias) = extract_catch_value_alias(state_param, stmt) {
                     catch_aliases.push(alias);
+                    i += 1;
+                    continue;
+                }
+                // A minifier drops the unused temp of `_t = _ctx.v` and keeps
+                // the bare read. It hands over the caught value and is not
+                // part of the catch body.
+                if is_discarded_catch_value_read(state_param, stmt) {
                     i += 1;
                     continue;
                 }
             }
 
             let mut stmt = stmt.clone();
-            if is_catch {
+            if let Some(catch_binding) = &catch_binding {
                 let mut replacer = CatchValueReplacer {
-                    state_name: state_name.clone(),
+                    state_param: state_param.clone(),
                     aliases: catch_aliases.clone(),
-                    replacement: Box::new(Expr::Ident(Ident::new_no_ctxt(
-                        "error".into(),
-                        DUMMY_SP,
-                    ))),
+                    replacement: Box::new(Expr::Ident(catch_binding.clone())),
                 };
                 stmt.visit_mut_with(&mut replacer);
             }
 
-            if let Some((decoded, consumed)) = decode_nested_state_jump(state_name, &stmts[i..]) {
-                flat.push((idx, decoded));
+            if let Some((decoded, consumed)) = decode_nested_state_jump(state_param, &stmts[i..]) {
+                flat.push((label, decoded));
                 i += consumed;
                 continue;
             }
 
             // Handle return statements (yields, abrupt returns, stop)
             if let Stmt::Return(ret) = &stmt {
-                if let Some(decoded) = decode_return(state_name, ret) {
+                if let Some(decoded) = decode_return(state_param, ret) {
                     match decoded {
                         DecodedReturn::Return(expr) => {
                             flat.push((
-                                idx,
+                                label,
                                 Stmt::Return(ReturnStmt {
                                     span: DUMMY_SP,
                                     arg: Some(expr),
@@ -1813,7 +2025,7 @@ fn decode_babel_state_machine(
                         }
                         DecodedReturn::ReturnVoid => {
                             flat.push((
-                                idx,
+                                label,
                                 Stmt::Return(ReturnStmt {
                                     span: DUMMY_SP,
                                     arg: None,
@@ -1822,7 +2034,7 @@ fn decode_babel_state_machine(
                         }
                         DecodedReturn::Throw(expr) => {
                             flat.push((
-                                idx,
+                                label,
                                 Stmt::Throw(swc_core::ecma::ast::ThrowStmt {
                                     span: DUMMY_SP,
                                     arg: expr,
@@ -1833,7 +2045,7 @@ fn decode_babel_state_machine(
                         DecodedReturn::CommaYield(expr) => {
                             // return _ctx.next = N, value → yield value
                             flat.push((
-                                idx,
+                                label,
                                 Stmt::Expr(ExprStmt {
                                     span: DUMMY_SP,
                                     expr: Box::new(Expr::Yield(YieldExpr {
@@ -1854,7 +2066,7 @@ fn decode_babel_state_machine(
                             {
                                 if let Some((assign_index, assign_stmt)) =
                                     extract_delegate_result_assignment(
-                                        state_name,
+                                        state_param,
                                         &cases,
                                         next_loc,
                                         result_name,
@@ -1863,10 +2075,10 @@ fn decode_babel_state_machine(
                                 {
                                     skip_delegate_result_assignments
                                         .insert((next_loc, assign_index));
-                                    flat.push((idx, assign_stmt));
+                                    flat.push((label, assign_stmt));
                                 } else {
                                     flat.push((
-                                        idx,
+                                        label,
                                         Stmt::Expr(ExprStmt {
                                             span: DUMMY_SP,
                                             expr: delegate_yield_expr(expr),
@@ -1875,7 +2087,7 @@ fn decode_babel_state_machine(
                                 }
                             } else {
                                 flat.push((
-                                    idx,
+                                    label,
                                     Stmt::Expr(ExprStmt {
                                         span: DUMMY_SP,
                                         expr: delegate_yield_expr(expr),
@@ -1889,9 +2101,9 @@ fn decode_babel_state_machine(
                 }
                 // Plain return with non-pattern expression: treat as yield
                 if let Some(arg) = &ret.arg {
-                    if !is_stop_call(state_name, arg) {
+                    if !is_stop_call(state_param, arg) {
                         flat.push((
-                            idx,
+                            label,
                             Stmt::Expr(ExprStmt {
                                 span: DUMMY_SP,
                                 expr: Box::new(Expr::Yield(YieldExpr {
@@ -1917,7 +2129,7 @@ fn decode_babel_state_machine(
             }
 
             // Regular statement — emit as-is
-            flat.push((idx, stmt));
+            flat.push((label, stmt));
             i += 1;
         }
     }
@@ -1925,17 +2137,14 @@ fn decode_babel_state_machine(
     // Phase 2: merge _ctx.sent with previous yield
     let mut output: Vec<(usize, Stmt)> = Vec::new();
     for (idx, stmt) in flat {
-        if is_standalone_sent(state_name, &stmt) {
+        if is_standalone_sent(state_param, &stmt) {
             continue;
         }
-        if stmt_uses_sent(state_name, &stmt) {
-            if is_catch_label(idx, &trys) {
+        if stmt_uses_sent(state_param, &stmt) {
+            if let Some(catch_binding) = catch_bindings.for_label(idx, &trys) {
                 let mut replacer = SentReplacer {
-                    state_name: state_name.clone(),
-                    replacement: Box::new(Expr::Ident(Ident::new_no_ctxt(
-                        "error".into(),
-                        DUMMY_SP,
-                    ))),
+                    state_param: state_param.clone(),
+                    replacement: Box::new(Expr::Ident(catch_binding)),
                 };
                 let mut s = stmt;
                 s.visit_mut_with(&mut replacer);
@@ -1950,7 +2159,7 @@ fn decode_babel_state_machine(
                         arg: Some(arg),
                     }));
                     let mut replacer = SentReplacer {
-                        state_name: state_name.clone(),
+                        state_param: state_param.clone(),
                         replacement: yield_expr,
                     };
                     let mut s = stmt.clone();
@@ -1965,7 +2174,7 @@ fn decode_babel_state_machine(
                 output.push((idx, merged_stmt));
             } else {
                 let mut replacer = SentReplacer {
-                    state_name: state_name.clone(),
+                    state_param: state_param.clone(),
                     replacement: Box::new(Expr::Ident(Ident::new_no_ctxt(
                         "undefined".into(),
                         DUMMY_SP,
@@ -1981,21 +2190,23 @@ fn decode_babel_state_machine(
     }
 
     // Phase 3: Detect infinite loops (case 0 → ... → goto 0 pattern)
-    let has_back_edge_to_zero = detect_back_edge_to_zero(state_name, &cases);
+    let has_back_edge_to_zero = detect_back_edge_to_zero(state_param, &cases);
 
     let mut result = StateMachineProgram::from_labeled_stmts(output, trys)
+        .with_catch_bindings(catch_bindings)
+        .with_index_loops(IndexLoopContinueMode::SingleBodyJumpTarget)
         .recover_conditional_assignments()
         .recover_conditional_branches(OpcodeReturnScan::IncludeNestedFunctions)
         // MidMachine joins are unsound here: a regenerator yield resumes at the
         // `_ctx.next` label set before it, not the lexically next case, so
         // folding up to a join can keep blocks the original machine skips
-        // (see bail_on_nested_control_flow).
+        // (see the `bail_on_nested_control_flow` test in un_regenerator_rule.rs).
         .resolve_labeled_forward_jumps(
             OpcodeReturnScan::IncludeNestedFunctions,
             ForwardJumpJoin::EndOfMachine,
         )
         .into_reconstructed_stmts_with_index_loops(IndexLoopContinueMode::SingleBodyJumpTarget);
-    fold_state_temp_member_calls(state_name, &mut result);
+    fold_state_temp_member_calls(state_param, &mut result);
 
     // Wrap in while(true) if we detected a back-edge to case 0
     if has_back_edge_to_zero && !result.is_empty() {
@@ -2016,7 +2227,7 @@ fn decode_babel_state_machine(
     result
 }
 
-fn detect_back_edge_to_zero(state_name: &Atom, cases: &[SwitchCase]) -> bool {
+fn detect_back_edge_to_zero(state_param: &Ident, cases: &[SwitchCase]) -> bool {
     for case in cases {
         let idx = match case_label_index(case) {
             Some(n) => n,
@@ -2026,13 +2237,13 @@ fn detect_back_edge_to_zero(state_name: &Atom, cases: &[SwitchCase]) -> bool {
             continue;
         }
         for stmt in &case.cons {
-            if is_next_assign_to(state_name, stmt, 0) {
+            if is_next_assign_to(state_param, stmt, 0) {
                 return true;
             }
             // Check comma operator: return _ctx.next = 0, ...
             if let Stmt::Return(ret) = stmt {
                 if let Some(arg) = &ret.arg {
-                    if is_comma_next_assign_to(state_name, arg, 0) {
+                    if is_comma_next_assign_to(state_param, arg, 0) {
                         return true;
                     }
                 }
@@ -2042,18 +2253,18 @@ fn detect_back_edge_to_zero(state_name: &Atom, cases: &[SwitchCase]) -> bool {
     false
 }
 
-fn decode_nested_state_jump(state_name: &Atom, stmts: &[Stmt]) -> Option<(Stmt, usize)> {
+fn decode_nested_state_jump(state_param: &Ident, stmts: &[Stmt]) -> Option<(Stmt, usize)> {
     let Stmt::If(if_stmt) = stmts.first()? else {
         return None;
     };
     if if_stmt.alt.is_some() {
         return None;
     }
-    let goto_target = extract_next_break_target(state_name, &if_stmt.cons)?;
+    let goto_target = extract_next_break_target(state_param, &if_stmt.cons)?;
 
     if let Some(continue_target) = stmts
         .get(1)
-        .and_then(|stmt| extract_continue_target(state_name, stmt))
+        .and_then(|stmt| extract_continue_target(state_param, stmt))
     {
         if continue_target != goto_target {
             return Some((
@@ -2066,17 +2277,17 @@ fn decode_nested_state_jump(state_name: &Atom, stmts: &[Stmt]) -> Option<(Stmt, 
     Some((jump_if_stmt(if_stmt.test.clone(), goto_target), 1))
 }
 
-fn extract_next_break_target(state_name: &Atom, stmt: &Stmt) -> Option<usize> {
+fn extract_next_break_target(state_param: &Ident, stmt: &Stmt) -> Option<usize> {
     let Stmt::Block(block) = stmt else {
         return None;
     };
     if block.stmts.len() != 2 || !matches!(block.stmts[1], Stmt::Break(_)) {
         return None;
     }
-    extract_state_next_assign_target(state_name, &block.stmts[0])
+    extract_state_next_assign_target(state_param, &block.stmts[0])
 }
 
-fn extract_state_next_assign_target(state_name: &Atom, stmt: &Stmt) -> Option<usize> {
+fn extract_state_next_assign_target(state_param: &Ident, stmt: &Stmt) -> Option<usize> {
     let Stmt::Expr(ExprStmt { expr, .. }) = stmt else {
         return None;
     };
@@ -2087,18 +2298,18 @@ fn extract_state_next_assign_target(state_name: &Atom, stmt: &Stmt) -> Option<us
         return None;
     }
     let left_member = assign.left.as_simple().and_then(|s| s.as_member())?;
-    if !is_ident_with_name(&left_member.obj, state_name) || !is_next_prop(&left_member.prop) {
+    if !is_state_param_ref(&left_member.obj, state_param) || !is_next_prop(&left_member.prop) {
         return None;
     }
     number_lit_usize(&assign.right)
 }
 
-fn extract_continue_target(state_name: &Atom, stmt: &Stmt) -> Option<usize> {
-    extract_abrupt_continue_target(state_name, stmt)
-        .or_else(|| extract_short_continue_target(state_name, stmt))
+fn extract_continue_target(state_param: &Ident, stmt: &Stmt) -> Option<usize> {
+    extract_abrupt_continue_target(state_param, stmt)
+        .or_else(|| extract_short_continue_target(state_param, stmt))
 }
 
-fn extract_abrupt_continue_target(state_name: &Atom, stmt: &Stmt) -> Option<usize> {
+fn extract_abrupt_continue_target(state_param: &Ident, stmt: &Stmt) -> Option<usize> {
     let Stmt::Return(ret) = stmt else {
         return None;
     };
@@ -2109,7 +2320,7 @@ fn extract_abrupt_continue_target(state_name: &Atom, stmt: &Stmt) -> Option<usiz
     let Expr::Member(member) = callee.as_ref() else {
         return None;
     };
-    if !is_ident_with_name(&member.obj, state_name) || !member_prop_name(&member.prop, "abrupt") {
+    if !is_state_param_ref(&member.obj, state_param) || !member_prop_name(&member.prop, "abrupt") {
         return None;
     }
     let Expr::Lit(Lit::Str(kind)) = call.args.first()?.expr.as_ref() else {
@@ -2121,7 +2332,7 @@ fn extract_abrupt_continue_target(state_name: &Atom, stmt: &Stmt) -> Option<usiz
     number_lit_usize(&call.args.get(1)?.expr)
 }
 
-fn extract_short_continue_target(state_name: &Atom, stmt: &Stmt) -> Option<usize> {
+fn extract_short_continue_target(state_param: &Ident, stmt: &Stmt) -> Option<usize> {
     let Stmt::Return(ret) = stmt else {
         return None;
     };
@@ -2132,7 +2343,7 @@ fn extract_short_continue_target(state_name: &Atom, stmt: &Stmt) -> Option<usize
     let Expr::Member(member) = callee.as_ref() else {
         return None;
     };
-    if !is_ident_with_name(&member.obj, state_name) || !member_prop_name(&member.prop, "a") {
+    if !is_state_param_ref(&member.obj, state_param) || !member_prop_name(&member.prop, "a") {
         return None;
     }
     let Expr::Lit(Lit::Num(kind)) = call.args.first()?.expr.as_ref() else {
@@ -2222,7 +2433,7 @@ fn is_try_region_exit(label: usize, target: usize, trys: &[[Option<usize>; 4]]) 
     })
 }
 
-fn is_next_assign_to(state_name: &Atom, stmt: &Stmt, target: usize) -> bool {
+fn is_next_assign_to(state_param: &Ident, stmt: &Stmt, target: usize) -> bool {
     let Stmt::Expr(ExprStmt { expr, .. }) = stmt else {
         return false;
     };
@@ -2235,7 +2446,7 @@ fn is_next_assign_to(state_name: &Atom, stmt: &Stmt, target: usize) -> bool {
     let Some(left_member) = assign.left.as_simple().and_then(|s| s.as_member()) else {
         return false;
     };
-    if !is_ident_with_name(&left_member.obj, state_name) || !is_next_prop(&left_member.prop) {
+    if !is_state_param_ref(&left_member.obj, state_param) || !is_next_prop(&left_member.prop) {
         return false;
     }
     if let Expr::Lit(Lit::Num(n)) = assign.right.as_ref() {
@@ -2244,7 +2455,7 @@ fn is_next_assign_to(state_name: &Atom, stmt: &Stmt, target: usize) -> bool {
     false
 }
 
-fn is_comma_next_assign_to(state_name: &Atom, expr: &Expr, target: usize) -> bool {
+fn is_comma_next_assign_to(state_param: &Ident, expr: &Expr, target: usize) -> bool {
     let Expr::Seq(seq) = expr else {
         return false;
     };
@@ -2256,7 +2467,8 @@ fn is_comma_next_assign_to(state_name: &Atom, expr: &Expr, target: usize) -> boo
             let Some(left_member) = assign.left.as_simple().and_then(|s| s.as_member()) else {
                 continue;
             };
-            if is_ident_with_name(&left_member.obj, state_name) && is_next_prop(&left_member.prop) {
+            if is_state_param_ref(&left_member.obj, state_param) && is_next_prop(&left_member.prop)
+            {
                 if let Expr::Lit(Lit::Num(n)) = assign.right.as_ref() {
                     if n.value as usize == target {
                         return true;
@@ -2281,25 +2493,25 @@ enum DecodedReturn {
     },
 }
 
-fn decode_return(state_name: &Atom, ret: &ReturnStmt) -> Option<DecodedReturn> {
+fn decode_return(state_param: &Ident, ret: &ReturnStmt) -> Option<DecodedReturn> {
     let arg = ret.arg.as_ref()?;
 
     // return _ctx.stop()
-    if is_stop_call(state_name, arg) || is_finish_call(state_name, arg) {
+    if is_stop_call(state_param, arg) || is_finish_call(state_param, arg) {
         return Some(DecodedReturn::Stop);
     }
 
-    if let Some(decoded) = decode_delegate_yield(state_name, arg) {
+    if let Some(decoded) = decode_delegate_yield(state_param, arg) {
         return Some(decoded);
     }
 
     // return _ctx.abrupt("return", value)
-    if let Some(decoded) = decode_abrupt(state_name, arg) {
+    if let Some(decoded) = decode_abrupt(state_param, arg) {
         return Some(decoded);
     }
 
     // Babel 7.27+: return _ctx.a(2, value)
-    if let Some(decoded) = decode_short_abrupt(state_name, arg) {
+    if let Some(decoded) = decode_short_abrupt(state_param, arg) {
         return Some(decoded);
     }
 
@@ -2307,7 +2519,7 @@ fn decode_return(state_name: &Atom, ret: &ReturnStmt) -> Option<DecodedReturn> {
     if let Expr::Seq(seq) = arg.as_ref() {
         if seq.exprs.len() >= 2 {
             // Check if first expression is _ctx.next = N
-            if is_next_assign_expr(state_name, &seq.exprs[0]) {
+            if is_next_assign_expr(state_param, &seq.exprs[0]) {
                 let value = seq.exprs.last().unwrap().clone();
                 return Some(DecodedReturn::CommaYield(value));
             }
@@ -2317,7 +2529,7 @@ fn decode_return(state_name: &Atom, ret: &ReturnStmt) -> Option<DecodedReturn> {
     None
 }
 
-fn decode_delegate_yield(state_name: &Atom, expr: &Expr) -> Option<DecodedReturn> {
+fn decode_delegate_yield(state_param: &Ident, expr: &Expr) -> Option<DecodedReturn> {
     let Expr::Call(call) = expr else {
         return None;
     };
@@ -2325,7 +2537,7 @@ fn decode_delegate_yield(state_name: &Atom, expr: &Expr) -> Option<DecodedReturn
     let Expr::Member(member) = callee.as_ref() else {
         return None;
     };
-    if !is_ident_with_name(&member.obj, state_name)
+    if !is_state_param_ref(&member.obj, state_param)
         || !(member_prop_name(&member.prop, "delegateYield") || member_prop_name(&member.prop, "d"))
     {
         return None;
@@ -2354,7 +2566,7 @@ fn decode_delegate_yield(state_name: &Atom, expr: &Expr) -> Option<DecodedReturn
 }
 
 fn extract_delegate_result_assignment(
-    state_name: &Atom,
+    state_param: &Ident,
     cases: &[SwitchCase],
     next_loc: usize,
     result_name: &Atom,
@@ -2364,20 +2576,20 @@ fn extract_delegate_result_assignment(
         .iter()
         .find(|case| case_label_index(case) == Some(next_loc))?;
     for (stmt_index, stmt) in case.cons.iter().enumerate() {
-        if is_next_assign(state_name, stmt)
-            || is_prev_assign(state_name, stmt)
-            || is_label_assign(state_name, stmt)
+        if is_next_assign(state_param, stmt)
+            || is_prev_assign(state_param, stmt)
+            || is_label_assign(state_param, stmt)
         {
             continue;
         }
-        return rewrite_delegate_result_assignment(state_name, result_name, yielded, stmt)
+        return rewrite_delegate_result_assignment(state_param, result_name, yielded, stmt)
             .map(|stmt| (stmt_index, stmt));
     }
     None
 }
 
 fn rewrite_delegate_result_assignment(
-    state_name: &Atom,
+    state_param: &Ident,
     result_name: &Atom,
     yielded: Box<Expr>,
     stmt: &Stmt,
@@ -2388,7 +2600,7 @@ fn rewrite_delegate_result_assignment(
                 return None;
             };
             if assign.op != AssignOp::Assign
-                || !is_state_result_expr(state_name, &assign.right, result_name)
+                || !is_state_result_expr(state_param, &assign.right, result_name)
             {
                 return None;
             }
@@ -2406,7 +2618,7 @@ fn rewrite_delegate_result_assignment(
                 if decl
                     .init
                     .as_deref()
-                    .is_some_and(|init| is_state_result_expr(state_name, init, result_name))
+                    .is_some_and(|init| is_state_result_expr(state_param, init, result_name))
                 {
                     decl.init = Some(delegate_yield_expr(yielded.clone()));
                     changed = true;
@@ -2426,11 +2638,11 @@ fn delegate_yield_expr(expr: Box<Expr>) -> Box<Expr> {
     }))
 }
 
-fn is_state_result_expr(state_name: &Atom, expr: &Expr, result_name: &Atom) -> bool {
+fn is_state_result_expr(state_param: &Ident, expr: &Expr, result_name: &Atom) -> bool {
     let Expr::Member(member) = strip_parens(expr) else {
         return false;
     };
-    is_ident_with_name(&member.obj, state_name)
+    is_state_param_ref(&member.obj, state_param)
         && member_prop_atom(&member.prop).as_ref() == Some(result_name)
 }
 
@@ -2460,7 +2672,7 @@ fn unwrap_regenerator_values(expr: Box<Expr>, helpers: &[BindingKey]) -> Box<Exp
     expr
 }
 
-fn is_stop_call(state_name: &Atom, expr: &Expr) -> bool {
+fn is_stop_call(state_param: &Ident, expr: &Expr) -> bool {
     let Expr::Call(call) = expr else {
         return false;
     };
@@ -2470,10 +2682,10 @@ fn is_stop_call(state_name: &Atom, expr: &Expr) -> bool {
     let Expr::Member(member) = callee.as_ref() else {
         return false;
     };
-    is_ident_with_name(&member.obj, state_name) && member_prop_name(&member.prop, "stop")
+    is_state_param_ref(&member.obj, state_param) && member_prop_name(&member.prop, "stop")
 }
 
-fn is_finish_call(state_name: &Atom, expr: &Expr) -> bool {
+fn is_finish_call(state_param: &Ident, expr: &Expr) -> bool {
     let Expr::Call(call) = expr else {
         return false;
     };
@@ -2483,11 +2695,11 @@ fn is_finish_call(state_name: &Atom, expr: &Expr) -> bool {
     let Expr::Member(member) = callee.as_ref() else {
         return false;
     };
-    is_ident_with_name(&member.obj, state_name)
+    is_state_param_ref(&member.obj, state_param)
         && (member_prop_name(&member.prop, "finish") || member_prop_name(&member.prop, "f"))
 }
 
-fn decode_abrupt(state_name: &Atom, expr: &Expr) -> Option<DecodedReturn> {
+fn decode_abrupt(state_param: &Ident, expr: &Expr) -> Option<DecodedReturn> {
     let Expr::Call(call) = expr else {
         return None;
     };
@@ -2495,7 +2707,7 @@ fn decode_abrupt(state_name: &Atom, expr: &Expr) -> Option<DecodedReturn> {
     let Expr::Member(member) = callee.as_ref() else {
         return None;
     };
-    if !is_ident_with_name(&member.obj, state_name) || !member_prop_name(&member.prop, "abrupt") {
+    if !is_state_param_ref(&member.obj, state_param) || !member_prop_name(&member.prop, "abrupt") {
         return None;
     }
     if call.args.is_empty() {
@@ -2524,7 +2736,7 @@ fn decode_abrupt(state_name: &Atom, expr: &Expr) -> Option<DecodedReturn> {
     }
 }
 
-fn decode_short_abrupt(state_name: &Atom, expr: &Expr) -> Option<DecodedReturn> {
+fn decode_short_abrupt(state_param: &Ident, expr: &Expr) -> Option<DecodedReturn> {
     let Expr::Call(call) = expr else {
         return None;
     };
@@ -2532,7 +2744,7 @@ fn decode_short_abrupt(state_name: &Atom, expr: &Expr) -> Option<DecodedReturn> 
     let Expr::Member(member) = callee.as_ref() else {
         return None;
     };
-    if !is_ident_with_name(&member.obj, state_name) || !member_prop_name(&member.prop, "a") {
+    if !is_state_param_ref(&member.obj, state_param) || !member_prop_name(&member.prop, "a") {
         return None;
     }
     let Expr::Lit(Lit::Num(kind)) = call.args.first()?.expr.as_ref() else {
@@ -2552,11 +2764,11 @@ fn decode_short_abrupt(state_name: &Atom, expr: &Expr) -> Option<DecodedReturn> 
     }
 }
 
-fn is_next_assign(state_name: &Atom, stmt: &Stmt) -> bool {
+fn is_next_assign(state_param: &Ident, stmt: &Stmt) -> bool {
     let Stmt::Expr(ExprStmt { expr, .. }) = stmt else {
         return false;
     };
-    is_next_assign_expr(state_name, expr)
+    is_next_assign_expr(state_param, expr)
 }
 
 fn extract_next_assign_target(stmt: &Stmt) -> Option<usize> {
@@ -2579,7 +2791,7 @@ fn extract_next_assign_target(stmt: &Stmt) -> Option<usize> {
     Some(n.value as usize)
 }
 
-fn is_next_assign_expr(state_name: &Atom, expr: &Expr) -> bool {
+fn is_next_assign_expr(state_param: &Ident, expr: &Expr) -> bool {
     let Expr::Assign(assign) = expr else {
         return false;
     };
@@ -2589,7 +2801,7 @@ fn is_next_assign_expr(state_name: &Atom, expr: &Expr) -> bool {
     let Some(left_member) = assign.left.as_simple().and_then(|s| s.as_member()) else {
         return false;
     };
-    is_ident_with_name(&left_member.obj, state_name) && is_next_prop(&left_member.prop)
+    is_state_param_ref(&left_member.obj, state_param) && is_next_prop(&left_member.prop)
 }
 
 fn is_next_prop(prop: &MemberProp) -> bool {
@@ -2604,7 +2816,7 @@ fn is_mark_prop(prop: &MemberProp) -> bool {
     member_prop_name(prop, "mark") || member_prop_name(prop, "m")
 }
 
-fn is_label_assign(state_name: &Atom, stmt: &Stmt) -> bool {
+fn is_label_assign(state_param: &Ident, stmt: &Stmt) -> bool {
     let Stmt::Expr(ExprStmt { expr, .. }) = stmt else {
         return false;
     };
@@ -2617,10 +2829,11 @@ fn is_label_assign(state_name: &Atom, stmt: &Stmt) -> bool {
     let Some(left_member) = assign.left.as_simple().and_then(|s| s.as_member()) else {
         return false;
     };
-    is_ident_with_name(&left_member.obj, state_name) && member_prop_name(&left_member.prop, "label")
+    is_state_param_ref(&left_member.obj, state_param)
+        && member_prop_name(&left_member.prop, "label")
 }
 
-fn is_prev_assign(state_name: &Atom, stmt: &Stmt) -> bool {
+fn is_prev_assign(state_param: &Ident, stmt: &Stmt) -> bool {
     let Stmt::Expr(ExprStmt { expr, .. }) = stmt else {
         return false;
     };
@@ -2633,7 +2846,25 @@ fn is_prev_assign(state_name: &Atom, stmt: &Stmt) -> bool {
     let Some(left_member) = assign.left.as_simple().and_then(|s| s.as_member()) else {
         return false;
     };
-    is_ident_with_name(&left_member.obj, state_name) && is_prev_prop(&left_member.prop)
+    is_state_param_ref(&left_member.obj, state_param) && is_prev_prop(&left_member.prop)
+}
+
+/// The label a `_ctx.prev = N` / `_ctx.p = N` statement records.
+fn extract_prev_assign_target(state_param: &Ident, stmt: &Stmt) -> Option<usize> {
+    let Stmt::Expr(ExprStmt { expr, .. }) = stmt else {
+        return None;
+    };
+    let Expr::Assign(assign) = expr.as_ref() else {
+        return None;
+    };
+    if assign.op != AssignOp::Assign {
+        return None;
+    }
+    let left_member = assign.left.as_simple().and_then(|s| s.as_member())?;
+    if !is_state_param_ref(&left_member.obj, state_param) || !is_prev_prop(&left_member.prop) {
+        return None;
+    }
+    number_lit_usize(&assign.right)
 }
 
 fn is_prev_prop(prop: &MemberProp) -> bool {
@@ -2657,7 +2888,7 @@ fn next_numeric_case_label(cases: &[SwitchCase], current: usize) -> Option<usize
         .min()
 }
 
-fn extract_trys_push(state_name: &Atom, stmt: &Stmt) -> Option<[Option<usize>; 4]> {
+fn extract_trys_push(state_param: &Ident, stmt: &Stmt) -> Option<[Option<usize>; 4]> {
     let Stmt::Expr(ExprStmt { expr, .. }) = stmt else {
         return None;
     };
@@ -2671,7 +2902,7 @@ fn extract_trys_push(state_name: &Atom, stmt: &Stmt) -> Option<[Option<usize>; 4
     let Expr::Member(outer_mem) = callee_mem.obj.as_ref() else {
         return None;
     };
-    if !is_ident_with_name(&outer_mem.obj, state_name) {
+    if !is_state_param_ref(&outer_mem.obj, state_param) {
         return None;
     }
     if !member_prop_name(&outer_mem.prop, "trys") {
@@ -2689,32 +2920,32 @@ fn extract_trys_push(state_name: &Atom, stmt: &Stmt) -> Option<[Option<usize>; 4
     parse_try_region_array(arr)
 }
 
-fn is_standalone_sent(state_name: &Atom, stmt: &Stmt) -> bool {
+fn is_standalone_sent(state_param: &Ident, stmt: &Stmt) -> bool {
     if let Stmt::Expr(ExprStmt { expr, .. }) = stmt {
-        return is_sent_access(state_name, expr);
+        return is_sent_access(state_param, expr);
     }
     false
 }
 
-fn is_sent_access(state_name: &Atom, expr: &Expr) -> bool {
+fn is_sent_access(state_param: &Ident, expr: &Expr) -> bool {
     // _ctx.sent (property access, not method call like tslib)
     if let Expr::Member(member) = expr {
-        return is_ident_with_name(&member.obj, state_name) && is_sent_prop(&member.prop);
+        return is_state_param_ref(&member.obj, state_param) && is_sent_prop(&member.prop);
     }
     // Also handle _ctx.sent() (some versions use method call)
     if let Expr::Call(call) = expr {
         if let Some(callee) = call.callee.as_expr() {
             if let Expr::Member(member) = callee.as_ref() {
-                return is_ident_with_name(&member.obj, state_name) && is_sent_prop(&member.prop);
+                return is_state_param_ref(&member.obj, state_param) && is_sent_prop(&member.prop);
             }
         }
     }
     false
 }
 
-fn stmt_uses_sent(state_name: &Atom, stmt: &Stmt) -> bool {
+fn stmt_uses_sent(state_param: &Ident, stmt: &Stmt) -> bool {
     struct Finder {
-        state_name: Atom,
+        state_param: Ident,
         found: bool,
     }
     impl swc_core::ecma::visit::Visit for Finder {
@@ -2723,7 +2954,7 @@ fn stmt_uses_sent(state_name: &Atom, stmt: &Stmt) -> bool {
         fn visit_arrow_expr(&mut self, _arrow: &ArrowExpr) {}
 
         fn visit_member_expr(&mut self, member: &MemberExpr) {
-            if is_ident_with_name(&member.obj, &self.state_name) && is_sent_prop(&member.prop) {
+            if is_state_param_ref(&member.obj, &self.state_param) && is_sent_prop(&member.prop) {
                 self.found = true;
                 return;
             }
@@ -2731,7 +2962,7 @@ fn stmt_uses_sent(state_name: &Atom, stmt: &Stmt) -> bool {
         }
     }
     let mut f = Finder {
-        state_name: state_name.clone(),
+        state_param: state_param.clone(),
         found: false,
     };
     stmt.visit_with(&mut f);
@@ -2747,12 +2978,8 @@ fn extract_yield_from_stmt(stmt: &Stmt) -> Option<Box<Expr>> {
     None
 }
 
-fn is_catch_label(label_idx: usize, trys: &[[Option<usize>; 4]]) -> bool {
-    trys.iter().any(|region| region[1] == Some(label_idx))
-}
-
 struct SentReplacer {
-    state_name: Atom,
+    state_param: Ident,
     replacement: Box<Expr>,
 }
 
@@ -2762,7 +2989,7 @@ enum CatchValueAlias {
     LocalIdent(BindingKey),
 }
 
-fn extract_catch_value_alias(state_name: &Atom, stmt: &Stmt) -> Option<CatchValueAlias> {
+fn extract_catch_value_alias(state_param: &Ident, stmt: &Stmt) -> Option<CatchValueAlias> {
     let Stmt::Expr(ExprStmt { expr, .. }) = stmt else {
         return None;
     };
@@ -2773,15 +3000,15 @@ fn extract_catch_value_alias(state_name: &Atom, stmt: &Stmt) -> Option<CatchValu
         return None;
     }
 
-    if is_state_catch_call(state_name, &assign.right) {
+    if is_state_catch_call(state_param, &assign.right) {
         let left_member = assign.left.as_simple()?.as_member()?;
-        if !is_ident_with_name(&left_member.obj, state_name) {
+        if !is_state_param_ref(&left_member.obj, state_param) {
             return None;
         }
         return member_prop_atom(&left_member.prop).map(CatchValueAlias::StateMember);
     }
 
-    if is_sent_access(state_name, &assign.right) {
+    if is_sent_access(state_param, &assign.right) {
         let ident = assign.left.as_simple()?.as_ident()?;
         return Some(CatchValueAlias::LocalIdent((ident.sym.clone(), ident.ctxt)));
     }
@@ -2789,7 +3016,14 @@ fn extract_catch_value_alias(state_name: &Atom, stmt: &Stmt) -> Option<CatchValu
     None
 }
 
-fn is_state_catch_call(state_name: &Atom, expr: &Expr) -> bool {
+fn is_discarded_catch_value_read(state_param: &Ident, stmt: &Stmt) -> bool {
+    let Stmt::Expr(ExprStmt { expr, .. }) = stmt else {
+        return false;
+    };
+    matches!(expr.as_ref(), Expr::Member(_)) && is_sent_access(state_param, expr)
+}
+
+fn is_state_catch_call(state_param: &Ident, expr: &Expr) -> bool {
     let Expr::Call(call) = expr else {
         return false;
     };
@@ -2799,11 +3033,11 @@ fn is_state_catch_call(state_name: &Atom, expr: &Expr) -> bool {
     let Expr::Member(member) = callee.as_ref() else {
         return false;
     };
-    is_ident_with_name(&member.obj, state_name) && member_prop_name(&member.prop, "catch")
+    is_state_param_ref(&member.obj, state_param) && member_prop_name(&member.prop, "catch")
 }
 
 struct CatchValueReplacer {
-    state_name: Atom,
+    state_param: Ident,
     aliases: Vec<CatchValueAlias>,
     replacement: Box<Expr>,
 }
@@ -2814,7 +3048,7 @@ impl VisitMut for CatchValueReplacer {
     fn visit_mut_arrow_expr(&mut self, _arrow: &mut ArrowExpr) {}
 
     fn visit_mut_expr(&mut self, expr: &mut Expr) {
-        if is_sent_access(&self.state_name, expr) {
+        if is_sent_access(&self.state_param, expr) {
             *expr = *self.replacement.clone();
             return;
         }
@@ -2829,7 +3063,7 @@ impl VisitMut for CatchValueReplacer {
         }
 
         if let Expr::Member(member) = expr {
-            if is_ident_with_name(&member.obj, &self.state_name) {
+            if is_state_param_ref(&member.obj, &self.state_param) {
                 if let Some(prop) = member_prop_atom(&member.prop) {
                     if self.aliases.iter().any(|alias| {
                         matches!(alias, CatchValueAlias::StateMember(alias_prop) if *alias_prop == prop)
@@ -2853,7 +3087,7 @@ impl VisitMut for SentReplacer {
     fn visit_mut_expr(&mut self, expr: &mut Expr) {
         // Replace _ctx.sent property access
         if let Expr::Member(member) = expr {
-            if is_ident_with_name(&member.obj, &self.state_name) && is_sent_prop(&member.prop) {
+            if is_state_param_ref(&member.obj, &self.state_param) && is_sent_prop(&member.prop) {
                 let original_span = expr.span();
                 let mut replacement = *self.replacement.clone();
                 propagate_span(&mut replacement, original_span);
@@ -2865,7 +3099,7 @@ impl VisitMut for SentReplacer {
         if let Expr::Call(call) = expr {
             if let Some(callee) = call.callee.as_expr() {
                 if let Expr::Member(member) = callee.as_ref() {
-                    if is_ident_with_name(&member.obj, &self.state_name)
+                    if is_state_param_ref(&member.obj, &self.state_param)
                         && is_sent_prop(&member.prop)
                     {
                         let original_span = expr.span();
@@ -2885,19 +3119,20 @@ fn is_sent_prop(prop: &MemberProp) -> bool {
     member_prop_name(prop, "sent") || member_prop_name(prop, "v")
 }
 
-fn fold_state_temp_member_calls(state_name: &Atom, stmts: &mut Vec<Stmt>) {
+fn fold_state_temp_member_calls(state_param: &Ident, stmts: &mut Vec<Stmt>) {
     let mut folded = Vec::new();
     let mut index = 0usize;
 
     while index < stmts.len() {
-        if let Some((stmt, consumed)) = try_fold_state_temp_member_call(state_name, &stmts[index..])
-            .or_else(|| try_fold_local_temp_member_call(&stmts[index..]))
+        if let Some((stmt, consumed)) =
+            try_fold_state_temp_member_call(state_param, &stmts[index..])
+                .or_else(|| try_fold_local_temp_member_call(&stmts[index..]))
         {
             folded.push(stmt);
             index += consumed;
         } else {
             let mut stmt = stmts[index].clone();
-            fold_state_temp_member_calls_in_stmt(state_name, &mut stmt);
+            fold_state_temp_member_calls_in_stmt(state_param, &mut stmt);
             folded.push(stmt);
             index += 1;
         }
@@ -2906,38 +3141,38 @@ fn fold_state_temp_member_calls(state_name: &Atom, stmts: &mut Vec<Stmt>) {
     *stmts = folded;
 }
 
-fn fold_state_temp_member_calls_in_stmt(state_name: &Atom, stmt: &mut Stmt) {
+fn fold_state_temp_member_calls_in_stmt(state_param: &Ident, stmt: &mut Stmt) {
     match stmt {
-        Stmt::Block(block) => fold_state_temp_member_calls(state_name, &mut block.stmts),
+        Stmt::Block(block) => fold_state_temp_member_calls(state_param, &mut block.stmts),
         Stmt::For(for_stmt) => {
             if let Stmt::Block(block) = for_stmt.body.as_mut() {
-                fold_state_temp_member_calls(state_name, &mut block.stmts);
+                fold_state_temp_member_calls(state_param, &mut block.stmts);
             }
         }
         Stmt::Try(try_stmt) => {
-            fold_state_temp_member_calls(state_name, &mut try_stmt.block.stmts);
+            fold_state_temp_member_calls(state_param, &mut try_stmt.block.stmts);
             if let Some(handler) = &mut try_stmt.handler {
-                fold_state_temp_member_calls(state_name, &mut handler.body.stmts);
+                fold_state_temp_member_calls(state_param, &mut handler.body.stmts);
             }
             if let Some(finalizer) = &mut try_stmt.finalizer {
-                fold_state_temp_member_calls(state_name, &mut finalizer.stmts);
+                fold_state_temp_member_calls(state_param, &mut finalizer.stmts);
             }
         }
         Stmt::If(if_stmt) => {
-            fold_state_temp_member_calls_in_stmt(state_name, &mut if_stmt.cons);
+            fold_state_temp_member_calls_in_stmt(state_param, &mut if_stmt.cons);
             if let Some(alt) = &mut if_stmt.alt {
-                fold_state_temp_member_calls_in_stmt(state_name, alt);
+                fold_state_temp_member_calls_in_stmt(state_param, alt);
             }
         }
         _ => {}
     }
 }
 
-fn try_fold_state_temp_member_call(state_name: &Atom, stmts: &[Stmt]) -> Option<(Stmt, usize)> {
-    let (receiver_key, receiver) = extract_state_member_assign(state_name, stmts.first()?)?;
-    let (arg_key, arg) = extract_state_member_assign(state_name, stmts.get(1)?)?;
+fn try_fold_state_temp_member_call(state_param: &Ident, stmts: &[Stmt]) -> Option<(Stmt, usize)> {
+    let (receiver_key, receiver) = extract_state_member_assign(state_param, stmts.first()?)?;
+    let (arg_key, arg) = extract_state_member_assign(state_param, stmts.get(1)?)?;
     let call = extract_bound_state_member_call(
-        state_name,
+        state_param,
         stmts.get(2)?,
         &receiver_key,
         receiver,
@@ -3101,7 +3336,7 @@ fn local_temp_key(expr: &Expr) -> Option<BindingKey> {
     Some((id.sym.clone(), id.ctxt))
 }
 
-fn extract_state_member_assign(state_name: &Atom, stmt: &Stmt) -> Option<(Atom, Box<Expr>)> {
+fn extract_state_member_assign(state_param: &Ident, stmt: &Stmt) -> Option<(Atom, Box<Expr>)> {
     let Stmt::Expr(ExprStmt { expr, .. }) = stmt else {
         return None;
     };
@@ -3112,7 +3347,7 @@ fn extract_state_member_assign(state_name: &Atom, stmt: &Stmt) -> Option<(Atom, 
         return None;
     }
     let left_member = assign.left.as_simple().and_then(|s| s.as_member())?;
-    if !is_ident_with_name(&left_member.obj, state_name) {
+    if !is_state_param_ref(&left_member.obj, state_param) {
         return None;
     }
     let key = member_prop_atom(&left_member.prop)?;
@@ -3120,7 +3355,7 @@ fn extract_state_member_assign(state_name: &Atom, stmt: &Stmt) -> Option<(Atom, 
 }
 
 fn extract_bound_state_member_call(
-    state_name: &Atom,
+    state_param: &Ident,
     stmt: &Stmt,
     receiver_key: &Atom,
     receiver: Box<Expr>,
@@ -3143,12 +3378,12 @@ fn extract_bound_state_member_call(
     let Expr::Member(method_member) = call_member.obj.as_ref() else {
         return None;
     };
-    if state_member_key(state_name, &method_member.obj).as_ref() != Some(receiver_key) {
+    if state_member_key(state_param, &method_member.obj).as_ref() != Some(receiver_key) {
         return None;
     }
     if call.args.len() != 2
-        || state_member_key(state_name, &call.args[0].expr).as_ref() != Some(receiver_key)
-        || state_member_key(state_name, &call.args[1].expr).as_ref() != Some(arg_key)
+        || state_member_key(state_param, &call.args[0].expr).as_ref() != Some(receiver_key)
+        || state_member_key(state_param, &call.args[1].expr).as_ref() != Some(arg_key)
     {
         return None;
     }
@@ -3166,11 +3401,11 @@ fn extract_bound_state_member_call(
     Some(next)
 }
 
-fn state_member_key(state_name: &Atom, expr: &Expr) -> Option<Atom> {
+fn state_member_key(state_param: &Ident, expr: &Expr) -> Option<Atom> {
     let Expr::Member(member) = strip_parens(expr) else {
         return None;
     };
-    if !is_ident_with_name(&member.obj, state_name) {
+    if !is_state_param_ref(&member.obj, state_param) {
         return None;
     }
     member_prop_atom(&member.prop)
@@ -3437,7 +3672,7 @@ fn anonymous_async_fn_expr(mut fn_expr: FnExpr) -> Expr {
 
 fn collect_binding_ref_counts(module: &Module) -> HashMap<BindingKey, usize> {
     let mut counter = BindingRefCounter {
-        counts: HashMap::new(),
+        counts: HashMap::default(),
     };
     module.visit_with(&mut counter);
     counter.counts
@@ -3720,7 +3955,7 @@ fn collect_esbuild_async_helpers(module: &Module, unresolved_mark: Mark) -> Vec<
                         return None;
                     };
                     let name = binding.id.sym.as_ref();
-                    if name != "__async" && !is_likely_generated_alias(name) {
+                    if !is_esbuild_async_helper_name(name) && !is_likely_generated_alias(name) {
                         return None;
                     }
                     let init = decl.init.as_deref()?;
@@ -3733,6 +3968,16 @@ fn collect_esbuild_async_helpers(module: &Module, unresolved_mark: Mark) -> Vec<
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// `__async`, or a deconflicted copy when a bundle holds several: esbuild
+/// renames it to `__async2`, rollup to `__async$1`.
+fn is_esbuild_async_helper_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("__async") else {
+        return false;
+    };
+    let digits = rest.strip_prefix('$').unwrap_or(rest);
+    rest.is_empty() || (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn is_esbuild_async_helper_expr(expr: &Expr, unresolved_mark: Mark) -> bool {
@@ -3949,7 +4194,7 @@ fn is_paramless_async_to_gen_iife(expr: &Expr, async_to_gen_callees: &AsyncToGen
 fn try_transform_async_to_generator_expr(
     expr: Expr,
     async_to_gen_callees: &AsyncToGenCallees,
-    generator_helpers: &[BindingKey],
+    generator_helpers: &AsyncHelperContext,
 ) -> Option<(Expr, Option<BindingKey>)> {
     let Expr::Call(mut call) = expr else {
         return None;
@@ -3973,7 +4218,7 @@ fn try_transform_async_to_generator_expr(
 
 fn build_async_fn_expr_from_gen_arg(
     gen_fn_arg: Expr,
-    generator_helpers: &[BindingKey],
+    generator_helpers: &AsyncHelperContext,
 ) -> Option<(FnExpr, Option<BindingKey>)> {
     match gen_fn_arg {
         Expr::Fn(fn_expr) => {
@@ -4045,7 +4290,7 @@ fn build_async_fn_expr_from_gen_arg(
 fn try_transform_async_to_generator(
     body: &mut FunctionBody,
     async_to_gen_callees: &AsyncToGenCallees,
-    generator_helpers: &[BindingKey],
+    generator_helpers: &AsyncHelperContext,
     _unresolved_mark: Mark,
 ) -> bool {
     let return_idx = body
@@ -4109,22 +4354,23 @@ fn is_async_to_gen_callee(expr: &Expr, async_to_gen_callees: &AsyncToGenCallees)
     let Expr::Member(member) = expr else {
         return false;
     };
-    if !member_prop_name(&member.prop, "default") {
-        return false;
-    }
     let Expr::Ident(obj) = member.obj.as_ref() else {
         return false;
     };
-    async_to_gen_callees
-        .default_members
-        .iter()
-        .any(|(sym, ctxt)| obj.sym == *sym && obj.ctxt == *ctxt)
+    let candidates = if member_prop_name(&member.prop, "_") {
+        async_to_gen_callees.swc_members
+    } else if member_prop_name(&member.prop, "default") {
+        async_to_gen_callees.default_members
+    } else {
+        return false;
+    };
+    candidates.iter().any(|key| binding_key(obj) == *key)
 }
 
 fn extract_async_to_gen_body(
     stmt: Stmt,
     async_to_gen_callees: &AsyncToGenCallees,
-    generator_helpers: &[BindingKey],
+    generator_helpers: &AsyncHelperContext,
 ) -> Option<Vec<Stmt>> {
     let Stmt::Return(ret) = stmt else { return None };
     let arg = *ret.arg?;
@@ -4166,7 +4412,11 @@ fn extract_async_to_gen_body(
             // Non-generator function that contains regeneratorRuntime.wrap
             let mut body = fn_expr.function.body?;
             if try_transform_regenerator_wrap(&mut body).is_some()
-                || try_transform_ts_generator_body(&mut body, generator_helpers, &HashSet::new())
+                || try_transform_ts_generator_body(
+                    &mut body,
+                    generator_helpers,
+                    &HashSet::default(),
+                )
             {
                 return Some(body.stmts);
             }
@@ -4190,7 +4440,11 @@ fn extract_async_to_gen_body(
             };
             let mut body = fn_expr.function.body?;
             if try_transform_regenerator_wrap(&mut body).is_some()
-                || try_transform_ts_generator_body(&mut body, generator_helpers, &HashSet::new())
+                || try_transform_ts_generator_body(
+                    &mut body,
+                    generator_helpers,
+                    &HashSet::default(),
+                )
             {
                 return Some(body.stmts);
             }
@@ -4276,22 +4530,9 @@ fn remove_consumed_mark_declarations(module: &mut Module, consumed_marks: &[Bind
     });
 }
 
-fn remove_helper_decls(module: &mut Module, to_remove: &[BindingKey]) {
-    let removable: HashSet<BindingKey> = to_remove.iter().cloned().collect();
-    remove_fn_decls_by_binding(module, &removable);
-    remove_var_declarators_by_binding(&mut module.body, &removable);
-}
-
 fn remove_unused_helper_decls(module: &mut Module, helpers: &[BindingKey]) {
-    if helpers.is_empty() {
-        return;
-    }
-    let unused: Vec<_> = helpers
-        .iter()
-        .filter(|helper| count_binding_refs(module, helper) <= 1)
-        .cloned()
-        .collect();
-    remove_helper_decls(module, &unused);
+    let candidates = helpers.iter().cloned().collect();
+    remove_unused_helper_declarations(module, &candidates);
 }
 
 // ============================================================
@@ -4314,10 +4555,6 @@ fn propagate_span(expr: &mut Expr, span: Span) {
         Expr::Member(e) => e.span = span,
         _ => {}
     }
-}
-
-fn is_ident_with_name(expr: &Expr, name: &Atom) -> bool {
-    matches!(expr, Expr::Ident(id) if id.sym == *name)
 }
 
 fn member_prop_atom(prop: &MemberProp) -> Option<Atom> {
@@ -4354,4 +4591,144 @@ fn export_name_is(name: &swc_core::ecma::ast::ModuleExportName, expected: &str) 
 
 fn str_to_atom(value: &swc_core::atoms::Wtf8Atom) -> Atom {
     Atom::from(value.as_str().unwrap_or(""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use swc_core::common::{sync::Lrc, FileName, Globals, SourceMap, GLOBALS};
+    use swc_core::ecma::parser::{lexer::Lexer, EsSyntax, Parser, StringInput, Syntax};
+    use swc_core::ecma::transforms::base::resolver;
+
+    #[test]
+    fn catch_binding_and_its_references_share_one_context() {
+        let source = r#"
+var _marked = regeneratorRuntime.mark(g);
+function g() {
+  return regeneratorRuntime.wrap(function(_ctx) {
+    while (true) {
+      switch (_ctx.prev = _ctx.next) {
+        case 0:
+          _ctx.prev = 0;
+          _ctx.next = 3;
+          return doThing();
+        case 3:
+          _ctx.next = 8;
+          break;
+        case 5:
+          _ctx.prev = 5;
+          _ctx.t0 = _ctx.catch(0);
+          handle(_ctx.t0);
+        case 8:
+        case "end":
+          return _ctx.stop();
+      }
+    }
+  }, _marked, null, [[0, 5]]);
+}
+"#;
+        GLOBALS.set(&Globals::new(), || {
+            let cm: Lrc<SourceMap> = Default::default();
+            let mut module = crate::unpacker::parse_es_module(source, "fixture.js", cm)
+                .expect("fixture should parse");
+            let unresolved_mark = Mark::new();
+            module.visit_mut_with(&mut resolver(unresolved_mark, Mark::new(), false));
+
+            module.visit_mut_with(&mut UnRegenerator::new(unresolved_mark));
+
+            #[derive(Default)]
+            struct Errors(Vec<Ident>);
+            impl Visit for Errors {
+                fn visit_ident(&mut self, ident: &Ident) {
+                    if ident.sym == "error" {
+                        self.0.push(ident.clone());
+                    }
+                }
+            }
+            let mut errors = Errors::default();
+            module.visit_with(&mut errors);
+            assert_eq!(
+                errors.0.len(),
+                2,
+                "catch parameter plus one reference: {:?}",
+                errors.0
+            );
+            assert_eq!(errors.0[0].ctxt, errors.0[1].ctxt);
+            assert_ne!(errors.0[0].ctxt, swc_core::common::SyntaxContext::empty());
+            assert_ne!(errors.0[0].ctxt.outer(), unresolved_mark);
+        });
+    }
+
+    #[test]
+    fn ts_decoder_handoff_resolves_canonical_values_and_preserves_shadowing() {
+        // Test the generator decoder before async yield-to-await conversion.
+        // Opcode 5 means yield*, not an await; wrapping this synthetic shape
+        // in an async helper would not model compiler-lowered async source.
+        for name in ["__values", "_ts_values"] {
+            for shadowed in [false, true] {
+                GLOBALS.set(&Globals::new(), || {
+                    let parameter = if shadowed { name } else { "items" };
+                    let source = format!(
+                        r#"
+import {{ __generator as generator }} from "tslib";
+function inner({parameter}) {{
+    return generator(this, function(state) {{
+        switch (state.label) {{
+            case 0: return [5, {name}(items)];
+            case 1: state.sent(); return [2];
+        }}
+    }});
+}}
+"#
+                    );
+                    let cm: Lrc<SourceMap> = Default::default();
+                    let file = cm.new_source_file(Lrc::new(FileName::Anon), source);
+                    let lexer = Lexer::new(
+                        Syntax::Es(EsSyntax::default()),
+                        Default::default(),
+                        StringInput::from(&*file),
+                        None,
+                    );
+                    let mut module = Parser::new_from(lexer).parse_module().unwrap();
+                    let unresolved_mark = Mark::new();
+                    module.visit_mut_with(&mut resolver(unresolved_mark, Mark::new(), false));
+                    let local_helpers =
+                        LocalHelperContext::collect_with_mark(&module, unresolved_mark);
+                    let mut helpers = AsyncHelperContext::from_local_helpers(
+                        &local_helpers,
+                        Some(unresolved_mark),
+                    );
+                    helpers.record_module_hazards(&module);
+                    let ModuleItem::Stmt(Stmt::Decl(Decl::Fn(inner))) = &module.body[1] else {
+                        panic!("expected inner function");
+                    };
+                    let (_, statements, _) = extract_async_to_gen_body_with_params(
+                        Expr::Fn(FnExpr {
+                            ident: None,
+                            function: inner.function.clone(),
+                        }),
+                        &helpers,
+                    )
+                    .expect("shared TS decoder should recover the generator body");
+                    let Stmt::Expr(statement) = &statements[0] else {
+                        panic!("expected delegated yield");
+                    };
+                    let Expr::Yield(yielded) = statement.expr.as_ref() else {
+                        panic!("expected yield expression");
+                    };
+                    assert!(yielded.delegate);
+                    let arg = yielded.arg.as_deref().unwrap();
+                    if shadowed {
+                        let Expr::Call(call) = arg else {
+                            panic!("a shadowed values function must still be called");
+                        };
+                        assert!(matches!(call.callee.as_expr().map(|e| e.as_ref()),
+                            Some(Expr::Ident(id)) if id.sym == name));
+                    } else {
+                        assert!(matches!(arg, Expr::Ident(id) if id.sym == "items"));
+                    }
+                });
+            }
+        }
+    }
 }

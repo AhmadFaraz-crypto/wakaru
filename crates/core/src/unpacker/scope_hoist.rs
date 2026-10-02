@@ -1,7 +1,8 @@
+use crate::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::cell::Cell;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::BinaryHeap;
 
 use swc_core::atoms::Atom;
 use swc_core::common::{sync::Lrc, SourceMap, Span, Spanned, DUMMY_SP, GLOBALS};
@@ -11,12 +12,12 @@ use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 use crate::rules::rename_utils::collect_module_names;
 
 use super::emit_esm::{
-    dedup_filename, emit_items, make_named_export_stmt, make_named_import_stmt,
-    try_promote_fn_class_export, FilenameDedupStyle,
+    dedup_filename, emit_items, make_named_export_stmt, make_named_export_stmt_with_aliases,
+    make_named_import_stmt_with_aliases, try_promote_fn_class_export, FilenameDedupStyle,
 };
 use super::{
     has_strict_mode_syntax_hazard, module_item_declared_names, spans_byte_ranges, BundleFormat,
-    UnpackResult, UnpackedModule,
+    SourcePositions, UnpackResult, UnpackedModule,
 };
 
 const MIN_DECLARATIONS: usize = 10;
@@ -124,6 +125,7 @@ pub fn split_scope_hoisted(source: &str) -> Option<UnpackResult> {
         source,
         ScopeHoistRenderMode::Executable,
         ScopeHoistSource::DirectAsset,
+        SourcePositions::Discard,
     )
 }
 
@@ -131,6 +133,7 @@ pub(crate) fn split_scope_hoisted_with_mode(
     source: &str,
     render_mode: ScopeHoistRenderMode,
     origin: ScopeHoistSource,
+    positions: SourcePositions,
 ) -> Option<UnpackResult> {
     GLOBALS.set(&Default::default(), || {
         let cm: Lrc<SourceMap> = Default::default();
@@ -139,7 +142,7 @@ pub(crate) fn split_scope_hoisted_with_mode(
         if !recoverable_parse_errors.is_empty() {
             return None;
         }
-        split_from_module(&module, cm, render_mode, origin)
+        split_from_module(&module, cm, render_mode, origin, positions)
     })
 }
 
@@ -148,8 +151,9 @@ pub(crate) fn split_scope_hoisted_module_with_mode(
     cm: Lrc<SourceMap>,
     render_mode: ScopeHoistRenderMode,
     origin: ScopeHoistSource,
+    positions: SourcePositions,
 ) -> Option<UnpackResult> {
-    split_from_module(module, cm, render_mode, origin)
+    split_from_module(module, cm, render_mode, origin, positions)
 }
 
 /// Analyze the same direct top-level source consumed by the heuristic
@@ -305,17 +309,19 @@ fn split_from_module(
     cm: Lrc<SourceMap>,
     render_mode: ScopeHoistRenderMode,
     origin: ScopeHoistSource,
+    positions: SourcePositions,
 ) -> Option<UnpackResult> {
     if has_strict_mode_syntax_hazard(module) {
         return None;
     }
 
-    // Unwrap IIFE wrapper if present: `(()=>{ ... })()` or `(function(){ ... })()`
+    // Unwrap IIFE wrapper if present: `(()=>{ ... })()`, `(function(){ ... })()`,
+    // or the minified `!function(){ ... }()` form.
     let iife_body = unwrap_iife(module);
     let body = iife_body.as_deref().unwrap_or(&module.body);
 
     let plan = analyze_scope_hoist(body, render_mode, origin)?;
-    render_scope_hoist_plan(body, plan, cm, render_mode)
+    render_scope_hoist_plan(body, plan, cm, render_mode, positions)
 }
 
 struct ScopeHoistPlan {
@@ -393,6 +399,7 @@ fn render_scope_hoist_plan(
     plan: ScopeHoistPlan,
     cm: Lrc<SourceMap>,
     render_mode: ScopeHoistRenderMode,
+    positions: SourcePositions,
 ) -> Option<UnpackResult> {
     let ScopeHoistPlan {
         items,
@@ -446,6 +453,7 @@ fn render_scope_hoist_plan(
         clusters,
         inspection_context_by_item.as_deref(),
         cm,
+        positions,
     )?;
     Some(UnpackResult::without_cycle_warnings(
         modules,
@@ -453,7 +461,8 @@ fn render_scope_hoist_plan(
     ))
 }
 
-/// Detect and unwrap an IIFE wrapper: `(()=>{ ... })()` or `(function(){ ... })()`
+/// Detect and unwrap an IIFE wrapper: `(()=>{ ... })()`, `(function(){ ... })()`,
+/// or `!function(){ ... }()`.
 /// Returns the inner body statements (plus any trailing top-level items)
 /// converted to ModuleItems. Only matches when the first item is an IIFE call
 /// and removing its function scope cannot collide with trailing bindings.
@@ -462,7 +471,15 @@ fn unwrap_iife(module: &Module) -> Option<Vec<ModuleItem>> {
     let ModuleItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = first else {
         return None;
     };
-    let Expr::Call(call) = &**expr else {
+    let call_expr = match &**expr {
+        Expr::Unary(UnaryExpr {
+            op: UnaryOp::Bang,
+            arg,
+            ..
+        }) => &**arg,
+        other => other,
+    };
+    let Expr::Call(call) = call_expr else {
         return None;
     };
     if !call.args.is_empty() {
@@ -476,7 +493,7 @@ fn unwrap_iife(module: &Module) -> Option<Vec<ModuleItem>> {
         other => other,
     };
     let stmts = match inner {
-        Expr::Arrow(arrow) if arrow.params.is_empty() => {
+        Expr::Arrow(arrow) if !arrow.is_async && arrow.params.is_empty() => {
             if let ArrowFunctionBody::FunctionBody(block) = &*arrow.body {
                 Some(&block.stmts)
             } else {
@@ -491,7 +508,11 @@ fn unwrap_iife(module: &Module) -> Option<Vec<ModuleItem>> {
             // Keep the wrapper even when the name currently appears unused;
             // fail closed rather than trying to prove every reflective use of
             // the function identity.
-            if fn_expr.ident.is_none() && fn_expr.function.params.is_empty() {
+            if fn_expr.ident.is_none()
+                && !fn_expr.function.is_async
+                && !fn_expr.function.is_generator
+                && fn_expr.function.params.is_empty()
+            {
                 fn_expr.function.body.as_ref().map(|b| &b.stmts)
             } else {
                 None
@@ -645,11 +666,11 @@ fn item_referenced_and_written_names(
 ) -> (HashSet<Atom>, HashSet<Atom>) {
     let own: HashSet<&Atom> = own_names.iter().collect();
     let mut collector = RefCollector {
-        refs: HashSet::new(),
-        writes: HashSet::new(),
+        refs: HashSet::default(),
+        writes: HashSet::default(),
         own_names: &own,
-        block_bindings: HashSet::new(),
-        var_bindings: HashSet::new(),
+        block_bindings: HashSet::default(),
+        var_bindings: HashSet::default(),
     };
     item.visit_with(&mut collector);
     (collector.refs, collector.writes)
@@ -947,6 +968,23 @@ impl Visit for RefCollector<'_> {
         }
         prop.value.visit_with(self);
     }
+
+    // Import specifiers declare locals; their imported names belong to the
+    // source module.
+    fn visit_import_decl(&mut self, _: &ImportDecl) {}
+
+    // Only a local `orig` is a reference. An exported name, and every name in
+    // `export { ... } from "..."`, is not a binding of this module.
+    fn visit_named_export(&mut self, export: &NamedExport) {
+        if export.src.is_some() {
+            return;
+        }
+        for specifier in &export.specifiers {
+            if let ExportSpecifier::Named(named) = specifier {
+                named.orig.visit_with(self);
+            }
+        }
+    }
 }
 
 fn collect_pat_bindings(pat: &Pat, bindings: &mut HashSet<Atom>) {
@@ -985,7 +1023,7 @@ fn collect_pat_bindings(pat: &Pat, bindings: &mut HashSet<Atom>) {
 }
 
 fn collect_dynamic_require_helpers(body: &[ModuleItem]) -> HashSet<Atom> {
-    let mut helpers = HashSet::new();
+    let mut helpers = HashSet::default();
     for item in body {
         let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
             continue;
@@ -1004,7 +1042,7 @@ fn collect_dynamic_require_helpers(body: &[ModuleItem]) -> HashSet<Atom> {
 }
 
 fn collect_esbuild_to_esm_helpers(body: &[ModuleItem]) -> HashSet<Atom> {
-    let mut helpers = HashSet::new();
+    let mut helpers = HashSet::default();
     for item in body {
         let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
             continue;
@@ -1152,7 +1190,7 @@ impl VisitMut for DynamicRequireHelperRewriter<'_> {
     }
 
     fn visit_mut_arrow_expr(&mut self, arrow: &mut ArrowExpr) {
-        let mut names = HashSet::new();
+        let mut names = HashSet::default();
         for param in &arrow.params {
             collect_pat_bindings(param, &mut names);
         }
@@ -1165,7 +1203,7 @@ impl VisitMut for DynamicRequireHelperRewriter<'_> {
     }
 
     fn visit_mut_block_stmt(&mut self, block: &mut BlockStmt) {
-        let mut names = HashSet::new();
+        let mut names = HashSet::default();
         collect_local_bindings_from_stmts(&block.stmts, &mut names);
         self.push_shadowed(names);
         block.visit_mut_children_with(self);
@@ -1184,7 +1222,7 @@ impl VisitMut for DynamicRequireHelperRewriter<'_> {
 }
 
 fn collect_local_bindings_from_function(function: &Function) -> HashSet<Atom> {
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
     if let Some(body) = &function.body {
         collect_local_bindings_from_stmts(&body.stmts, &mut names);
     }
@@ -1338,7 +1376,7 @@ impl VisitMut for DefaultInteropMemberRewriter<'_> {
     }
 
     fn visit_mut_arrow_expr(&mut self, arrow: &mut ArrowExpr) {
-        let mut names = HashSet::new();
+        let mut names = HashSet::default();
         for param in &arrow.params {
             collect_pat_bindings(param, &mut names);
         }
@@ -1351,7 +1389,7 @@ impl VisitMut for DefaultInteropMemberRewriter<'_> {
     }
 
     fn visit_mut_block_stmt(&mut self, block: &mut BlockStmt) {
-        let mut names = HashSet::new();
+        let mut names = HashSet::default();
         collect_local_bindings_from_stmts(&block.stmts, &mut names);
         self.push_shadowed(names);
         block.visit_mut_children_with(self);
@@ -1385,7 +1423,7 @@ struct ReferenceGraph {
 }
 
 fn build_reference_graph(items: &[TopLevelItem]) -> ReferenceGraph {
-    let mut name_to_item: HashMap<Atom, usize> = HashMap::new();
+    let mut name_to_item: HashMap<Atom, usize> = HashMap::default();
     for (idx, item) in items.iter().enumerate() {
         for name in &item.declared_names {
             name_to_item.insert(name.clone(), idx);
@@ -1393,9 +1431,9 @@ fn build_reference_graph(items: &[TopLevelItem]) -> ReferenceGraph {
     }
 
     let n = items.len();
-    let mut references = vec![HashSet::new(); n];
-    let mut referenced_by = vec![HashSet::new(); n];
-    let mut writes = vec![HashSet::new(); n];
+    let mut references = vec![HashSet::default(); n];
+    let mut referenced_by = vec![HashSet::default(); n];
+    let mut writes = vec![HashSet::default(); n];
 
     for (idx, item) in items.iter().enumerate() {
         for ref_name in &item.referenced_names {
@@ -1534,7 +1572,7 @@ fn analyze_cross_item_writes(graph: &ReferenceGraph, uf: &UnionFind) -> CrossWri
     let item_count = graph.writes.len();
     let mut signal_uf = uf.clone();
     let signal_root_by_item: Vec<_> = (0..item_count).map(|item| signal_uf.find(item)).collect();
-    let mut writer_targets = vec![HashSet::new(); item_count];
+    let mut writer_targets = vec![HashSet::default(); item_count];
     let mut write_components = UnionFind::new(item_count);
 
     for (writer, targets) in graph.writes.iter().enumerate() {
@@ -1549,8 +1587,8 @@ fn analyze_cross_item_writes(graph: &ReferenceGraph, uf: &UnionFind) -> CrossWri
     }
 
     let signal_roots: HashSet<_> = signal_root_by_item.iter().copied().collect();
-    let mut component_counts = HashMap::new();
-    let mut component_minimums = HashMap::new();
+    let mut component_counts = HashMap::default();
+    let mut component_minimums = HashMap::default();
     for &signal_root in &signal_roots {
         let component = write_components.find(signal_root);
         *component_counts.entry(component).or_insert(0usize) += 1;
@@ -1584,7 +1622,7 @@ fn analyze_cross_item_writes(graph: &ReferenceGraph, uf: &UnionFind) -> CrossWri
     }
 
     let signal_roots: HashSet<_> = signal_root_by_item.iter().copied().collect();
-    let mut leaf_component_counts = HashMap::new();
+    let mut leaf_component_counts = HashMap::default();
     for &signal_root in &signal_roots {
         let component = leaf_components.find(signal_root);
         *leaf_component_counts.entry(component).or_insert(0usize) += 1;
@@ -1619,7 +1657,7 @@ fn retain_inspect_cross_write_edge(
 fn canonical_cluster_ids(uf: &UnionFind, item_count: usize) -> Vec<usize> {
     let mut uf = uf.clone();
     let roots: Vec<_> = (0..item_count).map(|item| uf.find(item)).collect();
-    let mut minimum_by_root = HashMap::new();
+    let mut minimum_by_root = HashMap::default();
     for (item, &root) in roots.iter().enumerate() {
         minimum_by_root
             .entry(root)
@@ -1662,7 +1700,7 @@ fn merge_bounded_cross_item_writes(
     let topology = analyze_cross_item_writes(graph, uf);
     let mut component_cap_uf = uf.clone();
     let mut leaf_candidate_uf = uf.clone();
-    let mut leaf_edges_by_component: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    let mut leaf_edges_by_component: HashMap<usize, Vec<(usize, usize)>> = HashMap::default();
 
     for (writer, targets) in graph.writes.iter().enumerate() {
         let writer_root = topology.signal_root_by_item[writer];
@@ -1697,7 +1735,7 @@ fn merge_bounded_cross_item_writes(
     };
 
     let mut selected_uf = component_cap_uf;
-    let mut restored_components = HashSet::new();
+    let mut restored_components = HashSet::default();
     let mut component_ids = leaf_edges_by_component.keys().copied().collect::<Vec<_>>();
     component_ids.sort_unstable();
     for component_id in component_ids {
@@ -1734,7 +1772,7 @@ fn inspection_output_cluster_count(items: &[TopLevelItem], uf: &UnionFind) -> us
 /// write-based partition sees multiple producers and can synthesize an
 /// immutable import beside a local redeclaration of the same binding.
 fn union_duplicate_var_declarations(items: &[TopLevelItem], uf: &mut UnionFind) {
-    let mut first_var_declaration = HashMap::<Atom, usize>::new();
+    let mut first_var_declaration = HashMap::<Atom, usize>::default();
     for (item_index, item) in items.iter().enumerate() {
         for name in &item.top_level_var_names {
             if let Some(&first_index) = first_var_declaration.get(name) {
@@ -1849,7 +1887,7 @@ fn apply_merge_signals(items: &[TopLevelItem], graph: &ReferenceGraph, uf: &mut 
         let cluster_members: Vec<usize> = (0..items.len())
             .filter(|&k| uf.find(k) == consumer_root)
             .collect();
-        let mut ref_targets: HashSet<usize> = HashSet::new();
+        let mut ref_targets: HashSet<usize> = HashSet::default();
         for k in &cluster_members {
             for &t in &graph.references[*k] {
                 let tr = uf.find(t);
@@ -1875,7 +1913,7 @@ struct Cluster {
 }
 
 fn extract_root_clusters(items: &[TopLevelItem], uf: &mut UnionFind) -> Vec<Cluster> {
-    let mut root_to_indices: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut root_to_indices: HashMap<usize, Vec<usize>> = HashMap::default();
     for i in 0..items.len() {
         root_to_indices.entry(uf.find(i)).or_default().push(i);
     }
@@ -2150,7 +2188,7 @@ fn move_bare_statements_into_entry(
     // entry ends up importing and redeclaring the same binding.
     union_duplicate_var_declarations(items, &mut write_groups);
     merge_cross_item_writes(graph, &mut write_groups);
-    let mut entry_write_roots = HashSet::new();
+    let mut entry_write_roots = HashSet::default();
     for (item_index, item) in items.iter().enumerate() {
         if item.declared_names.is_empty() && !item.is_module_decl {
             entry_write_roots.insert(write_groups.find(item_index));
@@ -2349,7 +2387,7 @@ fn build_cluster_graph(clusters: &[Cluster], graph: &ReferenceGraph) -> Vec<Hash
         }
     }
 
-    let mut cluster_graph = vec![HashSet::new(); clusters.len()];
+    let mut cluster_graph = vec![HashSet::default(); clusters.len()];
     for (cluster_index, cluster) in clusters.iter().enumerate() {
         for &item_index in &cluster.item_indices {
             for &target_item in &graph.references[item_index] {
@@ -2436,7 +2474,7 @@ fn build_cluster_symbol_links(
     cluster_declared: &[HashSet<Atom>],
     cluster_referenced: &[HashSet<Atom>],
 ) -> ClusterSymbolLinks {
-    let mut declaring_clusters: HashMap<Atom, Vec<usize>> = HashMap::new();
+    let mut declaring_clusters: HashMap<Atom, Vec<usize>> = HashMap::default();
     for (cluster_index, declared_names) in cluster_declared.iter().enumerate() {
         for name in declared_names {
             declaring_clusters
@@ -2447,9 +2485,9 @@ fn build_cluster_symbol_links(
     }
 
     let mut imports_by_consumer = (0..cluster_referenced.len())
-        .map(|_| HashMap::<usize, Vec<Atom>>::new())
+        .map(|_| HashMap::<usize, Vec<Atom>>::default())
         .collect::<Vec<_>>();
-    let mut exports_by_producer = vec![HashSet::new(); cluster_declared.len()];
+    let mut exports_by_producer = vec![HashSet::default(); cluster_declared.len()];
 
     for (consumer_index, referenced_names) in cluster_referenced.iter().enumerate() {
         for name in referenced_names {
@@ -2495,6 +2533,7 @@ fn emit_clusters(
     clusters: Vec<Cluster>,
     inspection_context_by_item: Option<&[usize]>,
     cm: Lrc<SourceMap>,
+    positions: SourcePositions,
 ) -> Option<Vec<UnpackedModule>> {
     let dynamic_require_helpers = collect_dynamic_require_helpers(body);
     let esbuild_to_esm_helpers = collect_esbuild_to_esm_helpers(body);
@@ -2517,13 +2556,13 @@ fn emit_clusters(
             })
             .collect::<Vec<_>>()
     });
-    let mut context_cluster_counts = HashMap::new();
+    let mut context_cluster_counts = HashMap::default();
     if let Some(cluster_contexts) = &cluster_contexts {
         for context in cluster_contexts.iter().flatten() {
             *context_cluster_counts.entry(*context).or_insert(0usize) += 1;
         }
     }
-    let mut context_spans = HashMap::<usize, Vec<Span>>::new();
+    let mut context_spans = HashMap::<usize, Vec<Span>>::default();
     if let Some(context_by_item) = inspection_context_by_item {
         for (item, &context) in context_by_item.iter().enumerate() {
             if context_cluster_counts.get(&context).copied().unwrap_or(0) >= 2 {
@@ -2576,7 +2615,7 @@ fn emit_clusters(
                 return item_info.referenced_names.clone();
             }
             let mut emitted_item = source_item.clone();
-            let mut default_interop_bindings = HashSet::new();
+            let mut default_interop_bindings = HashSet::default();
             rewrite_emitted_runtime_helpers(
                 &mut emitted_item,
                 &item_info.declared_names,
@@ -2599,11 +2638,16 @@ fn emit_clusters(
         .collect();
 
     let mut symbol_links = build_cluster_symbol_links(&cluster_declared, &cluster_link_referenced);
+    let link_export_names: Vec<LinkExportNames> = clusters
+        .iter()
+        .zip(&symbol_links.exports_by_producer)
+        .map(|(cluster, linked)| plan_link_export_names(body, cluster, linked))
+        .collect();
 
     // Assign final filenames first so synthesized imports point at the same
     // paths the caller will write. Chunk names are derived from minified
     // bindings, so collisions are common in scope-concatenated packages.
-    let mut seen_filenames = HashSet::new();
+    let mut seen_filenames = HashSet::default();
     let filenames: Vec<String> = clusters
         .iter()
         .map(|c| {
@@ -2630,16 +2674,30 @@ fn emit_clusters(
 
         // Synthesize imports from the indexed cross-cluster symbol links.
         for (producer_index, needed) in &symbol_links.imports_by_consumer[ci] {
-            module_items.push(make_named_import_stmt(needed, &filenames[*producer_index]));
+            let aliases = &link_export_names[*producer_index].aliases;
+            let names: Vec<(Atom, Atom)> = needed
+                .iter()
+                .map(|local| (aliases.get(local).unwrap_or(local).clone(), local.clone()))
+                .collect();
+            module_items.push(make_named_import_stmt_with_aliases(
+                &names,
+                &filenames[*producer_index],
+            ));
         }
 
-        // Collect which names this cluster should export.
+        // Collect which names this cluster should export. Names the cluster's
+        // own export statements already cover, or would collide with, are
+        // handled by the link export plan instead.
+        let link_exports = &link_export_names[ci];
         let mut exported = std::mem::take(&mut symbol_links.exports_by_producer[ci]);
+        exported.retain(|name| {
+            !link_exports.existing.contains(name) && !link_exports.aliases.contains_key(name)
+        });
 
         // Original body items, with exported declarations promoted to
         // `export function ...` / `export const ...` / `export class ...`.
         let mut leftover_exports: Vec<Atom> = Vec::new();
-        let mut default_interop_bindings = HashSet::new();
+        let mut default_interop_bindings = HashSet::default();
         for &i in &cluster.item_indices {
             let mut item = body[i].clone();
             rewrite_emitted_runtime_helpers(
@@ -2676,6 +2734,15 @@ fn emit_clusters(
         if !leftover_exports.is_empty() {
             leftover_exports.sort();
             module_items.push(make_named_export_stmt(&leftover_exports));
+        }
+        if !link_exports.aliases.is_empty() {
+            let mut aliased = link_exports
+                .aliases
+                .iter()
+                .map(|(local, exported)| (local.clone(), exported.clone()))
+                .collect::<Vec<_>>();
+            aliased.sort();
+            module_items.push(make_named_export_stmt_with_aliases(&aliased));
         }
 
         if !default_interop_bindings.is_empty() {
@@ -2723,11 +2790,11 @@ fn emit_clusters(
             derive_chunk_name(items, cluster)
         };
 
-        let code = emit_items(module_items, filenames[ci].clone(), cm.clone());
+        let code = emit_items(module_items, filenames[ci].clone(), cm.clone(), positions);
         modules.push(UnpackedModule {
             id,
             is_entry: cluster.is_entry,
-            code,
+            code: code.code,
             filename: filenames[ci].clone(),
             source_ranges: spans_byte_ranges(
                 &cm,
@@ -2739,11 +2806,104 @@ fn emit_clusters(
                 .and_then(|context| context_ranges.get(&context).cloned())
                 .unwrap_or_default(),
             source_input: String::new(),
-            generated_source_map: Vec::new(),
+            generated_source_map: code.points,
+            verbatim_source_offset: None,
+            mapped_in_every_mode: false,
         });
     }
 
     Some(modules)
+}
+
+/// How a producer cluster exposes the locals other clusters import from it
+/// when its own export statements already use some of those names.
+#[derive(Default)]
+struct LinkExportNames {
+    /// Locals the cluster already exports under their own name.
+    existing: HashSet<Atom>,
+    /// Locals whose name another export of the cluster already uses (such as
+    /// `export { qM as b }` beside a local `b`), mapped to an unused export
+    /// name.
+    aliases: HashMap<Atom, Atom>,
+}
+
+fn plan_link_export_names(
+    body: &[ModuleItem],
+    cluster: &Cluster,
+    linked: &HashSet<Atom>,
+) -> LinkExportNames {
+    let mut plan = LinkExportNames::default();
+    if linked.is_empty() {
+        return plan;
+    }
+    // Exported name -> the local it exports, when it exports a local.
+    let mut used: HashMap<Atom, Option<Atom>> = HashMap::default();
+    for &i in &cluster.item_indices {
+        collect_export_names(&body[i], &mut used);
+    }
+    let mut reserved: HashSet<Atom> = used.keys().chain(linked).cloned().collect();
+    let mut locals = linked.iter().collect::<Vec<_>>();
+    locals.sort();
+    for local in locals {
+        match used.get(local) {
+            None => {}
+            Some(Some(exported_local)) if exported_local == local => {
+                plan.existing.insert(local.clone());
+            }
+            Some(_) => {
+                let alias = (2..)
+                    .map(|suffix| Atom::from(format!("{local}${suffix}")))
+                    .find(|candidate| reserved.insert(candidate.clone()))
+                    .expect("open-ended suffix search must find an unused export name");
+                plan.aliases.insert(local.clone(), alias);
+            }
+        }
+    }
+    plan
+}
+
+fn collect_export_names(item: &ModuleItem, used: &mut HashMap<Atom, Option<Atom>>) {
+    let ModuleItem::ModuleDecl(decl) = item else {
+        return;
+    };
+    match decl {
+        ModuleDecl::ExportDecl(_) => {
+            for name in module_item_declared_names(item) {
+                used.insert(name.clone(), Some(name));
+            }
+        }
+        ModuleDecl::ExportDefaultDecl(_) | ModuleDecl::ExportDefaultExpr(_) => {
+            used.insert("default".into(), None);
+        }
+        ModuleDecl::ExportNamed(export) => {
+            for specifier in &export.specifiers {
+                match specifier {
+                    ExportSpecifier::Named(named) => {
+                        let exported = named.exported.as_ref().unwrap_or(&named.orig);
+                        let local = match (&export.src, &named.orig) {
+                            (None, ModuleExportName::Ident(orig)) => Some(orig.sym.clone()),
+                            _ => None,
+                        };
+                        used.insert(module_export_name_atom(exported), local);
+                    }
+                    ExportSpecifier::Namespace(namespace) => {
+                        used.insert(module_export_name_atom(&namespace.name), None);
+                    }
+                    ExportSpecifier::Default(default) => {
+                        used.insert(default.exported.sym.clone(), None);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn module_export_name_atom(name: &ModuleExportName) -> Atom {
+    match name {
+        ModuleExportName::Ident(ident) => ident.sym.clone(),
+        ModuleExportName::Str(str_lit) => str_lit.value.as_str().unwrap_or("").into(),
+    }
 }
 
 fn collect_import_decls(body: &[ModuleItem]) -> Vec<ImportDecl> {
@@ -2808,27 +2968,34 @@ fn try_promote_export(item: &ModuleItem, exported: &HashSet<Atom>) -> ExportProm
     }
     match item {
         // `const x = ..., y = ...` — check if all or some declarators are exported.
+        // A declarator is exported only when every name it binds is, so a
+        // destructuring pattern never exports a name no cluster asked for.
         ModuleItem::Stmt(Stmt::Decl(Decl::Var(var_decl))) => {
-            let decl_names: Vec<Atom> = var_decl
+            let declarator_names: Vec<Vec<Atom>> = var_decl
                 .decls
                 .iter()
-                .filter_map(|d| {
-                    if let Pat::Ident(bi) = &d.name {
-                        Some(bi.id.sym.clone())
-                    } else {
-                        Option::None
-                    }
+                .map(|decl| {
+                    let mut names = HashSet::default();
+                    collect_pat_bindings(&decl.name, &mut names);
+                    let mut names = names.into_iter().collect::<Vec<_>>();
+                    names.sort();
+                    names
                 })
                 .collect();
-            let export_names: Vec<Atom> = decl_names
+            let is_exported: Vec<bool> = declarator_names
                 .iter()
-                .filter(|n| exported.contains(*n))
-                .cloned()
+                .map(|names| !names.is_empty() && names.iter().all(|name| exported.contains(name)))
+                .collect();
+            let export_names: Vec<Atom> = declarator_names
+                .iter()
+                .zip(&is_exported)
+                .filter(|(_, exported)| **exported)
+                .flat_map(|(names, _)| names.iter().cloned())
                 .collect();
             if export_names.is_empty() {
                 return ExportPromotion::None;
             }
-            if export_names.len() == decl_names.len() {
+            if is_exported.iter().all(|exported| *exported) {
                 // All declarators exported → `export const x = ..., y = ...`
                 let new_item = ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl {
                     span: Default::default(),
@@ -2837,14 +3004,11 @@ fn try_promote_export(item: &ModuleItem, exported: &HashSet<Atom>) -> ExportProm
                 ExportPromotion::Promoted(new_item, export_names)
             } else {
                 // Partial — split without reordering initializer evaluation.
-                let export_set: HashSet<&Atom> = export_names.iter().collect();
                 let mut items = Vec::new();
-                for decl in &var_decl.decls {
-                    let is_exported =
-                        matches!(&decl.name, Pat::Ident(bi) if export_set.contains(&bi.id.sym));
+                for (decl, is_exported) in var_decl.decls.iter().zip(&is_exported) {
                     let mut split_decl = var_decl.clone();
                     split_decl.decls = vec![decl.clone()];
-                    if is_exported {
+                    if *is_exported {
                         items.push(ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl {
                             span: Default::default(),
                             decl: Decl::Var(split_decl),

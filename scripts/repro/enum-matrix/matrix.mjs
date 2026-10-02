@@ -1,12 +1,11 @@
 #!/usr/bin/env node
 
+import { runNodeBatchSync } from "../lib/tool-process.mjs";
+
 import {
-  runMatrix, batchRunner, withTerserVariants, ensureNodeTool, standardLowerers,
+  runMatrix, batchRunner, withTerserVariants, ensureNodeTool, ensureSwcTool, standardLowerers,
 } from "../lib/runner.mjs";
 import { mangleValidator } from "../lib/compare.mjs";
-import { join } from "node:path";
-import { writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 
 const snippets = [
   {
@@ -152,10 +151,7 @@ function babelTsBatch(sources, profile, pluginOptions) {
   const packages = [`@babel/core@${profile.core}`, `${pluginName}@${pluginVersion}`];
   const toolKey = `babel-${profile.core}-transform-typescript`;
   const toolDir = ensureNodeTool(toolKey, packages);
-  const helper = join(toolDir, "babel-ts-batch.mjs");
-  writeFileSync(
-    helper,
-    `
+  const helperSource = `
 import fs from "node:fs";
 const babelModule = await import("@babel/core");
 const pluginModule = await import(${JSON.stringify(pluginName)});
@@ -173,32 +169,18 @@ const results = sources.map(source => {
   } catch (e) { return { error: e.message }; }
 });
 process.stdout.write(JSON.stringify(results));
-`,
-  );
-  const result = spawnSync("node", [helper], {
+`;
+  return runNodeBatchSync(helperSource, sources, {
+    label: "babel-ts-batch.mjs",
     cwd: toolDir,
-    input: JSON.stringify(sources),
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024 * 50,
-    env: { ...process.env, MATRIX_BABEL_OPTIONS: JSON.stringify(pluginOptions) },
+    env: { MATRIX_BABEL_OPTIONS: JSON.stringify(pluginOptions) },
   });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`babel batch exited ${result.status}: ${result.stderr}`);
-  const outputs = JSON.parse(result.stdout);
-  const map = new Map();
-  for (let i = 0; i < sources.length; i++) {
-    map.set(sources[i], outputs[i].error ? new Error(outputs[i].error) : outputs[i].code);
-  }
-  return map;
 }
 
 // Custom SWC batch for TypeScript (parser: { syntax: "typescript" }, filename: "input.ts")
 function swcTsBatch(sources) {
-  const toolDir = ensureNodeTool("swc", ["@swc/core@1"]);
-  const helper = join(toolDir, "swc-ts-batch.cjs");
-  writeFileSync(
-    helper,
-    `
+  const toolDir = ensureSwcTool();
+  const helperSource = `
 const fs = require("node:fs");
 const swc = require("@swc/core");
 const sources = JSON.parse(fs.readFileSync(0, "utf8"));
@@ -212,31 +194,18 @@ const results = sources.map(source => {
   } catch (e) { return { error: e.message }; }
 });
 process.stdout.write(JSON.stringify(results));
-`,
-  );
-  const result = spawnSync("node", [helper], {
+`;
+  return runNodeBatchSync(helperSource, sources, {
+    label: "swc-ts-batch.cjs",
+    format: "commonjs",
     cwd: toolDir,
-    input: JSON.stringify(sources),
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024 * 50,
   });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`swc batch exited ${result.status}: ${result.stderr}`);
-  const outputs = JSON.parse(result.stdout);
-  const map = new Map();
-  for (let i = 0; i < sources.length; i++) {
-    map.set(sources[i], outputs[i].error ? new Error(outputs[i].error) : outputs[i].code);
-  }
-  return map;
 }
 
 // Custom esbuild batch for TypeScript (loader: "ts")
 function esbuildTsBatch(sources) {
   const toolDir = ensureNodeTool("esbuild-0.28", ["esbuild@0.28.0"]);
-  const helper = join(toolDir, "esbuild-ts-batch.cjs");
-  writeFileSync(
-    helper,
-    `
+  const helperSource = `
 const fs = require("node:fs");
 const esbuild = require("esbuild");
 const sources = JSON.parse(fs.readFileSync(0, "utf8"));
@@ -248,22 +217,12 @@ const results = sources.map(source => {
   } catch (e) { return { error: e.message }; }
 });
 process.stdout.write(JSON.stringify(results));
-`,
-  );
-  const result = spawnSync("node", [helper], {
+`;
+  return runNodeBatchSync(helperSource, sources, {
+    label: "esbuild-ts-batch.cjs",
+    format: "commonjs",
     cwd: toolDir,
-    input: JSON.stringify(sources),
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024 * 50,
   });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`esbuild batch exited ${result.status}: ${result.stderr}`);
-  const outputs = JSON.parse(result.stdout);
-  const map = new Map();
-  for (let i = 0; i < sources.length; i++) {
-    map.set(sources[i], outputs[i].error ? new Error(outputs[i].error) : outputs[i].code);
-  }
-  return map;
 }
 
 const transformers = [

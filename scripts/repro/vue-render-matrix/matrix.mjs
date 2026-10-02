@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { runNodeBatchSync } from "../lib/tool-process.mjs";
+
 import {
   runMatrix, batchRunner, withTerserVariants, ensureNodeTool,
 } from "../lib/runner.mjs";
@@ -11,8 +13,6 @@ import {
 } from "../lib/vue-sfc-compare.mjs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
-import { spawnSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const VUE_COMPILER_VERSION = "3.5.35";
@@ -193,13 +193,10 @@ const visible = true
 const allSources = snippets.map((s) => s.source);
 
 function vueSfcBatch(sources, profile) {
-  const helper = join(vueToolDir, "vue-sfc-batch.mjs");
   const compilerHelper = pathToFileURL(
     join(dirname(fileURLToPath(import.meta.url)), "..", "lib", "vue-sfc-compiler.mjs"),
   ).href;
-  writeFileSync(
-    helper,
-    `
+  const helperSource = `
 import fs from "node:fs";
 import { parse, compileScript, compileTemplate } from "@vue/compiler-sfc";
 import { compileVueSfc } from ${JSON.stringify(compilerHelper)};
@@ -224,27 +221,13 @@ const results = sources.map((source, index) => {
   }
 });
 process.stdout.write(JSON.stringify(results));
-`,
-  );
+`;
 
-  const result = spawnSync("node", [helper], {
+  return runNodeBatchSync(helperSource, sources, {
+    label: "vue-sfc-batch.mjs",
     cwd: vueToolDir,
-    input: JSON.stringify(sources),
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024 * 50,
-    env: { ...process.env, MATRIX_VUE_PROFILE: JSON.stringify(profile) },
+    env: { MATRIX_VUE_PROFILE: JSON.stringify(profile) },
   });
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    const detail = [result.stderr.trim(), result.stdout.trim()].filter(Boolean).join(" ");
-    throw new Error(`vue compiler batch exited ${result.status}: ${detail}`);
-  }
-  const outputs = JSON.parse(result.stdout);
-  const map = new Map();
-  for (let i = 0; i < sources.length; i++) {
-    map.set(sources[i], outputs[i].error ? new Error(outputs[i].error) : outputs[i].code);
-  }
-  return map;
 }
 
 const transformers = VUE_SFC_COMPILE_PROFILES.flatMap((profile) =>

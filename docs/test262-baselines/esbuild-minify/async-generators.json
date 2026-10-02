@@ -39,8 +39,8 @@
     "runnable": 2963,
     "skipped": 0,
     "unsupported": 13,
-    "rejected": 236,
-    "passed": 2714,
+    "rejected": 229,
+    "passed": 2721,
     "failed": 0
   },
   "outcomes": [
@@ -861,14 +861,6 @@
       "summary": "Error: Transform failed with 1 error:\n<stdin>:31:15: ERROR: Cannot assign to \"c\" because it is a constant"
     },
     {
-      "path": "test/language/statements/for-await-of/async-func-decl-dstr-array-elem-trlg-iter-elision-iter-nrml-close-null.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "5b30fc20df98f9c6368d4675641d438e2719e3571ecdc80bb92b9b0d419850e1",
-      "summary": "Error: sloppy: expected success, got runtime Error: Test262Error: Expected SameValue(«1», «2») to be true"
-    },
-    {
       "path": "test/language/statements/for-await-of/async-func-decl-dstr-obj-id-init-fn-name-class.js",
       "variant": "sloppy,strict",
       "status": "rejected",
@@ -1355,54 +1347,6 @@
       "kind": "transform-reject",
       "fingerprint": "4ff0760da273657609cae598cc650437f3fd5bb6a802c3daca558e8c80162b73",
       "summary": "Error: Transform failed with 1 error:\n<stdin>:31:15: ERROR: Cannot assign to \"c\" because it is a constant"
-    },
-    {
-      "path": "test/language/statements/for-await-of/async-gen-decl-dstr-array-elem-trlg-iter-elision-iter-nrml-close-err.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "feaf35819caf0da1d860fa494e5432d5a2a73918c2053390b3a0f9c7dc599dbb",
-      "summary": "Error: sloppy: expected success, got runtime Error: Test262Error: Expected SameValue(«1», «2») to be true"
-    },
-    {
-      "path": "test/language/statements/for-await-of/async-gen-decl-dstr-array-elem-trlg-iter-elision-iter-nrml-close-null.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "7e9b5b6560c778978c4f6bc101b484690feda0b40d4e953c6d801fbcfee60df1",
-      "summary": "Error: sloppy: expected success, got runtime Error: Test262Error: Expected SameValue(«1», «2») to be true"
-    },
-    {
-      "path": "test/language/statements/for-await-of/async-gen-decl-dstr-array-elem-trlg-iter-elision-iter-nrml-close-skip.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "b2e3e83a0d2c85df1b1b40c5ecf34239e80572ae5bc1d1033406a266202e3eac",
-      "summary": "Error: sloppy: expected success, got runtime Error: TypeError: Iterator result undefined is not an object"
-    },
-    {
-      "path": "test/language/statements/for-await-of/async-gen-decl-dstr-array-elem-trlg-iter-elision-iter-nrml-close.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "d91d67d976c27481f8209aa78aed113cd0b11e54510546924861b19570dd9dd6",
-      "summary": "Error: sloppy: expected success, got runtime Error: Test262Error: Expected SameValue(«1», «2») to be true"
-    },
-    {
-      "path": "test/language/statements/for-await-of/async-gen-decl-dstr-array-elision-iter-nrml-close-skip.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "8211e6e3aa515f1bc20b4a88df1529bbb4b2a5d71a305822675d6bcf9a45c86d",
-      "summary": "Error: sloppy: expected success, got runtime Error: Test262Error: Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "test/language/statements/for-await-of/async-gen-decl-dstr-array-elision-iter-nrml-close.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "f895c668d2aef5aea5d45c73af505e1e9c778b0fa493392165e2e290dd44079d",
-      "summary": "Error: sloppy: expected success, got runtime Error: Test262Error: Expected SameValue(«0», «1») to be true"
     },
     {
       "path": "test/language/statements/for-await-of/async-gen-decl-dstr-obj-id-init-fn-name-class.js",

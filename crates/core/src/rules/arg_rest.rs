@@ -1,16 +1,21 @@
+use crate::collections::HashSet;
+
 use swc_core::atoms::Atom;
-use swc_core::common::DUMMY_SP;
+use swc_core::common::{Mark, DUMMY_SP};
 use swc_core::ecma::ast::{
-    ArrowExpr, AssignOp, AssignTarget, BinaryOp, BindingIdent, Callee, Constructor, Decl, Expr,
-    Function, FunctionBody, Ident, Lit, MemberExpr, MemberProp, Number, Param, ParamOrTsParamProp,
-    Pat, RestPat, SimpleAssignTarget, Stmt, UpdateOp, VarDeclKind, VarDeclOrExpr,
+    AssignOp, AssignTarget, BinExpr, BinaryOp, BindingIdent, Callee, CondExpr, Constructor, Decl,
+    Expr, Function, FunctionBody, Ident, Lit, MemberExpr, MemberProp, Number, Param,
+    ParamOrTsParamProp, Pat, RestPat, SimpleAssignTarget, Stmt, UpdateOp, VarDecl, VarDeclKind,
+    VarDeclOrExpr, VarDeclarator,
 };
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use super::decl_utils::{
-    binding_id, contains_use_strict_string_statement, has_direct_use_strict_directive,
-    ident_matches_binding, BindingId,
+    binding_id, contains_use_strict_string_statement, fresh_binding_ident,
+    has_direct_use_strict_directive, ident_matches_binding, BindingId,
 };
+use super::helper_matcher::count_binding_refs;
+use super::rename_utils::{rename_bindings, BindingRename};
 use super::RewriteLevel;
 
 /// Replaces `arguments[N]` / `arguments.length` patterns with a rest parameter
@@ -53,6 +58,11 @@ impl VisitMut for ArgRest {
         if has_direct_use_strict_directive(body) {
             return;
         }
+        // A parameter initializer that reads `arguments` runs before the rest
+        // binding exists, and a mapped index it reads would change meaning.
+        if mentions_arguments(&func.params) {
+            return;
+        }
         let original = contains_use_strict_string_statement(body).then(|| func.clone());
         let fixed_param_count = func.params.len();
 
@@ -64,9 +74,11 @@ impl VisitMut for ArgRest {
             return;
         }
 
-        let rest_ident = copy_var
-            .clone()
-            .unwrap_or_else(|| Ident::new_no_ctxt("args".into(), DUMMY_SP));
+        let rest_ident = prepare_rest_ident(
+            func.body.as_mut().expect("body was checked above"),
+            &func.params,
+            copy_var.as_ref(),
+        );
         func.params.push(make_rest_param(rest_ident.clone()));
 
         // Rewrite `arguments` → rest param in the body
@@ -110,6 +122,9 @@ impl VisitMut for ArgRest {
         if has_direct_use_strict_directive(body) {
             return;
         }
+        if mentions_arguments(&ctor.params) {
+            return;
+        }
         let original = contains_use_strict_string_statement(body).then(|| ctor.clone());
         let fixed_param_count = ctor.params.len();
 
@@ -121,9 +136,11 @@ impl VisitMut for ArgRest {
             return;
         }
 
-        let rest_ident = copy_var
-            .clone()
-            .unwrap_or_else(|| Ident::new_no_ctxt("args".into(), DUMMY_SP));
+        let rest_ident = prepare_rest_ident(
+            ctor.body.as_mut().expect("body was checked above"),
+            &ctor.params,
+            copy_var.as_ref(),
+        );
         ctor.params.push(ParamOrTsParamProp::Param(make_rest_param(
             rest_ident.clone(),
         )));
@@ -153,8 +170,8 @@ impl VisitMut for ArgRest {
 
 /// Scan `body` for the Babel rest-args copy pattern **before** `arguments` is rewritten.
 /// Returns the copy variable's name (e.g. `i`, `r`, `t`) so it can be reused as the
-/// rest param — this avoids any naming conflicts because minified copy vars are already
-/// unique within their enclosing scope.
+/// rest param. Its name may still be shadowed inside a nested arrow where an
+/// arguments read will be inserted; `prepare_rest_ident` checks that separately.
 ///
 /// Pattern matched (3-declarator for-init, `arguments.length` as source):
 /// ```text
@@ -167,6 +184,78 @@ fn detect_copy_var_ident(body: &FunctionBody, fixed_param_count: usize) -> Optio
         .or_else(|| detect_ts_copy_var_ident(body, fixed_param_count))
 }
 
+/// Positive proof that a binding is the Array populated by a canonical
+/// Babel/TypeScript rest-argument copy. `ready_stmt` is the first statement
+/// after the declaration/copy loop, where the binding can be consumed as an
+/// initialized Array.
+pub(super) struct RestArrayCopyProof {
+    pub(super) binding: Ident,
+    pub(super) start_stmt: usize,
+    pub(super) ready_stmt: usize,
+}
+
+/// Find a rest-array copy using resolver identity for the built-in `Array`
+/// constructor and the function's implicit `arguments` binding. ArgRest's
+/// historical matcher remains name-based; callers using this as an Array proof
+/// need the stronger checks before replacing concat with spread.
+pub(super) fn find_rest_array_copy_proof(
+    body: &FunctionBody,
+    fixed_param_count: usize,
+    unresolved_mark: Mark,
+) -> Option<RestArrayCopyProof> {
+    if let Some((index, binding)) = body.stmts.iter().enumerate().find_map(|(index, stmt)| {
+        detect_copy_var_ident_from_stmt_with_mark(stmt, fixed_param_count, Some(unresolved_mark))
+            .filter(|_| arguments_refs_are_unresolved(stmt, unresolved_mark))
+            .map(|binding| (index, binding))
+    }) {
+        return Some(RestArrayCopyProof {
+            binding,
+            start_stmt: index,
+            ready_stmt: index + 1,
+        });
+    }
+
+    body.stmts.windows(2).enumerate().find_map(|(index, pair)| {
+        let copy_id = ts_empty_array_ident_from_stmt(&pair[0])?;
+        let loop_copy = detect_ts_copy_loop_from_stmt(&pair[1], fixed_param_count)?;
+        if binding_id(&copy_id) != loop_copy
+            || !arguments_refs_are_unresolved(&pair[1], unresolved_mark)
+        {
+            return None;
+        }
+        Some(RestArrayCopyProof {
+            binding: copy_id,
+            start_stmt: index,
+            ready_stmt: index + 2,
+        })
+    })
+}
+
+fn arguments_refs_are_unresolved<N>(node: &N, unresolved_mark: Mark) -> bool
+where
+    N: VisitWith<ArgumentsIdentityChecker>,
+{
+    let mut checker = ArgumentsIdentityChecker {
+        unresolved_mark,
+        valid: true,
+    };
+    node.visit_with(&mut checker);
+    checker.valid
+}
+
+struct ArgumentsIdentityChecker {
+    unresolved_mark: Mark,
+    valid: bool,
+}
+
+impl Visit for ArgumentsIdentityChecker {
+    fn visit_ident(&mut self, ident: &Ident) {
+        if ident.sym == "arguments" && ident.ctxt.outer() != self.unresolved_mark {
+            self.valid = false;
+        }
+    }
+}
+
 fn detect_ts_copy_var_ident(body: &FunctionBody, fixed_param_count: usize) -> Option<Ident> {
     body.stmts.windows(2).find_map(|pair| {
         let copy_id = ts_empty_array_ident_from_stmt(&pair[0])?;
@@ -176,6 +265,14 @@ fn detect_ts_copy_var_ident(body: &FunctionBody, fixed_param_count: usize) -> Op
 }
 
 fn detect_copy_var_ident_from_stmt(stmt: &Stmt, fixed_param_count: usize) -> Option<Ident> {
+    detect_copy_var_ident_from_stmt_with_mark(stmt, fixed_param_count, None)
+}
+
+fn detect_copy_var_ident_from_stmt_with_mark(
+    stmt: &Stmt,
+    fixed_param_count: usize,
+    unresolved_mark: Option<Mark>,
+) -> Option<Ident> {
     let Stmt::For(for_stmt) = stmt else {
         return None;
     };
@@ -211,7 +308,9 @@ fn detect_copy_var_ident_from_stmt(stmt: &Stmt, fixed_param_count: usize) -> Opt
         return None;
     };
 
-    let is_array_ctor = |sym: &Atom| sym == "Array";
+    let is_array_ctor = |ident: &Ident| {
+        ident.sym == "Array" && unresolved_mark.is_none_or(|mark| ident.ctxt.outer() == mark)
+    };
     let one_len_arg = |args: &[swc_core::ecma::ast::ExprOrSpread]| -> bool {
         args.len() == 1
             && args[0].spread.is_none()
@@ -226,7 +325,7 @@ fn detect_copy_var_ident_from_stmt(stmt: &Stmt, fixed_param_count: usize) -> Opt
             let Expr::Ident(id) = callee.as_ref() else {
                 return None;
             };
-            if !is_array_ctor(&id.sym) || !one_len_arg(&call.args) {
+            if !is_array_ctor(id) || !one_len_arg(&call.args) {
                 return None;
             }
         }
@@ -234,7 +333,7 @@ fn detect_copy_var_ident_from_stmt(stmt: &Stmt, fixed_param_count: usize) -> Opt
             let Expr::Ident(id) = new_expr.callee.as_ref() else {
                 return None;
             };
-            if !is_array_ctor(&id.sym) {
+            if !is_array_ctor(id) {
                 return None;
             }
             let args = new_expr.args.as_deref().unwrap_or(&[]);
@@ -624,9 +723,105 @@ impl Visit for ArgumentsChecker {
         }
     }
 
-    // Don't descend into nested functions — they have their own `arguments`
+    // Don't descend into nested functions or class constructors — they have
+    // their own `arguments`. Arrows have none and read this function's object,
+    // so the default traversal covers them.
     fn visit_function(&mut self, _: &Function) {}
-    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+    fn visit_constructor(&mut self, _: &Constructor) {}
+}
+
+/// True when any node in `node` mentions `arguments` from the enclosing
+/// function's activation: nested arrows count, nested functions do not.
+fn mentions_arguments<N: VisitWith<ArgumentsMentionDetector>>(node: &N) -> bool {
+    let mut detector = ArgumentsMentionDetector { found: false };
+    node.visit_with(&mut detector);
+    detector.found
+}
+
+struct ArgumentsMentionDetector {
+    found: bool,
+}
+
+impl Visit for ArgumentsMentionDetector {
+    fn visit_ident(&mut self, id: &Ident) {
+        if id.sym == "arguments" {
+            self.found = true;
+        }
+    }
+
+    fn visit_function(&mut self, _: &Function) {}
+    fn visit_constructor(&mut self, _: &Constructor) {}
+}
+
+/// Reuse a copy binding's name and context when possible. If another binding
+/// has the same printed name, rename the copy and its references before
+/// removing its loop. The nested binding itself must not be renamed.
+fn prepare_rest_ident<P: VisitWith<IdentNameCollector>>(
+    body: &mut FunctionBody,
+    params: &P,
+    copy: Option<&Ident>,
+) -> Ident {
+    let preferred = copy.map_or_else(|| Atom::from("args"), |ident| ident.sym.clone());
+    let name = fresh_rest_name(body, params, preferred, copy.map(binding_id));
+    let Some(copy) = copy else {
+        return fresh_binding_ident(name, DUMMY_SP);
+    };
+    if name != copy.sym {
+        rename_bindings(
+            body,
+            &[BindingRename {
+                old: binding_id(copy),
+                new: name.clone(),
+            }],
+        );
+    }
+    let mut rest = copy.clone();
+    rest.sym = name;
+    rest
+}
+
+/// Printed JavaScript has no SyntaxContext. Reserve every identifier spelling
+/// except the copy binding being replaced, then pick the preferred name or an
+/// unused suffix. This covers both capture of inserted reads and outer names.
+fn fresh_rest_name<P: VisitWith<IdentNameCollector>>(
+    body: &FunctionBody,
+    params: &P,
+    preferred: Atom,
+    copy: Option<BindingId>,
+) -> Atom {
+    let mut collector = IdentNameCollector {
+        names: HashSet::default(),
+        ignored_binding: copy,
+    };
+    body.visit_with(&mut collector);
+    collector.ignored_binding = None;
+    params.visit_with(&mut collector);
+
+    if !collector.names.contains(&preferred) {
+        return preferred;
+    }
+    (1usize..)
+        .map(|suffix| Atom::from(format!("{preferred}_{suffix}")))
+        .find(|candidate| !collector.names.contains(candidate))
+        .expect("an unused suffix exists")
+}
+
+struct IdentNameCollector {
+    names: HashSet<Atom>,
+    ignored_binding: Option<BindingId>,
+}
+
+impl Visit for IdentNameCollector {
+    fn visit_ident(&mut self, ident: &Ident) {
+        if self
+            .ignored_binding
+            .as_ref()
+            .is_some_and(|binding| ident_matches_binding(ident, binding))
+        {
+            return;
+        }
+        self.names.insert(ident.sym.clone());
+    }
 }
 
 fn is_arguments_ident(expr: &Expr) -> bool {
@@ -779,9 +974,20 @@ fn remove_arguments_copy_loop(body: &mut FunctionBody, fixed_param_count: usize)
     let old = std::mem::take(&mut body.stmts);
     let mut result = Vec::with_capacity(old.len());
     let mut i = 0;
+    // Where the removed loop stood, and the bindings its head declared besides
+    // the copy: the length alias and the index. Minified code reuses them
+    // after the loop (`e` becomes the `_this` alias), so they are re-declared
+    // there when a reference survives.
+    let mut removed_loop: Option<(usize, Vec<(Ident, Box<Expr>)>)> = None;
 
     while i < old.len() {
-        if detect_copy_var_ident_from_stmt(&old[i], fixed_param_count).is_some() {
+        if let Some(copy) = detect_copy_var_ident_from_stmt(&old[i], fixed_param_count) {
+            if removed_loop.is_none() {
+                removed_loop = Some((
+                    result.len(),
+                    copy_loop_side_bindings(&old[i], &binding_id(&copy)),
+                ));
+            }
             i += 1;
             continue;
         }
@@ -791,13 +997,22 @@ fn remove_arguments_copy_loop(body: &mut FunctionBody, fixed_param_count: usize)
                 if detect_ts_copy_loop_from_stmt(&old[i + 1], fixed_param_count)
                     .is_some_and(|loop_copy| loop_copy == binding_id(&copy))
                 {
+                    if removed_loop.is_none() {
+                        removed_loop = Some((
+                            result.len(),
+                            copy_loop_side_bindings(&old[i + 1], &binding_id(&copy)),
+                        ));
+                    }
                     i += 2;
                     continue;
                 }
             }
         }
 
-        if detect_ts_copy_loop_from_stmt(&old[i], fixed_param_count).is_some() {
+        if let Some(copy) = detect_ts_copy_loop_from_stmt(&old[i], fixed_param_count) {
+            if removed_loop.is_none() {
+                removed_loop = Some((result.len(), copy_loop_side_bindings(&old[i], &copy)));
+            }
             i += 1;
             continue;
         }
@@ -806,7 +1021,89 @@ fn remove_arguments_copy_loop(body: &mut FunctionBody, fixed_param_count: usize)
         i += 1;
     }
 
+    if let Some((index, bindings)) = removed_loop {
+        let decls: Vec<VarDeclarator> = bindings
+            .into_iter()
+            .filter(|(ident, _)| {
+                let key = binding_id(ident);
+                result.iter().any(|stmt| count_binding_refs(stmt, &key) > 0)
+            })
+            .map(|(ident, length)| VarDeclarator {
+                span: DUMMY_SP,
+                name: Pat::Ident(BindingIdent {
+                    id: ident,
+                    type_ann: None,
+                }),
+                init: Some(length),
+                definite: false,
+            })
+            .collect();
+        if !decls.is_empty() {
+            result.insert(
+                index,
+                Stmt::Decl(Decl::Var(Box::new(VarDecl {
+                    span: DUMMY_SP,
+                    ctxt: Default::default(),
+                    kind: VarDeclKind::Var,
+                    declare: false,
+                    decls,
+                }))),
+            );
+        }
+    }
+
     body.stmts = result;
+}
+
+/// The `var` bindings a copy loop's head declares other than the copy itself,
+/// each paired with its terminal value. The length alias keeps
+/// `arguments.length`, while the index cannot finish below its initial value
+/// when fewer arguments than fixed parameters were supplied. Clone expressions
+/// so references retain their resolver contexts.
+fn copy_loop_side_bindings(stmt: &Stmt, copy: &BindingId) -> Vec<(Ident, Box<Expr>)> {
+    let Stmt::For(for_stmt) = stmt else {
+        return Vec::new();
+    };
+    let Some(VarDeclOrExpr::VarDecl(init)) = &for_stmt.init else {
+        return Vec::new();
+    };
+    let from_head = init
+        .decls
+        .first()
+        .and_then(|decl| decl.init.as_deref())
+        .filter(|expr| is_arguments_length_expr(expr));
+    let from_test = for_stmt.test.as_deref().and_then(|test| match test {
+        Expr::Bin(bin) if is_arguments_length_expr(&bin.right) => Some(bin.right.as_ref()),
+        _ => None,
+    });
+    let Some(length) = from_head.or(from_test) else {
+        return Vec::new();
+    };
+    init.decls
+        .iter()
+        .filter_map(|decl| match &decl.name {
+            Pat::Ident(binding) if binding_id(&binding.id) != *copy => {
+                let value = match decl.init.as_deref() {
+                    Some(start @ Expr::Lit(Lit::Num(number))) if number.value > 0.0 => {
+                        Expr::Cond(CondExpr {
+                            span: DUMMY_SP,
+                            test: Box::new(Expr::Bin(BinExpr {
+                                span: DUMMY_SP,
+                                op: BinaryOp::Lt,
+                                left: Box::new(length.clone()),
+                                right: Box::new(start.clone()),
+                            })),
+                            cons: Box::new(start.clone()),
+                            alt: Box::new(length.clone()),
+                        })
+                    }
+                    _ => length.clone(),
+                };
+                Some((binding.id.clone(), Box::new(value)))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 struct ArgumentsRewriter {
@@ -846,9 +1143,10 @@ impl VisitMut for ArgumentsRewriter {
         expr.visit_mut_children_with(self);
     }
 
-    // Don't descend into nested functions
+    // Don't descend into nested functions or class constructors; arrows read
+    // this function's `arguments` and are rewritten along with the body.
     fn visit_mut_function(&mut self, _: &mut Function) {}
-    fn visit_mut_arrow_expr(&mut self, _: &mut ArrowExpr) {}
+    fn visit_mut_constructor(&mut self, _: &mut Constructor) {}
 }
 
 fn is_safe_arguments_index(expr: &Expr, fixed_param_count: usize) -> bool {

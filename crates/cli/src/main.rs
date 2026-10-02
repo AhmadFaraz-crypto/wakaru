@@ -26,10 +26,11 @@ mod vue;
 
 use color::Styled;
 use discovery::{collect_directory_js_inputs, collect_validate_inputs, DirectoryScanStats};
-use formatter::{format_cli_output, selected_formatter};
+use formatter::{format_cli_output, format_cli_output_with_source_map, selected_formatter};
 use json_output::{
-    JsonDecompileOutput, JsonModule, JsonModuleKind, JsonModuleStatus, JsonUnpackOutput,
-    JsonWarning,
+    JsonChunkAsset, JsonChunkEnumeration, JsonChunkEnumerationOutput, JsonChunkUrl,
+    JsonDecompileOutput, JsonModule, JsonModuleKind, JsonModuleStatus, JsonPublicPath,
+    JsonRelativeImport, JsonUnpackOutput, JsonWarning,
 };
 use output::{canonicalize_output_dir, resolve_unpack_output_path, write_file, write_if_changed};
 use vue::{
@@ -39,6 +40,11 @@ use vue::{
     vue_js_output_filename, vue_output_filename_for_component, vue_sfc_artifact_summary,
     vue_sfc_js_artifact_status,
 };
+
+// AST processing allocates and frees many small nodes across Rayon workers.
+// Keep this allocator choice in the executable; library users own theirs.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliRewriteLevel {
@@ -145,8 +151,8 @@ struct Cli {
     formatter: bool,
 
     /// Emit a source map (.map) alongside each decompiled JavaScript output
-    /// file, mapping the output back to the input. Requires -o/--output.
-    /// Vue SFC sidecars are not mapped.
+    /// file, mapping the output back to the input (with --unpack, into the
+    /// bundle). Requires -o/--output. Vue SFC sidecars are not mapped.
     #[arg(long = "emit-source-map")]
     emit_source_map: bool,
 
@@ -213,12 +219,26 @@ enum DebugCommand {
     /// output only — raw output carries no module-graph contract. Exits
     /// nonzero when findings exist.
     Validate(ValidateArgs),
+
+    /// Statically enumerate chunk references without unpacking modules.
+    EnumerateChunks(EnumerateChunksArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct EnumerateChunksArgs {
+    /// Input JavaScript file. Use `-` or omit to read from stdin.
+    input: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
 struct ValidateArgs {
     /// Directory containing emitted modules (normal unpack output).
     dir: PathBuf,
+
+    /// Original bundle input (file or directory; repeatable). Free identifiers
+    /// in the output that are not free anywhere in these inputs are reported.
+    #[arg(long, value_name = "PATH")]
+    input: Vec<PathBuf>,
 
     /// Print findings as JSON.
     #[arg(long)]
@@ -365,11 +385,19 @@ fn run_unpack(cli: Cli) -> Result<()> {
     let module_sources = cli
         .vue_sfc
         .then(|| output.modules.iter().cloned().collect::<HashMap<_, _>>());
-    let modules = output.modules;
+    let mut source_maps: HashMap<String, String> = output.source_maps.into_iter().collect();
+    let modules: Vec<(String, String, Option<String>)> = output
+        .modules
+        .into_iter()
+        .map(|(filename, code)| {
+            let source_map = source_maps.remove(&filename);
+            (filename, code, source_map)
+        })
+        .collect();
     let total_modules = modules.len();
     let artifacts: Vec<CliOutputArtifact> = modules
         .into_par_iter()
-        .flat_map(|(filename, code)| {
+        .flat_map(|(filename, code, source_map)| {
             let mut artifacts = Vec::new();
             let recovered_vue_sfcs = if cli.vue_sfc {
                 let module_sources = module_sources
@@ -389,7 +417,8 @@ fn run_unpack(cli: Cli) -> Result<()> {
             let recovered_vue_sfc = !recovered_vue_sfcs.is_empty();
             let likely_vue_sfc = cli.vue_sfc
                 && (recovered_vue_sfc || is_likely_vue_sfc_source(&code).unwrap_or(false));
-            let formatted = format_cli_output(code, &filename, js_formatter);
+            let (formatted, source_map) =
+                format_cli_output_with_source_map(code, source_map, &filename, js_formatter);
             artifacts.push(CliOutputArtifact {
                 filename: if cli.vue_sfc {
                     vue_js_output_filename(&filename)
@@ -405,6 +434,7 @@ fn run_unpack(cli: Cli) -> Result<()> {
                 },
                 source_filename: (cli.vue_sfc && recovered_vue_sfc).then(|| filename.clone()),
                 source_map_filename: Some(filename.clone()),
+                source_map,
             });
 
             let multiple_vue_sfcs = recovered_vue_sfcs.len() > 1;
@@ -420,6 +450,7 @@ fn run_unpack(cli: Cli) -> Result<()> {
                     status: JsonModuleStatus::RecoveredVueSfc,
                     source_filename: Some(filename.clone()),
                     source_map_filename: None,
+                    source_map: None,
                 });
             }
             artifacts
@@ -453,22 +484,20 @@ fn run_unpack(cli: Cli) -> Result<()> {
         }
     }
 
-    if !output.source_maps.is_empty() {
-        let srcmap_map: std::collections::HashMap<&str, &str> = output
-            .source_maps
-            .iter()
-            .map(|(f, m)| (f.as_str(), m.as_str()))
-            .collect();
-        for (artifact, (out_path, _)) in artifacts.iter().zip(resolved.iter()) {
-            if let Some(map_json) = artifact
-                .source_map_filename
-                .as_deref()
-                .and_then(|filename| srcmap_map.get(filename))
-            {
-                let map_path = append_map_extension(out_path);
-                write_file(&map_path, map_json)?;
-            }
-        }
+    if artifacts
+        .iter()
+        .any(|artifact| artifact.source_map.is_some())
+    {
+        let span = tracing::info_span!("cli_write_source_maps");
+        let _enter = span.enter();
+        artifacts.par_iter().zip(resolved.par_iter()).try_for_each(
+            |(artifact, (out_path, _))| match artifact.source_map.as_deref() {
+                Some(map_json) => {
+                    write_output_source_map(&append_map_extension(out_path), map_json)
+                }
+                None => Ok(()),
+            },
+        )?;
     }
 
     if cli.provenance {
@@ -647,7 +676,12 @@ fn run_single(cli: Cli) -> Result<()> {
     );
     let formatter =
         selected_formatter(cli.formatter && (!recovered_vue_sfc || js_primary_vue_output));
-    let code = format_cli_output(output.code, &output_filename, formatter);
+    let (code, source_map) = format_cli_output_with_source_map(
+        output.code,
+        output.source_map.take(),
+        &output_filename,
+        formatter,
+    );
 
     if cli.json {
         let json_code = if output_path.is_none() {
@@ -662,10 +696,8 @@ fn run_single(cli: Cli) -> Result<()> {
             }
             fs::write(path, &code)
                 .with_context(|| format!("failed to write {}", path.display()))?;
-            if let Some(ref map_json) = output.source_map {
-                let map_path = append_map_extension(path);
-                fs::write(&map_path, map_json)
-                    .with_context(|| format!("failed to write {}", map_path.display()))?;
+            if let Some(ref map_json) = source_map {
+                write_output_source_map(&append_map_extension(path), map_json)?;
             }
             if let (Some(sidecar_path), Some(sidecar_code)) =
                 (vue_sidecar_path.as_ref(), vue_sidecar.as_ref())
@@ -676,7 +708,7 @@ fn run_single(cli: Cli) -> Result<()> {
         }
         let json = JsonDecompileOutput {
             code: json_code,
-            source_map: output.source_map.clone(),
+            source_map: source_map.clone(),
             kind: vue_metadata.as_ref().map(|metadata| metadata.kind),
             status: vue_metadata.as_ref().map(|metadata| metadata.status),
             source_filename: vue_metadata
@@ -701,10 +733,8 @@ fn run_single(cli: Cli) -> Result<()> {
                 }
                 fs::write(&path, &code)
                     .with_context(|| format!("failed to write {}", path.display()))?;
-                if let Some(ref map_json) = output.source_map {
-                    let map_path = append_map_extension(&path);
-                    fs::write(&map_path, map_json)
-                        .with_context(|| format!("failed to write {}", map_path.display()))?;
+                if let Some(ref map_json) = source_map {
+                    write_output_source_map(&append_map_extension(&path), map_json)?;
                 }
                 if let (Some(sidecar_path), Some(sidecar_code)) =
                     (vue_sidecar_path.as_ref(), vue_sidecar.as_ref())
@@ -806,7 +836,26 @@ fn run_debug(args: DebugArgs, force: bool) -> Result<()> {
         DebugCommand::Trace(args) => run_trace(args, force),
         DebugCommand::Normalize(args) => run_normalize(args),
         DebugCommand::Validate(args) => run_validate(args),
+        DebugCommand::EnumerateChunks(args) => run_enumerate_chunks(args),
     }
+}
+
+fn run_enumerate_chunks(args: EnumerateChunksArgs) -> Result<()> {
+    let (source, filename) = read_input(args.input.as_ref())?;
+    let output = enumerate_chunks_json(&source, &filename)?;
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+fn enumerate_chunks_json(source: &str, filename: &str) -> Result<JsonChunkEnumerationOutput> {
+    let report = wakaru_core::unpacker::enumerate_chunks(source, filename)?;
+    Ok(JsonChunkEnumerationOutput {
+        input: filename.to_string(),
+        detected_format: report
+            .detected_format
+            .map(|format| format.as_str().to_string()),
+        enumeration: report.enumeration.as_ref().map(json_chunk_enumeration),
+    })
 }
 
 fn run_validate(args: ValidateArgs) -> Result<()> {
@@ -826,11 +875,29 @@ fn run_validate(args: ValidateArgs) -> Result<()> {
         modules.push((relative, source));
     }
 
-    let findings = wakaru_core::validate_output_modules(&modules);
+    let mut inputs = Vec::new();
+    for input in &args.input {
+        let files = if input.is_dir() {
+            collect_directory_js_inputs(input)?
+        } else {
+            vec![input.clone()]
+        };
+        for path in files {
+            let source = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read input {}", path.display()))?;
+            inputs.push((path.to_string_lossy().replace('\\', "/"), source));
+        }
+    }
+    if !args.input.is_empty() && inputs.is_empty() {
+        anyhow::bail!("no JavaScript files found under the --input paths");
+    }
+
+    let findings = wakaru_core::validate_output_modules_with_inputs(&modules, &inputs);
 
     if args.json {
         let payload = serde_json::json!({
             "modules": modules.len(),
+            "inputs": inputs.len(),
             "findings": findings
                 .iter()
                 .map(validate_finding_json)
@@ -909,7 +976,7 @@ fn run_trace(args: TraceArgs, force: bool) -> Result<()> {
             only_changed: !args.all,
         },
     )?;
-    let output = format_trace_events(&events);
+    let output = trace_output_text(&events, args.all);
 
     match args.output {
         Some(path) => {
@@ -923,6 +990,20 @@ fn run_trace(args: TraceArgs, force: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// A traced range in which no rule changed the rendered output yields no
+/// events; say so instead of emitting an empty trace.
+fn trace_output_text(events: &[wakaru_core::RuleTraceEvent], include_unchanged: bool) -> String {
+    if !events.is_empty() {
+        return format_trace_events(events);
+    }
+    if include_unchanged {
+        "=== no rule ran in the traced range ===\n".to_string()
+    } else {
+        "=== no rule changed the rendered output in the traced range (pass --all to list unchanged rules) ===\n"
+            .to_string()
+    }
 }
 
 fn read_sourcemap(path: Option<&PathBuf>) -> Result<Option<Vec<u8>>> {
@@ -970,6 +1051,8 @@ struct CliOutputArtifact {
     status: JsonModuleStatus,
     source_filename: Option<String>,
     source_map_filename: Option<String>,
+    /// Output source map for `code`, already carried across formatting.
+    source_map: Option<String>,
 }
 
 fn json_module_for_artifact(artifact: &CliOutputArtifact) -> JsonModule {
@@ -981,6 +1064,7 @@ fn json_module_for_artifact(artifact: &CliOutputArtifact) -> JsonModule {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn json_unpack_output_for_artifacts(
     detected_formats: &[CliBundleFormat],
     safety: wakaru::OutputSafety,
@@ -1006,6 +1090,79 @@ fn json_unpack_output_for_artifacts(
         total: total_modules,
         failed,
         elapsed_ms: elapsed.as_millis() as u64,
+    }
+}
+
+fn json_chunk_enumeration(
+    enumeration: &wakaru_core::unpacker::chunk_enumeration::ChunkEnumeration,
+) -> JsonChunkEnumeration {
+    use wakaru_core::unpacker::chunk_enumeration::{
+        ChunkAssetKind, ChunkEnumerationStatus, ChunkIdSource, PublicPathFact, RelativeImportKind,
+    };
+
+    JsonChunkEnumeration {
+        public_path: match &enumeration.public_path {
+            PublicPathFact::Static(value) => JsonPublicPath {
+                status: "static".to_string(),
+                value: Some(value.clone()),
+            },
+            PublicPathFact::ScriptRelative(suffix) => JsonPublicPath {
+                status: "script_relative".to_string(),
+                value: Some(suffix.clone()),
+            },
+            PublicPathFact::RuntimeComputed => JsonPublicPath {
+                status: "runtime_computed".to_string(),
+                value: None,
+            },
+            PublicPathFact::NotFound => JsonPublicPath {
+                status: "not_found".to_string(),
+                value: None,
+            },
+        },
+        assets: enumeration
+            .assets
+            .iter()
+            .map(|asset| JsonChunkAsset {
+                kind: match asset.kind {
+                    ChunkAssetKind::Js => "js",
+                    ChunkAssetKind::Css => "css",
+                }
+                .to_string(),
+                status: match asset.status {
+                    ChunkEnumerationStatus::Enumerated => "enumerated",
+                    ChunkEnumerationStatus::NoStaticChunkIds => "no_static_chunk_ids",
+                    ChunkEnumerationStatus::DynamicTemplate => "dynamic_template",
+                }
+                .to_string(),
+                template: asset.template.clone(),
+                urls: asset
+                    .urls
+                    .iter()
+                    .map(|url| JsonChunkUrl {
+                        chunk_id: url.chunk_id.clone(),
+                        url: url.url.clone(),
+                        source: match url.source {
+                            ChunkIdSource::FilenameMap => "filename_map",
+                            ChunkIdSource::EnsureCall => "ensure_call",
+                        }
+                        .to_string(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        relative_imports: enumeration
+            .relative_imports
+            .iter()
+            .map(|import| JsonRelativeImport {
+                specifier: import.specifier.clone(),
+                kind: match import.kind {
+                    RelativeImportKind::Import => "import",
+                    RelativeImportKind::ExportFrom => "export_from",
+                    RelativeImportKind::DynamicImport => "dynamic_import",
+                }
+                .to_string(),
+            })
+            .collect(),
     }
 }
 
@@ -1428,6 +1585,87 @@ fn append_map_extension(path: &Path) -> PathBuf {
     let mut map_name = path.as_os_str().to_owned();
     map_name.push(".map");
     PathBuf::from(map_name)
+}
+
+/// Write an output source map next to its JavaScript file.
+///
+/// Source map consumers resolve `sources` against the map's own location,
+/// while the engine names inputs as the CLI received them (relative to the
+/// working directory). Rewrite each source that names a file on disk to a
+/// path relative to the map; others (stdin, executable members) stay as-is.
+fn write_output_source_map(map_path: &Path, map_json: &str) -> Result<()> {
+    write_file(map_path, &relativize_map_sources(map_path, map_json))
+}
+
+fn relativize_map_sources(map_path: &Path, map_json: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct MapSources {
+        sources: Vec<String>,
+    }
+
+    // Only `sources` changes; leave the rest (including the large
+    // `mappings` string) untouched instead of decoding and re-encoding it.
+    let Ok(MapSources { sources }) = serde_json::from_str::<MapSources>(map_json) else {
+        return map_json.to_string();
+    };
+    let map_dir = match map_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let Ok(map_dir) = fs::canonicalize(map_dir) else {
+        return map_json.to_string();
+    };
+    let relativized: Vec<String> = sources
+        .iter()
+        .map(|source| {
+            let source_path = Path::new(source);
+            source_path
+                .is_file()
+                .then(|| fs::canonicalize(source_path).ok())
+                .flatten()
+                .and_then(|source| relative_path(&map_dir, &source))
+                .unwrap_or_else(|| source.clone())
+        })
+        .collect();
+    if relativized == sources {
+        return map_json.to_string();
+    }
+    let (Ok(old), Ok(new)) = (
+        serde_json::to_string(&sources),
+        serde_json::to_string(&relativized),
+    ) else {
+        return map_json.to_string();
+    };
+    // The engine writes compact JSON, so the array appears exactly as serde
+    // serializes it.
+    map_json.replacen(
+        &format!("\"sources\":{old}"),
+        &format!("\"sources\":{new}"),
+        1,
+    )
+}
+
+/// Slash-separated path from `from_dir` to `to`, both absolute. `None` when
+/// they share no root (for example different Windows drives).
+fn relative_path(from_dir: &Path, to: &Path) -> Option<String> {
+    let from: Vec<_> = from_dir.components().collect();
+    let to: Vec<_> = to.components().collect();
+    let common = from
+        .iter()
+        .zip(&to)
+        .take_while(|(from, to)| from == to)
+        .count();
+    if common == 0 {
+        return None;
+    }
+    let parts: Vec<String> = std::iter::repeat_n("..".to_string(), from.len() - common)
+        .chain(
+            to[common..]
+                .iter()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned()),
+        )
+        .collect();
+    Some(parts.join("/"))
 }
 
 fn ensure_output_file(path: &Path, force: bool) -> Result<()> {

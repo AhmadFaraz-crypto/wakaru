@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use swc_core::atoms::Atom;
 use swc_core::ecma::ast::{Callee, Decl, Expr, Pat, Stmt};
@@ -76,12 +76,12 @@ impl VueSelectionPlan {
         Self {
             setup_scope_bindings: context.setup_scope_bindings,
             setup_wanted_refs: context.initial_setup_refs,
-            module_wanted_refs: HashSet::new(),
+            module_wanted_refs: HashSet::default(),
         }
     }
 
     pub(super) fn select(mut self, candidates: &[&VueSetupLocalBinding]) -> HashSet<usize> {
-        let mut selected = HashSet::new();
+        let mut selected = HashSet::default();
         loop {
             let mut changed = false;
             self.route_setup_refs_to_module_scope();
@@ -230,7 +230,7 @@ fn selects_safe_template_expr_local(
     match &declaration.stmt {
         Stmt::Decl(Decl::Fn(_)) | Stmt::Decl(Decl::Class(_)) => true,
         Stmt::Decl(Decl::Var(var)) => var.decls.iter().any(|decl| {
-            let mut decl_bindings = HashSet::new();
+            let mut decl_bindings = HashSet::default();
             collect_local_pat_bindings(&decl.name, &mut decl_bindings);
             if !decl_bindings
                 .iter()

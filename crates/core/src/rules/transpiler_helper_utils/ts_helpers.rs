@@ -5,13 +5,13 @@
 //! UnAsyncAwait matches detected `__awaiter` / `__generator` aliases rather than
 //! mapping them to a semantic kind).
 
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::common::Mark;
 use swc_core::ecma::ast::{
-    ArrowFunctionBody, AssignExpr, BinExpr, BinaryOp, CallExpr, Callee, Decl, Expr, Function,
-    Ident, ImportSpecifier, Lit, MemberExpr, MemberProp, Module, ModuleDecl, ModuleItem, Pat,
-    PropName, Stmt, VarDeclarator,
+    ArrowExpr, ArrowFunctionBody, AssignExpr, BinExpr, BinaryOp, CallExpr, Callee, Decl, Expr,
+    Function, Ident, ImportSpecifier, Lit, MemberExpr, MemberProp, Module, ModuleDecl, ModuleItem,
+    Pat, PropName, Stmt, VarDeclarator,
 };
 use swc_core::ecma::visit::{Visit, VisitWith};
 
@@ -25,7 +25,7 @@ pub(super) fn collect_ts_helpers(
     tslib_namespaces: &HashSet<BindingKey>,
     unresolved_mark: Option<Mark>,
 ) -> HashMap<BindingKey, TsHelperInfo> {
-    let mut helpers = HashMap::new();
+    let mut helpers = HashMap::default();
 
     for item in &module.body {
         match item {
@@ -49,6 +49,16 @@ pub(super) fn collect_ts_helpers(
                         collect_ts_helper_from_var_decl(decl, tslib_namespaces, unresolved_mark)
                     {
                         helpers.insert(key, helper);
+                    } else if let Some(key) =
+                        detect_ts_extends_sequence(module, decl, unresolved_mark)
+                    {
+                        helpers.insert(
+                            key,
+                            TsHelperInfo {
+                                kind: TsHelperKind::Extends,
+                                source: TsHelperSource::Inline,
+                            },
+                        );
                     }
                 }
             }
@@ -127,7 +137,7 @@ pub(crate) fn collect_inline_ts_helpers_deep(module: &Module) -> HashMap<Binding
 
         fn visit_var_declarator(&mut self, decl: &VarDeclarator) {
             if let Some((key, helper)) =
-                collect_ts_helper_from_var_decl(decl, &HashSet::new(), None)
+                collect_ts_helper_from_var_decl(decl, &HashSet::default(), None)
             {
                 if helper.source == TsHelperSource::Inline {
                     self.helpers.insert(key, helper.kind);
@@ -155,7 +165,7 @@ pub(crate) fn collect_inline_ts_helpers_deep(module: &Module) -> HashMap<Binding
     }
 
     let mut collector = Collector {
-        helpers: HashMap::new(),
+        helpers: HashMap::default(),
     };
     module.visit_with(&mut collector);
     collector.helpers
@@ -223,6 +233,7 @@ fn collect_ts_helper_from_var_decl(
 pub(crate) fn tslib_helper_name_kind(name: &str) -> Option<TranspilerHelperKind> {
     match name {
         "__assign" => Some(TranspilerHelperKind::Extends),
+        "__makeTemplateObject" => Some(TranspilerHelperKind::TaggedTemplateLiteral),
         "__rest" => Some(TranspilerHelperKind::ObjectWithoutProperties),
         "__read" => Some(TranspilerHelperKind::SlicedToArray),
         "__importDefault" => Some(TranspilerHelperKind::InteropRequireDefault),
@@ -235,6 +246,7 @@ fn ts_helper_name_kind(name: &str) -> Option<TsHelperKind> {
         "__awaiter" => Some(TsHelperKind::Awaiter),
         "__generator" => Some(TsHelperKind::Generator),
         "__values" | "_ts_values" => Some(TsHelperKind::Values),
+        "__asyncValues" => Some(TsHelperKind::AsyncValues),
         "__assign" => Some(TsHelperKind::Assign),
         "__rest" => Some(TsHelperKind::Rest),
         "__extends" => Some(TsHelperKind::Extends),
@@ -246,6 +258,8 @@ fn ts_helper_name_kind(name: &str) -> Option<TsHelperKind> {
         "__spread" => Some(TsHelperKind::Spread),
         "__spreadArrays" => Some(TsHelperKind::SpreadArrays),
         "__spreadArray" => Some(TsHelperKind::SpreadArray),
+        "__classPrivateFieldGet" => Some(TsHelperKind::ClassPrivateFieldGet),
+        "__classPrivateFieldSet" => Some(TsHelperKind::ClassPrivateFieldSet),
         _ => None,
     }
 }
@@ -256,7 +270,7 @@ pub(crate) fn collect_tslib_namespace_bindings(
     module: &Module,
     unresolved_mark: Option<Mark>,
 ) -> HashSet<BindingKey> {
-    let mut bindings = HashSet::new();
+    let mut bindings = HashSet::default();
 
     for item in &module.body {
         match item {
@@ -374,7 +388,7 @@ pub(super) fn collect_tslib_require_member_calls(
     }
 
     let mut finder = Finder {
-        kinds: HashSet::new(),
+        kinds: HashSet::default(),
         unresolved_mark,
     };
     module.visit_with(&mut finder);
@@ -389,6 +403,200 @@ pub(super) fn detect_helper_from_tslib_require_member(
     }
     tslib_helper_name_kind(static_member_prop_name(&member.prop)?)
 }
+// Terser lifts the ownKeys factory local and replaces the IIFE with a
+// sequence. Its initialization can be discarded only while the lifted var
+// remains private to this helper declaration.
+pub(super) fn detect_ts_import_star_sequence(
+    module: &Module,
+    decl: &VarDeclarator,
+    unresolved_mark: Option<Mark>,
+) -> Option<BindingKey> {
+    let key = var_declarator_binding_key(decl)?;
+    let ("__importStar", fallback) = ts_inline_helper_parts(decl.init.as_deref()?)? else {
+        return None;
+    };
+    let Expr::Seq(sequence) = strip_parens(fallback) else {
+        return None;
+    };
+    let [initialize, callable] = sequence.exprs.as_slice() else {
+        return None;
+    };
+    let Expr::Assign(assign) = strip_parens(initialize) else {
+        return None;
+    };
+    if assign.op != swc_core::ecma::ast::AssignOp::Assign {
+        return None;
+    }
+    let swc_core::ecma::ast::AssignTarget::Simple(swc_core::ecma::ast::SimpleAssignTarget::Ident(
+        binding,
+    )) = &assign.left
+    else {
+        return None;
+    };
+    let own_keys = binding_key(&binding.id);
+    let Expr::Fn(factory) = strip_parens(&assign.right) else {
+        return None;
+    };
+    let Expr::Fn(helper) = strip_parens(callable) else {
+        return None;
+    };
+    if factory.function.is_async
+        || factory.function.is_generator
+        || helper.function.is_async
+        || helper.function.is_generator
+        || factory.function.params.len() != 1
+        || helper.function.params.len() != 1
+    {
+        return None;
+    }
+    let factory_signals = collect_ts_helper_body_signals(&factory.function.body.as_ref()?.stmts);
+    let helper_signals = collect_ts_helper_body_signals(&helper.function.body.as_ref()?.stmts);
+    if !factory_signals.own_keys_loop
+        || !factory_signals.has_own_property
+        || !helper_signals.es_module_prop
+    {
+        return None;
+    }
+    ts_factory_local_is_private(module, &key, &own_keys, unresolved_mark).then_some(key)
+}
+
+// Like the import-star factory above, module-mode Terser can lift __extends'
+// extendStatics local. Both functions and the module-wide ownership proof are
+// required; the `this.__extends` marker alone does not identify a helper.
+fn detect_ts_extends_sequence(
+    module: &Module,
+    decl: &VarDeclarator,
+    unresolved_mark: Option<Mark>,
+) -> Option<BindingKey> {
+    let key = var_declarator_binding_key(decl)?;
+    let ("__extends", fallback) = ts_inline_helper_parts(decl.init.as_deref()?)? else {
+        return None;
+    };
+    let Expr::Seq(sequence) = strip_parens(fallback) else {
+        return None;
+    };
+    let [initialize, callable] = sequence.exprs.as_slice() else {
+        return None;
+    };
+    let Expr::Assign(assign) = strip_parens(initialize) else {
+        return None;
+    };
+    if assign.op != AssignOp::Assign {
+        return None;
+    }
+    let AssignTarget::Simple(SimpleAssignTarget::Ident(binding)) = &assign.left else {
+        return None;
+    };
+    let Expr::Fn(factory) = strip_parens(&assign.right) else {
+        return None;
+    };
+    let Expr::Fn(helper) = strip_parens(callable) else {
+        return None;
+    };
+    if factory.function.is_async
+        || factory.function.is_generator
+        || helper.function.is_async
+        || helper.function.is_generator
+        || factory.function.params.len() != 2
+        || helper.function.params.len() != 2
+    {
+        return None;
+    }
+    let factory_signals = collect_ts_helper_body_signals(&factory.function.body.as_ref()?.stmts);
+    let helper_signals = collect_ts_helper_body_signals(&helper.function.body.as_ref()?.stmts);
+    if !factory_signals.object_set_prototype_of
+        || !factory_signals.proto_prop
+        || !factory_signals.has_own_property
+        || !helper_signals.prototype_prop
+        || !helper_signals.type_error
+    {
+        return None;
+    }
+    let local = binding_key(&binding.id);
+    // The returned helper must actually call the lifted factory with its two
+    // parameters; a marker plus unrelated prototype code is not sufficient.
+    let [first, second] = helper.function.params.as_slice() else {
+        return None;
+    };
+    let (Pat::Ident(first), Pat::Ident(second)) = (&first.pat, &second.pat) else {
+        return None;
+    };
+    let calls_local = helper.function.body.as_ref()?.stmts.iter().any(|stmt| {
+        let Stmt::Expr(statement) = stmt else { return false; };
+        let Expr::Call(call) = strip_parens(&statement.expr) else { return false; };
+        call.args.len() == 2 && call.args.iter().all(|arg| arg.spread.is_none())
+            && matches!(&call.callee, Callee::Expr(callee) if matches!(strip_parens(callee), Expr::Ident(id) if binding_key(id) == local))
+            && matches!(strip_parens(&call.args[0].expr), Expr::Ident(id) if id.to_id() == first.id.to_id())
+            && matches!(strip_parens(&call.args[1].expr), Expr::Ident(id) if id.to_id() == second.id.to_id())
+    });
+    if !calls_local {
+        return None;
+    }
+    ts_factory_local_is_private(module, &key, &local, unresolved_mark).then_some(key)
+}
+
+fn ts_factory_local_is_private(
+    module: &Module,
+    key: &BindingKey,
+    local: &BindingKey,
+    unresolved_mark: Option<Mark>,
+) -> bool {
+    // The reference scan below skips declarators by binding identity. Count
+    // declarations throughout the module first, including hoisted `var` inside
+    // blocks, so a second initializer cannot hide in that skipped set.
+    let uses = crate::analysis::binding_uses::BindingUseIndex::collect_module_items(&module.body);
+    if !uses.has_single_declaration(key) || !uses.has_single_declaration(local) {
+        return false;
+    }
+    let mut declarations = 0;
+    for item in &module.body {
+        if let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item {
+            for candidate in &var.decls {
+                if var_declarator_binding_key(candidate).as_ref() == Some(local) {
+                    if var.kind != swc_core::ecma::ast::VarDeclKind::Var || candidate.init.is_some()
+                    {
+                        return false;
+                    }
+                    declarations += 1;
+                }
+            }
+        }
+    }
+    if declarations != 1 {
+        return false;
+    }
+    struct DynamicLookup {
+        unresolved_mark: Option<Mark>,
+        found: bool,
+    }
+    impl Visit for DynamicLookup {
+        fn visit_call_expr(&mut self, call: &CallExpr) {
+            if matches!(&call.callee, Callee::Expr(callee) if matches!(strip_parens(callee), Expr::Ident(id) if is_unresolved_or_unguarded_ident(id, "eval", self.unresolved_mark)))
+            {
+                self.found = true;
+            }
+            call.visit_children_with(self);
+        }
+        fn visit_with_stmt(&mut self, _: &swc_core::ecma::ast::WithStmt) {
+            self.found = true;
+        }
+    }
+    let mut dynamic = DynamicLookup {
+        unresolved_mark,
+        found: false,
+    };
+    module.visit_with(&mut dynamic);
+    if dynamic.found {
+        return false;
+    }
+    let remaining = super::remaining_refs_outside_var_declarators(
+        module,
+        &HashSet::from_iter([local.clone()]),
+        &HashSet::from_iter([key.clone(), local.clone()]),
+    );
+    remaining.is_empty()
+}
+
 fn ts_inline_helper_kind(expr: &Expr) -> Option<TsHelperKind> {
     let (name, fallback) = ts_inline_helper_parts(expr)?;
     let kind = ts_helper_name_kind(name)?;
@@ -451,9 +659,8 @@ fn ts_inline_helper_fallback_matches(expr: &Expr, kind: TsHelperKind) -> bool {
         TsHelperKind::Generator => {
             param_len >= 2 && (signals.label_prop || signals.trys_prop || signals.ops_prop)
         }
-        // `__values` / `_ts_values`: single iterable param, grabs `Symbol.iterator`,
-        // throws `TypeError` when the value is not iterable.
-        TsHelperKind::Values => param_len == 1 && signals.symbol_iterator && signals.type_error,
+        TsHelperKind::Values => ts_values_body_matches(param_len, body),
+        TsHelperKind::AsyncValues => ts_async_values_body_matches(param_len, body),
         TsHelperKind::Assign => {
             signals.object_assign || (signals.arguments_ref && signals.has_own_property)
         }
@@ -476,11 +683,13 @@ fn ts_inline_helper_fallback_matches(expr: &Expr, kind: TsHelperKind) -> bool {
         TsHelperKind::Spread => signals.arguments_ref && signals.concat_call,
         TsHelperKind::SpreadArrays => signals.arguments_ref && signals.array_constructor,
         TsHelperKind::SpreadArray => signals.concat_call,
-        TsHelperKind::ClassPrivateFieldGet | TsHelperKind::ClassPrivateFieldSet => false,
+        TsHelperKind::ClassPrivateFieldGet | TsHelperKind::ClassPrivateFieldSet => {
+            expr_contains_tsc_private_helper_fn(expr, kind)
+        }
     }
 }
 fn ts_helper_callable_body(expr: &Expr) -> Option<(usize, &[Stmt])> {
-    match expr {
+    match strip_parens(expr) {
         Expr::Fn(fn_expr) => {
             let body = fn_expr.function.body.as_ref()?;
             Some((fn_expr.function.params.len(), body.stmts.as_slice()))
@@ -526,15 +735,37 @@ struct TsHelperBodySignals {
     prototype_prop: bool,
     set_module_default_call: bool,
     symbol_iterator: bool,
+    symbol_async_iterator: bool,
     trys_prop: bool,
     type_error: bool,
 }
 fn collect_ts_helper_body_signals(stmts: &[Stmt]) -> TsHelperBodySignals {
+    collect_ts_helper_signals(stmts, true)
+}
+/// Signals from the helper's own statements only; nested functions and arrows
+/// are not entered.
+fn collect_ts_helper_own_body_signals(stmts: &[Stmt]) -> TsHelperBodySignals {
+    collect_ts_helper_signals(stmts, false)
+}
+fn collect_ts_helper_signals(stmts: &[Stmt], descend_into_functions: bool) -> TsHelperBodySignals {
     struct SignalVisitor {
         signals: TsHelperBodySignals,
+        descend_into_functions: bool,
     }
 
     impl Visit for SignalVisitor {
+        fn visit_function(&mut self, function: &Function) {
+            if self.descend_into_functions {
+                function.visit_children_with(self);
+            }
+        }
+
+        fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+            if self.descend_into_functions {
+                arrow.visit_children_with(self);
+            }
+        }
+
         fn visit_ident(&mut self, ident: &Ident) {
             match ident.sym.as_ref() {
                 "arguments" => self.signals.arguments_ref = true,
@@ -548,6 +779,9 @@ fn collect_ts_helper_body_signals(stmts: &[Stmt]) -> TsHelperBodySignals {
         fn visit_member_expr(&mut self, member: &MemberExpr) {
             if is_symbol_member(member, "iterator") {
                 self.signals.symbol_iterator = true;
+            }
+            if is_symbol_member(member, "asyncIterator") {
+                self.signals.symbol_async_iterator = true;
             }
             if is_object_member(member, "assign") {
                 self.signals.object_assign = true;
@@ -639,6 +873,7 @@ fn collect_ts_helper_body_signals(stmts: &[Stmt]) -> TsHelperBodySignals {
 
     let mut visitor = SignalVisitor {
         signals: TsHelperBodySignals::default(),
+        descend_into_functions,
     };
     stmts.visit_with(&mut visitor);
     visitor.signals
@@ -680,12 +915,13 @@ fn ts_private_helper_name_kind(name: &str, function: &Function) -> Option<TsHelp
     let kind = match name {
         "_ts_generator" => TsHelperKind::Generator,
         "_ts_values" | "__values" => TsHelperKind::Values,
+        "__asyncValues" => TsHelperKind::AsyncValues,
         "__classPrivateFieldGet" => TsHelperKind::ClassPrivateFieldGet,
         "__classPrivateFieldSet" => TsHelperKind::ClassPrivateFieldSet,
         _ => return None,
     };
     match kind {
-        TsHelperKind::Generator | TsHelperKind::Values => {
+        TsHelperKind::Generator | TsHelperKind::Values | TsHelperKind::AsyncValues => {
             ts_function_matches_kind(function, kind).then_some(kind)
         }
         _ => is_tsc_private_helper_fn(function, kind).then_some(kind),
@@ -701,6 +937,8 @@ fn ts_generated_fn_helper_kind(ident: &Ident, function: &Function) -> Option<TsH
         // Minifiers strip the `_ts_values` / `__values` name, but the body shape
         // (single iterable param, `Symbol.iterator`, `TypeError`) is preserved.
         Some(TsHelperKind::Values)
+    } else if ts_async_values_function_matches(function) {
+        Some(TsHelperKind::AsyncValues)
     } else {
         None
     }
@@ -710,9 +948,13 @@ fn ts_generated_values_callable_kind(ident: &Ident, expr: &Expr) -> Option<TsHel
         return None;
     }
     let (param_len, body) = ts_helper_callable_body(expr)?;
-    let signals = collect_ts_helper_body_signals(body);
-    (param_len == 1 && signals.symbol_iterator && signals.type_error)
-        .then_some(TsHelperKind::Values)
+    if ts_values_body_matches(param_len, body) {
+        Some(TsHelperKind::Values)
+    } else if ts_async_values_body_matches(param_len, body) {
+        Some(TsHelperKind::AsyncValues)
+    } else {
+        None
+    }
 }
 
 /// Fact extraction may see minified tslib helpers as direct arrow/function
@@ -731,8 +973,10 @@ fn ts_generated_fact_callable_kind(ident: &Ident, expr: &Expr) -> Option<TsHelpe
         Some(TsHelperKind::Awaiter)
     } else if param_len >= 2 && signals.label_prop && signals.trys_prop && signals.ops_prop {
         Some(TsHelperKind::Generator)
-    } else if param_len == 1 && signals.symbol_iterator && signals.type_error {
+    } else if ts_values_body_matches(param_len, body) {
         Some(TsHelperKind::Values)
+    } else if ts_async_values_body_matches(param_len, body) {
+        Some(TsHelperKind::AsyncValues)
     } else {
         None
     }
@@ -747,6 +991,7 @@ fn ts_function_matches_kind(function: &Function, kind: TsHelperKind) -> bool {
     match kind {
         TsHelperKind::Generator => ts_generator_state_function_matches(function),
         TsHelperKind::Values => ts_values_function_matches(function),
+        TsHelperKind::AsyncValues => ts_async_values_function_matches(function),
         _ => false,
     }
 }
@@ -754,8 +999,39 @@ fn ts_values_function_matches(function: &Function) -> bool {
     let Some(body) = &function.body else {
         return false;
     };
-    let signals = collect_ts_helper_body_signals(&body.stmts);
-    function.params.len() == 1 && signals.symbol_iterator && signals.type_error
+    ts_values_body_matches(function.params.len(), &body.stmts)
+}
+fn ts_async_values_function_matches(function: &Function) -> bool {
+    let Some(body) = &function.body else {
+        return false;
+    };
+    ts_async_values_body_matches(function.params.len(), &body.stmts)
+}
+/// `__asyncValues`: a single iterable param that reads `Symbol.asyncIterator`,
+/// throws `TypeError` when the symbol is missing, and wraps a sync iterator in
+/// a `Promise`-settling adapter (the nested `verb`/`settle` functions). The
+/// `Promise` signal separates it from Babel's `_asyncIterator`, whose body
+/// shares the first two signals and delegates wrapping to a separate helper.
+/// Its sync fallback also reads `Symbol.iterator`, so `ts_values_body_matches`
+/// excludes this shape.
+fn ts_async_values_body_matches(param_len: usize, body: &[Stmt]) -> bool {
+    if param_len != 1 {
+        return false;
+    }
+    let own = collect_ts_helper_own_body_signals(body);
+    own.symbol_async_iterator && own.type_error && collect_ts_helper_body_signals(body).promise
+}
+/// `__values` / `_ts_values`: a single iterable param, grabs `Symbol.iterator`,
+/// and throws `TypeError` when the value is not iterable. Both signals sit in
+/// the helper's own statements; a user function that merely contains an inlined
+/// Babel iterable helper carries them only inside nested functions and is not
+/// a helper (removing it would delete a live function).
+fn ts_values_body_matches(param_len: usize, body: &[Stmt]) -> bool {
+    if param_len != 1 {
+        return false;
+    }
+    let signals = collect_ts_helper_own_body_signals(body);
+    signals.symbol_iterator && signals.type_error && !signals.symbol_async_iterator
 }
 fn ts_generator_state_function_matches(function: &Function) -> bool {
     let Some(body) = &function.body else {

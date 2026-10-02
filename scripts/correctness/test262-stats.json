@@ -1,11 +1,11 @@
 {
-  "commit": "f7a95a95",
-  "date": "2026-07-14",
+  "commit": "281fb103e",
+  "date": "2026-09-13",
   "aggregate": {
     "producers": 3,
     "entries": 60,
     "runnable": 66729,
-    "passed": 62061,
+    "passed": 62155,
     "failed": 0,
     "pct": 100
   },
@@ -54,8 +54,8 @@
       "runnable": 2963,
       "skipped": 0,
       "unsupported": 13,
-      "rejected": 236,
-      "passed": 2714,
+      "rejected": 229,
+      "passed": 2721,
       "failed": 0
     },
     {
@@ -114,8 +114,8 @@
       "runnable": 2180,
       "skipped": 0,
       "unsupported": 5,
-      "rejected": 129,
-      "passed": 2046,
+      "rejected": 120,
+      "passed": 2055,
       "failed": 0
     },
     {
@@ -126,8 +126,8 @@
       "runnable": 1034,
       "skipped": 0,
       "unsupported": 0,
-      "rejected": 84,
-      "passed": 950,
+      "rejected": 66,
+      "passed": 968,
       "failed": 0
     },
     {
@@ -198,8 +198,8 @@
       "runnable": 2200,
       "skipped": 0,
       "unsupported": 93,
-      "rejected": 38,
-      "passed": 2069,
+      "rejected": 29,
+      "passed": 2078,
       "failed": 0
     },
     {
@@ -222,8 +222,8 @@
       "runnable": 1396,
       "skipped": 0,
       "unsupported": 10,
-      "rejected": 191,
-      "passed": 1195,
+      "rejected": 187,
+      "passed": 1199,
       "failed": 0
     },
     {
@@ -534,8 +534,8 @@
       "runnable": 2963,
       "skipped": 0,
       "unsupported": 44,
-      "rejected": 14,
-      "passed": 2905,
+      "rejected": 7,
+      "passed": 2912,
       "failed": 0
     },
     {
@@ -594,8 +594,8 @@
       "runnable": 2180,
       "skipped": 0,
       "unsupported": 37,
-      "rejected": 129,
-      "passed": 2014,
+      "rejected": 120,
+      "passed": 2023,
       "failed": 0
     },
     {
@@ -606,8 +606,8 @@
       "runnable": 1034,
       "skipped": 0,
       "unsupported": 28,
-      "rejected": 54,
-      "passed": 952,
+      "rejected": 36,
+      "passed": 970,
       "failed": 0
     },
     {
@@ -678,8 +678,8 @@
       "runnable": 2200,
       "skipped": 0,
       "unsupported": 108,
-      "rejected": 83,
-      "passed": 2009,
+      "rejected": 74,
+      "passed": 2018,
       "failed": 0
     },
     {
@@ -702,8 +702,8 @@
       "runnable": 1396,
       "skipped": 0,
       "unsupported": 19,
-      "rejected": 8,
-      "passed": 1369,
+      "rejected": 4,
+      "passed": 1373,
       "failed": 0
     },
     {

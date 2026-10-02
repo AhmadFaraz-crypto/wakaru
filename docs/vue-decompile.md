@@ -10,13 +10,12 @@ current status, known gaps, and follow-up targets.
 Run:
 
 ```bash
-cargo run -p wakaru-cli -- input.js --vue-sfc
+cargo run -p wakaru-cli -- input.js --vue-sfc -o output.js
 cargo run -p wakaru-cli -- --unpack bundle.js --vue-sfc -o unpacked/
 ```
 
-In single-file mode without `-o`, `--vue-sfc` prints a `.vue`-like artifact
-when the render module matches supported Vue helper shapes, and falls back to
-normal JavaScript otherwise.
+In single-file mode without `-o`, stdout remains decompiled JavaScript.
+Use an output path to write recovered Vue files.
 
 With `-o`, only `.vue` output paths are Vue-only. `-o App.vue` writes the
 recovered SFC and returns an error if the input cannot be recovered as Vue.

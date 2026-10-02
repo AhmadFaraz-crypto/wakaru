@@ -36,16 +36,16 @@
 //!
 //! Safety conditions, all required:
 //!
-//! * The temporary has a real, never-initialized `var` declaration (`var _n;`).
-//!   Lexical declarations are excluded because a later `let _n;` is still in
-//!   its temporal dead zone at the pattern, and TypeScript ambient declarations
-//!   do not create runtime bindings. An undeclared global would make erasing
-//!   `_n = {}` drop a global write, and an unresolved binding would drop a
-//!   `ReferenceError`.
-//! * Every occurrence of the temporary in the module is accounted for by the
-//!   matched pattern and the binding is not exported, so folding it away cannot
-//!   be observed. Keys and values that mention the temporary are rejected by
-//!   the same count.
+//! * The temporary is isolated to the pattern (`TempIsolation`): its only
+//!   declaration is a never-initialized `var _n;`, or a `let _n;` declared
+//!   before every use, and it is neither exported nor ambient. A `let` still
+//!   in its temporal dead zone at the pattern would throw, and a TypeScript
+//!   ambient declaration creates no runtime binding. An undeclared global
+//!   would make erasing `_n = {}` drop a global write, and an unresolved
+//!   binding would drop a `ReferenceError`.
+//! * Every use of the temporary in the module is accounted for by the
+//!   matched pattern, so folding it away cannot be observed. Keys and values
+//!   that mention the temporary are rejected by the same count.
 //! * The seed object literal has no accessor property and no `__proto__` key:
 //!   assigning to a key that an accessor covers calls that accessor, and a
 //!   `__proto__` key installs a prototype whose setters later assignments would
@@ -61,19 +61,18 @@
 //! this transform as a loose assumption for exactly that reason, so the rule is
 //! gated to `standard` and above.
 
-use std::collections::{HashMap, HashSet};
+use crate::collections::HashSet;
 
 use swc_core::common::Spanned;
 use swc_core::ecma::ast::{
-    AssignOp, AssignTarget, ComputedPropName, ExportSpecifier, Expr, KeyValueProp, Lit, MemberProp,
-    Module, ModuleDecl, ModuleExportName, ModuleItem, ObjectLit, Pat, Prop, PropName, PropOrSpread,
-    SeqExpr, SimpleAssignTarget, VarDecl, VarDeclKind,
+    AssignOp, AssignTarget, ComputedPropName, Expr, KeyValueProp, Lit, MemberProp, Module,
+    ObjectLit, Prop, PropName, PropOrSpread, SeqExpr, SimpleAssignTarget,
 };
-use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
+use swc_core::ecma::visit::{VisitMut, VisitMutWith};
 
-use super::binding_facts::collect_binding_facts;
-use super::dead_decls::{extend_consumed_uninitialized_expr, remove_consumed_uninitialized_decls};
-use super::decl_utils::{binding_id, collect_decl_binding_ids, ident_matches_binding, BindingId};
+use super::binding_facts::TempIsolation;
+use super::dead_decls::remove_consumed_uninitialized_decls;
+use super::decl_utils::{binding_id, ident_matches_binding, BindingId};
 use super::helper_matcher::count_binding_refs;
 use super::RewriteLevel;
 
@@ -83,8 +82,7 @@ const PROTO: &str = "__proto__";
 
 pub struct UnComputedProperties {
     rewrite_level: RewriteLevel,
-    foldable_temp_bindings: HashSet<BindingId>,
-    binding_references: HashMap<BindingId, usize>,
+    isolation: TempIsolation,
     consumed_uninitialized_bindings: HashSet<BindingId>,
 }
 
@@ -92,9 +90,8 @@ impl UnComputedProperties {
     pub fn new(rewrite_level: RewriteLevel) -> Self {
         Self {
             rewrite_level,
-            foldable_temp_bindings: HashSet::new(),
-            binding_references: HashMap::new(),
-            consumed_uninitialized_bindings: HashSet::new(),
+            isolation: TempIsolation::default(),
+            consumed_uninitialized_bindings: HashSet::default(),
         }
     }
 }
@@ -105,9 +102,7 @@ impl VisitMut for UnComputedProperties {
             return;
         }
 
-        let facts = collect_binding_facts(module);
-        self.foldable_temp_bindings = collect_foldable_temp_bindings(module);
-        self.binding_references = facts.references;
+        self.isolation = TempIsolation::collect(module);
         self.consumed_uninitialized_bindings.clear();
 
         module.visit_mut_children_with(self);
@@ -125,14 +120,13 @@ impl VisitMut for UnComputedProperties {
         let Some(folded) = self.try_fold_sequence(expr) else {
             return;
         };
-
-        extend_consumed_uninitialized_expr(
-            &mut self.consumed_uninitialized_bindings,
+        if !self.isolation.accept_expr_rewrite(
             expr,
             &folded,
-            &self.foldable_temp_bindings,
-            &self.binding_references,
-        );
+            &mut self.consumed_uninitialized_bindings,
+        ) {
+            return;
+        }
         *expr = folded;
     }
 }
@@ -152,12 +146,6 @@ impl UnComputedProperties {
         };
         let temp_binding = binding_id(temp);
 
-        // Only a declared-but-uninitialized binding can be folded away; see the
-        // module docs for why globals and unresolved names are excluded.
-        if !self.foldable_temp_bindings.contains(&temp_binding) {
-            return None;
-        }
-
         let seed_index = find_seed_index(seq, &temp_binding)?;
         let assignments = &seq.exprs[seed_index + 1..seq.exprs.len() - 1];
 
@@ -174,10 +162,9 @@ impl UnComputedProperties {
         if count_expr_binding_refs(&seq.exprs[seed_index..], &temp_binding) != structural_refs {
             return None;
         }
-        // `binding_references` counts the declarator identifier too, so a
-        // module-wide total of exactly one more than the pattern proves the temp
-        // is not observed anywhere else.
-        if self.binding_references.get(&temp_binding).copied() != Some(structural_refs + 1) {
+        // No use outside the pattern, and a declaration the fold may erase;
+        // see the module docs for why globals and unresolved names are excluded.
+        if !self.isolation.is_isolated(&temp_binding, structural_refs) {
             return None;
         }
 
@@ -217,72 +204,6 @@ impl UnComputedProperties {
             exprs,
         }))
     }
-}
-
-fn collect_foldable_temp_bindings(module: &Module) -> HashSet<BindingId> {
-    let mut collector = UninitializedVarCollector::default();
-    module.visit_with(&mut collector);
-
-    let exported = collect_exported_binding_ids(module);
-    collector
-        .bindings
-        .retain(|binding| !exported.contains(binding));
-    collector.bindings
-}
-
-#[derive(Default)]
-struct UninitializedVarCollector {
-    bindings: HashSet<BindingId>,
-}
-
-impl Visit for UninitializedVarCollector {
-    fn visit_var_decl(&mut self, var: &VarDecl) {
-        if var.kind == VarDeclKind::Var && !var.declare {
-            for declarator in &var.decls {
-                if declarator.init.is_none() {
-                    let Pat::Ident(binding) = &declarator.name else {
-                        continue;
-                    };
-                    self.bindings.insert(binding_id(&binding.id));
-                }
-            }
-        }
-
-        var.visit_children_with(self);
-    }
-}
-
-fn collect_exported_binding_ids(module: &Module) -> HashSet<BindingId> {
-    let mut bindings = HashSet::new();
-
-    for item in &module.body {
-        let ModuleItem::ModuleDecl(module_decl) = item else {
-            continue;
-        };
-
-        match module_decl {
-            ModuleDecl::ExportDecl(export) => {
-                collect_decl_binding_ids(&export.decl, &mut bindings);
-            }
-            ModuleDecl::ExportNamed(export) if export.src.is_none() && !export.type_only => {
-                for specifier in &export.specifiers {
-                    let ExportSpecifier::Named(named) = specifier else {
-                        continue;
-                    };
-                    if named.is_type_only {
-                        continue;
-                    }
-                    let ModuleExportName::Ident(local) = &named.orig else {
-                        continue;
-                    };
-                    bindings.insert(binding_id(local));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    bindings
 }
 
 /// The element that seeds the object, in one of the two producible forms.

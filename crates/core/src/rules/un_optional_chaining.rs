@@ -1,30 +1,27 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::common::{Mark, Span, Spanned, DUMMY_SP};
 use swc_core::ecma::ast::{
     AssignOp, AssignTarget, BinExpr, BinaryOp, CallExpr, Callee, CondExpr, Expr, Ident, IfStmt,
-    Lit, MemberExpr, MemberProp, Module, OptCall, OptChainBase, OptChainExpr, SimpleAssignTarget,
-    Stmt, UnaryExpr, UnaryOp,
+    Lit, MemberExpr, MemberProp, Module, OptCall, OptChainBase, OptChainExpr, ParenExpr,
+    SimpleAssignTarget, Stmt, UnaryExpr, UnaryOp,
 };
-use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
+use swc_core::ecma::visit::{VisitMut, VisitMutWith};
 
-use super::binding_facts::collect_binding_facts;
-use super::dead_decls::{
-    extend_consumed_uninitialized_expr, extend_consumed_uninitialized_stmt,
-    remove_consumed_uninitialized_decls,
-};
+use super::binding_facts::TempIsolation;
+use super::dead_decls::remove_consumed_uninitialized_decls;
 use super::decl_utils::{binding_id, BindingId};
 use super::expr_utils::{exprs_structurally_equal, is_unresolved_undefined};
 use super::{RewriteLevel, RewritePolicy};
+use crate::analysis::binding_uses::BindingUseIndex;
 
 use crate::utils::paren::strip_parens;
 
 pub struct UnOptionalChaining {
     unresolved_mark: Mark,
     policy: RewritePolicy,
-    uninitialized_bindings: HashSet<BindingId>,
-    binding_references: HashMap<BindingId, usize>,
     consumed_uninitialized_bindings: HashSet<BindingId>,
+    isolation: TempIsolation,
 }
 
 impl UnOptionalChaining {
@@ -32,18 +29,19 @@ impl UnOptionalChaining {
         Self {
             unresolved_mark,
             policy: RewritePolicy::from_level(level),
-            uninitialized_bindings: HashSet::new(),
-            binding_references: HashMap::new(),
-            consumed_uninitialized_bindings: HashSet::new(),
+            consumed_uninitialized_bindings: HashSet::default(),
+            isolation: TempIsolation::default(),
         }
     }
 }
 
 impl VisitMut for UnOptionalChaining {
     fn visit_mut_module(&mut self, module: &mut Module) {
-        let facts = collect_binding_facts(module);
-        self.uninitialized_bindings = facts.uninitialized;
-        self.binding_references = facts.references;
+        // Temps are hoisted `var _a;`, or `let _a;` declared before every use
+        // in the same function (VarDeclToLetConst's rewrite of the former); an
+        // uninitialized `let` elsewhere may be in its TDZ where the pattern
+        // assigns it, and `TempIsolation` rejects it.
+        self.isolation = TempIsolation::collect(module);
         self.consumed_uninitialized_bindings.clear();
         module.visit_mut_children_with(self);
         remove_consumed_uninitialized_decls(module, &self.consumed_uninitialized_bindings);
@@ -54,27 +52,24 @@ impl VisitMut for UnOptionalChaining {
             expr,
             self.unresolved_mark,
             self.policy,
-            &self.uninitialized_bindings,
-            &self.binding_references,
-        ) {
-            self.record_consumed_expr_bindings(expr, &result);
+            &self.isolation,
+        )
+        .filter(|result| self.accept_expr_rewrite(expr, result))
+        {
             replace_expr_preserving_span(expr, result);
             expr.visit_mut_children_with(self);
             return;
         }
 
-        if let Some(result) = try_optional_chaining(
-            expr,
-            self.unresolved_mark,
-            self.policy,
-            &self.uninitialized_bindings,
-            &self.binding_references,
-        ) {
-            self.record_consumed_expr_bindings(expr, &result);
+        if let Some(result) =
+            try_optional_chaining(expr, self.unresolved_mark, self.policy, &self.isolation)
+                .filter(|result| self.accept_expr_rewrite(expr, result))
+        {
             replace_expr_preserving_span(expr, result);
             expr.visit_mut_children_with(self);
-            if let Some(result) = try_optional_call_cleanup(expr) {
-                self.record_consumed_expr_bindings(expr, &result);
+            if let Some(result) = try_optional_call_cleanup(expr)
+                .filter(|result| self.accept_expr_rewrite(expr, result))
+            {
                 replace_expr_preserving_span(expr, result);
             }
             return;
@@ -82,20 +77,17 @@ impl VisitMut for UnOptionalChaining {
 
         expr.visit_mut_children_with(self);
 
-        if let Some(result) = try_optional_call_cleanup(expr) {
-            self.record_consumed_expr_bindings(expr, &result);
+        if let Some(result) =
+            try_optional_call_cleanup(expr).filter(|result| self.accept_expr_rewrite(expr, result))
+        {
             replace_expr_preserving_span(expr, result);
             return;
         }
 
-        if let Some(result) = try_optional_chaining(
-            expr,
-            self.unresolved_mark,
-            self.policy,
-            &self.uninitialized_bindings,
-            &self.binding_references,
-        ) {
-            self.record_consumed_expr_bindings(expr, &result);
+        if let Some(result) =
+            try_optional_chaining(expr, self.unresolved_mark, self.policy, &self.isolation)
+                .filter(|result| self.accept_expr_rewrite(expr, result))
+        {
             replace_expr_preserving_span(expr, result);
         }
     }
@@ -108,27 +100,71 @@ impl VisitMut for UnOptionalChaining {
                 if_stmt.test.as_ref(),
                 self.unresolved_mark,
                 self.policy,
-                &self.uninitialized_bindings,
-                &self.binding_references,
-            ) {
-                self.record_consumed_expr_bindings(if_stmt.test.as_ref(), &result);
+                &self.isolation,
+            )
+            .filter(|result| self.accept_expr_rewrite(&if_stmt.test, result))
+            {
                 *if_stmt.test = result;
             }
         }
 
         if let Some(result) =
             try_optional_call_short_circuit_stmt(stmt, self.unresolved_mark, self.policy)
+                .filter(|result| self.accept_stmt_rewrite(stmt, result))
         {
-            self.record_consumed_stmt_bindings(stmt, &result);
             *stmt = result;
             return;
         }
 
-        if let Some(result) = try_optional_call_if_stmt(stmt, self.unresolved_mark) {
-            self.record_consumed_stmt_bindings(stmt, &result);
+        if let Some(result) = try_optional_call_if_stmt(stmt, self.unresolved_mark)
+            .filter(|result| self.accept_stmt_rewrite(stmt, result))
+        {
             *stmt = result;
+            return;
+        }
+
+        if let Stmt::Expr(expr_stmt) = stmt {
+            if let Some(result) = try_short_circuit_stmt_optional_chain(
+                &expr_stmt.expr,
+                self.unresolved_mark,
+                self.policy,
+                &self.isolation,
+            )
+            .filter(|result| self.accept_expr_rewrite(&expr_stmt.expr, result))
+            {
+                replace_expr_preserving_span(&mut expr_stmt.expr, result);
+            }
         }
     }
+}
+
+/// Statement-position `x == null || x.m()` and its lowered forms
+/// (`null == (t = a) || t.m()`, `(t = a) === null || t === void 0 || t.m()`).
+/// Minifiers drop the `? void 0 :` ternary when the value is unused. With the
+/// value discarded, `check || access` equals `check ? void 0 : access`, so the
+/// ternary matchers and their temp and level gates decide the rewrite.
+fn try_short_circuit_stmt_optional_chain(
+    expr: &Expr,
+    unresolved_mark: Mark,
+    policy: RewritePolicy,
+    isolation: &TempIsolation,
+) -> Option<Expr> {
+    let Expr::Bin(BinExpr {
+        op: BinaryOp::LogicalOr,
+        left,
+        right,
+        span,
+    }) = expr
+    else {
+        return None;
+    };
+    let as_ternary = Expr::Cond(CondExpr {
+        span: *span,
+        test: left.clone(),
+        cons: Expr::undefined(DUMMY_SP),
+        alt: right.clone(),
+    });
+    try_optional_chaining(&as_ternary, unresolved_mark, policy, isolation)
 }
 
 /// Replace `*expr` with `result`, copying the original expression's span onto
@@ -152,24 +188,22 @@ fn propagate_span(expr: &mut Expr, span: Span) {
 }
 
 impl UnOptionalChaining {
-    fn record_consumed_expr_bindings(&mut self, before: &Expr, after: &Expr) {
-        extend_consumed_uninitialized_expr(
-            &mut self.consumed_uninitialized_bindings,
-            before,
-            after,
-            &self.uninitialized_bindings,
-            &self.binding_references,
-        );
+    /// Every rewrite goes through `TempIsolation` so that no path drops a
+    /// write it has not proven: recovering a lowered inner chain turns
+    /// `null == (t = a()) ? void 0 : t.b` into `a()?.b` without proving `t`,
+    /// and the builders replace only a temp's object slots, copying keys and
+    /// arguments that may still read it (`a()?.b?.[t.length]`).
+    fn accept_expr_rewrite(&mut self, before: &Expr, after: &Expr) -> bool {
+        self.isolation
+            .accept_expr_rewrite(before, after, &mut self.consumed_uninitialized_bindings)
     }
 
-    fn record_consumed_stmt_bindings(&mut self, before: &Stmt, after: &Stmt) {
-        extend_consumed_uninitialized_stmt(
+    fn accept_stmt_rewrite(&mut self, before: &Stmt, after: &Stmt) -> bool {
+        self.isolation.accept_stmts_rewrite(
+            std::slice::from_ref(before),
+            std::slice::from_ref(after),
             &mut self.consumed_uninitialized_bindings,
-            before,
-            after,
-            &self.uninitialized_bindings,
-            &self.binding_references,
-        );
+        )
     }
 }
 
@@ -396,40 +430,21 @@ fn try_optional_chaining(
     expr: &Expr,
     unresolved_mark: Mark,
     policy: RewritePolicy,
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
+    isolation: &TempIsolation,
 ) -> Option<Expr> {
     // Pattern: `(obj === null || obj === void 0) ? void 0 : obj.access`
-    if let Some(result) = try_ternary_optional_chain(
-        expr,
-        unresolved_mark,
-        policy,
-        uninitialized_bindings,
-        binding_references,
-    ) {
+    if let Some(result) = try_ternary_optional_chain(expr, unresolved_mark, policy, isolation) {
         return Some(result);
     }
 
     // Pattern: Babel-style flattened chains:
     // `(_a = obj) === null || _a === void 0 || (_a = _a.prop) === null || ... ? void 0 : _a.leaf`
-    if let Some(result) = try_flattened_optional_chain(
-        expr,
-        unresolved_mark,
-        policy,
-        uninitialized_bindings,
-        binding_references,
-    ) {
+    if let Some(result) = try_flattened_optional_chain(expr, unresolved_mark, policy, isolation) {
         return Some(result);
     }
 
     // Pattern: `obj == null ? undefined : obj.access`  (loose equality)
-    if let Some(result) = try_loose_eq_optional_chain(
-        expr,
-        unresolved_mark,
-        policy,
-        uninitialized_bindings,
-        binding_references,
-    ) {
+    if let Some(result) = try_loose_eq_optional_chain(expr, unresolved_mark, policy, isolation) {
         return Some(result);
     }
 
@@ -440,8 +455,7 @@ fn try_boolean_context_logical_and_optional_chain(
     expr: &Expr,
     unresolved_mark: Mark,
     policy: RewritePolicy,
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
+    isolation: &TempIsolation,
 ) -> Option<Expr> {
     let Expr::Unary(UnaryExpr {
         op: UnaryOp::Bang,
@@ -459,8 +473,7 @@ fn try_boolean_context_logical_and_optional_chain(
             arg,
             unresolved_mark,
             policy,
-            uninitialized_bindings,
-            binding_references,
+            isolation,
         )?),
     }))
 }
@@ -469,8 +482,7 @@ fn try_logical_and_optional_chain(
     expr: &Expr,
     unresolved_mark: Mark,
     policy: RewritePolicy,
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
+    isolation: &TempIsolation,
 ) -> Option<Expr> {
     if policy.level < RewriteLevel::Standard {
         return None;
@@ -482,21 +494,14 @@ fn try_logical_and_optional_chain(
         return None;
     }
 
-    rewrite_logical_and_optional_chain_terms(
-        &terms,
-        unresolved_mark,
-        policy,
-        uninitialized_bindings,
-        binding_references,
-    )
+    rewrite_logical_and_optional_chain_terms(&terms, unresolved_mark, policy, isolation)
 }
 
 fn rewrite_logical_and_optional_chain_terms(
     terms: &[&Expr],
     unresolved_mark: Mark,
     policy: RewritePolicy,
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
+    isolation: &TempIsolation,
 ) -> Option<Expr> {
     let mut rewritten_terms = Vec::with_capacity(terms.len());
     let mut changed = false;
@@ -507,8 +512,7 @@ fn rewrite_logical_and_optional_chain_terms(
             &terms[index..],
             unresolved_mark,
             policy,
-            uninitialized_bindings,
-            binding_references,
+            isolation,
         ) {
             rewritten_terms.push(chain);
             index += consumed;
@@ -526,8 +530,7 @@ fn try_logical_and_optional_chain_prefix(
     terms: &[&Expr],
     unresolved_mark: Mark,
     policy: RewritePolicy,
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
+    isolation: &TempIsolation,
 ) -> Option<(Expr, usize)> {
     if terms.len() < 3 {
         return None;
@@ -535,8 +538,8 @@ fn try_logical_and_optional_chain_prefix(
 
     let first = extract_logical_and_non_null_segment(terms, 0, unresolved_mark, policy)?;
     let mut temps = Vec::new();
-    let mut temp_values = HashMap::new();
-    let mut temp_call_contexts = HashMap::new();
+    let mut temp_values = HashMap::default();
+    let mut temp_call_contexts = HashMap::default();
     let mut chain = if let Some(real_rhs) = first.real_rhs.as_ref() {
         let Expr::Ident(tmp) = strip_parens(&first.checked) else {
             return None;
@@ -593,13 +596,7 @@ fn try_logical_and_optional_chain_prefix(
         return None;
     }
 
-    if !chain_temps_are_safe(
-        &temps,
-        &terms[..=index],
-        policy.level,
-        uninitialized_bindings,
-        binding_references,
-    ) {
+    if !chain_temps_are_safe(&temps, &terms[..=index], isolation) {
         return None;
     }
 
@@ -759,8 +756,7 @@ fn try_flattened_optional_chain(
     expr: &Expr,
     unresolved_mark: Mark,
     policy: RewritePolicy,
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
+    isolation: &TempIsolation,
 ) -> Option<Expr> {
     if policy.level < RewriteLevel::Standard {
         return None;
@@ -776,42 +772,25 @@ fn try_flattened_optional_chain(
         return None;
     }
 
-    try_flattened_strict_optional_chain(
-        test,
-        alt,
-        policy,
-        uninitialized_bindings,
-        binding_references,
-        unresolved_mark,
-    )
-    .or_else(|| {
-        try_flattened_mixed_loose_root_optional_chain(
-            test,
-            alt,
-            policy,
-            uninitialized_bindings,
-            binding_references,
-            unresolved_mark,
-        )
-    })
-    .or_else(|| {
-        try_flattened_loose_optional_chain(
-            test,
-            alt,
-            policy,
-            uninitialized_bindings,
-            binding_references,
-            unresolved_mark,
-        )
-    })
+    try_flattened_strict_optional_chain(test, alt, isolation, unresolved_mark)
+        .or_else(|| {
+            try_flattened_mixed_loose_root_optional_chain(
+                test,
+                alt,
+                policy,
+                isolation,
+                unresolved_mark,
+            )
+        })
+        .or_else(|| {
+            try_flattened_loose_optional_chain(test, alt, policy, isolation, unresolved_mark)
+        })
 }
 
 fn try_flattened_strict_optional_chain(
     test: &Expr,
     alt: &Expr,
-    policy: RewritePolicy,
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
+    isolation: &TempIsolation,
     unresolved_mark: Mark,
 ) -> Option<Expr> {
     let mut terms = Vec::new();
@@ -821,8 +800,8 @@ fn try_flattened_strict_optional_chain(
     }
 
     let first = extract_null_single(terms[0])?;
-    let mut temp_values = HashMap::new();
-    let mut temp_call_contexts = HashMap::new();
+    let mut temp_values = HashMap::default();
+    let mut temp_call_contexts = HashMap::default();
     let mut temps = Vec::new();
     let (mut chain, mut current_tmp) = if let Some((first_tmp, chain)) =
         extract_flattened_assignment_segment(&first, terms[1], unresolved_mark)
@@ -866,14 +845,7 @@ fn try_flattened_strict_optional_chain(
         index += 2;
     }
 
-    if !flattened_chain_temps_are_safe(
-        &temps,
-        test,
-        alt,
-        policy.level,
-        uninitialized_bindings,
-        binding_references,
-    ) {
+    if !flattened_chain_temps_are_safe(&temps, test, alt, isolation) {
         return None;
     }
 
@@ -891,8 +863,7 @@ fn try_flattened_mixed_loose_root_optional_chain(
     test: &Expr,
     alt: &Expr,
     policy: RewritePolicy,
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
+    isolation: &TempIsolation,
     unresolved_mark: Mark,
 ) -> Option<Expr> {
     if !policy.assumptions.no_document_all {
@@ -913,8 +884,8 @@ fn try_flattened_mixed_loose_root_optional_chain(
     let mut chain = base.clone();
     let mut current_tmp = base;
     let mut temps = Vec::new();
-    let mut temp_values = HashMap::new();
-    let mut temp_call_contexts = HashMap::new();
+    let mut temp_values = HashMap::default();
+    let mut temp_call_contexts = HashMap::default();
 
     let mut index = 1;
     while index < terms.len() {
@@ -935,14 +906,7 @@ fn try_flattened_mixed_loose_root_optional_chain(
         index += 2;
     }
 
-    if !flattened_chain_temps_are_safe(
-        &temps,
-        test,
-        alt,
-        policy.level,
-        uninitialized_bindings,
-        binding_references,
-    ) {
+    if !flattened_chain_temps_are_safe(&temps, test, alt, isolation) {
         return None;
     }
 
@@ -960,8 +924,7 @@ fn try_flattened_loose_optional_chain(
     test: &Expr,
     alt: &Expr,
     policy: RewritePolicy,
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
+    isolation: &TempIsolation,
     unresolved_mark: Mark,
 ) -> Option<Expr> {
     if !policy.assumptions.no_document_all {
@@ -974,8 +937,8 @@ fn try_flattened_loose_optional_chain(
         return None;
     }
 
-    let mut temp_values = HashMap::new();
-    let mut temp_call_contexts = HashMap::new();
+    let mut temp_values = HashMap::default();
+    let mut temp_call_contexts = HashMap::default();
     let mut temps = Vec::new();
     let (mut chain, mut current_tmp) = if let Some((first_tmp, chain)) =
         extract_flattened_loose_assignment_segment(terms[0], unresolved_mark)
@@ -1002,14 +965,7 @@ fn try_flattened_loose_optional_chain(
             extract_flattened_loose_assignment_segment(term, unresolved_mark)
         else {
             if index == terms.len() - 1 && policy.assumptions.pure_getters {
-                if !flattened_chain_temps_are_safe(
-                    &temps,
-                    test,
-                    alt,
-                    policy.level,
-                    uninitialized_bindings,
-                    binding_references,
-                ) {
+                if !flattened_chain_temps_are_safe(&temps, test, alt, isolation) {
                     return None;
                 }
                 return make_flattened_loose_repeated_access(
@@ -1035,14 +991,7 @@ fn try_flattened_loose_optional_chain(
         temps.push(next_tmp);
     }
 
-    if !flattened_chain_temps_are_safe(
-        &temps,
-        test,
-        alt,
-        policy.level,
-        uninitialized_bindings,
-        binding_references,
-    ) {
+    if !flattened_chain_temps_are_safe(&temps, test, alt, isolation) {
         return None;
     }
 
@@ -1316,73 +1265,25 @@ fn flattened_chain_temps_are_safe(
     temps: &[Ident],
     test: &Expr,
     alt: &Expr,
-    level: RewriteLevel,
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
+    isolation: &TempIsolation,
 ) -> bool {
-    chain_temps_are_safe(
-        temps,
-        &[test, alt],
-        level,
-        uninitialized_bindings,
-        binding_references,
-    )
+    chain_temps_are_safe(temps, &[test, alt], isolation)
 }
 
 fn chain_temps_are_safe(
     temps: &[Ident],
     pattern_exprs: &[&Expr],
-    level: RewriteLevel,
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
+    isolation: &TempIsolation,
 ) -> bool {
-    let pattern_references = count_binding_references_in_exprs(pattern_exprs);
     let unique_temps: HashSet<BindingId> = temps.iter().map(binding_id).collect();
-
-    unique_temps.iter().all(|binding_id| {
-        let pattern_count = pattern_references.get(binding_id).copied().unwrap_or(0);
-        let total_count = binding_references.get(binding_id).copied().unwrap_or(0);
-        if uninitialized_bindings.contains(binding_id) && total_count == pattern_count + 1 {
-            return true;
-        }
-        if level >= RewriteLevel::Aggressive
-            && looks_generated_temp_sym(&binding_id.0)
-            && total_count == pattern_count
-        {
-            return true;
-        }
-        false
-    })
+    isolation.are_isolated_to(&unique_temps, pattern_exprs)
 }
 
-fn temp_expr_is_safe_for_pattern(
-    temp: &Expr,
-    exprs: &[&Expr],
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
-) -> bool {
-    let Expr::Ident(Ident { sym, ctxt, .. }) = strip_parens(temp) else {
+fn temp_expr_is_safe_for_pattern(temp: &Expr, exprs: &[&Expr], isolation: &TempIsolation) -> bool {
+    let Expr::Ident(ident) = strip_parens(temp) else {
         return false;
     };
-    let binding_id = (sym.clone(), *ctxt);
-    let pattern_references = count_binding_references_in_exprs(exprs)
-        .get(&binding_id)
-        .copied()
-        .unwrap_or(0);
-    let total_references = binding_references.get(&binding_id).copied().unwrap_or(0);
-
-    if uninitialized_bindings.contains(&binding_id) && total_references == pattern_references + 1 {
-        return true;
-    }
-    looks_generated_temp_sym(sym) && total_references == pattern_references
-}
-
-fn count_binding_references_in_exprs(exprs: &[&Expr]) -> HashMap<BindingId, usize> {
-    let mut counter = BindingReferenceCounter::default();
-    for expr in exprs {
-        expr.visit_with(&mut counter);
-    }
-    counter.references
+    isolation.are_isolated_to([&binding_id(ident)], exprs)
 }
 
 /// Handle: `(obj === null || obj === void 0) ? void 0 : obj.access`  →  `obj?.access`
@@ -1391,8 +1292,7 @@ fn try_ternary_optional_chain(
     expr: &Expr,
     unresolved_mark: Mark,
     policy: RewritePolicy,
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
+    isolation: &TempIsolation,
 ) -> Option<Expr> {
     let Expr::Cond(CondExpr {
         test, cons, alt, ..
@@ -1413,21 +1313,12 @@ fn try_ternary_optional_chain(
     } = extract_null_check(test, unresolved_mark)?;
 
     if let Some(real_rhs) = real_value {
-        // Strict Babel lowering references the temp four times:
-        // assignment target, null check left/right, and the final access/call.
-        if is_standard_temp_expr(&checked, uninitialized_bindings, binding_references, 4)
-            || is_generated_temp_expr(&checked, binding_references, 3)
-            // Generated member/nested-chain temps skip the declaration-site proof, so we only
-            // require the three references inside the lowered chain itself.
-            || is_generated_member_temp_expr(&checked, &real_rhs, binding_references, 3)
-            || is_nested_optional_chain_temp_expr(&checked, &real_rhs, binding_references, 3)
+        // Strict Babel lowering uses the temp three times: the assignment
+        // (the null check's left side), the `void 0` check, and the final
+        // access/call; an optional call on the checked value adds one.
+        if is_exact_temp_expr(&checked, isolation, 3)
             || (is_optional_call_on_checked(alt, &checked)
-                && (is_standard_temp_expr(
-                    &checked,
-                    uninitialized_bindings,
-                    binding_references,
-                    5,
-                ) || is_generated_member_temp_expr(&checked, &real_rhs, binding_references, 5)))
+                && is_exact_temp_expr(&checked, isolation, 4))
         {
             if let Some(chain) =
                 make_optional_chain_replacing(&checked, &real_rhs, alt, unresolved_mark)
@@ -1435,12 +1326,11 @@ fn try_ternary_optional_chain(
                 return (policy.level >= RewriteLevel::Standard).then_some(chain);
             }
         }
-        if policy.level < RewriteLevel::Aggressive {
-            return None;
-        }
-        // Assignment form: `checked` is `tmp`, `real_rhs` is the original expr
-        // alt must use `tmp` as the object
-        return make_optional_chain_replacing(&checked, &real_rhs, alt, unresolved_mark);
+        // No further path: an undeclared, observed, or initialized temp cannot
+        // lose its assignment at any level (Generated Temporaries hard rule),
+        // and the declared `var _a;` shape is exactly what the proof above
+        // accepts.
+        return None;
     }
 
     // Plain form
@@ -1745,8 +1635,7 @@ fn try_loose_eq_optional_chain(
     expr: &Expr,
     unresolved_mark: Mark,
     policy: RewritePolicy,
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
+    isolation: &TempIsolation,
 ) -> Option<Expr> {
     if !policy.assumptions.no_document_all {
         return None;
@@ -1774,14 +1663,7 @@ fn try_loose_eq_optional_chain(
                 return None;
             }
             let checked = extract_loose_null_operand(left, right, unresolved_mark)?;
-            try_loose_chain_with_assign(
-                checked,
-                alt,
-                policy,
-                uninitialized_bindings,
-                binding_references,
-                unresolved_mark,
-            )
+            try_loose_chain_with_assign(checked, alt, policy, isolation, unresolved_mark)
         }
         // `x != null ? x.prop : undefined`
         // `(tmp = expr) != null ? tmp.prop : undefined`
@@ -1790,14 +1672,7 @@ fn try_loose_eq_optional_chain(
                 return None;
             }
             let checked = extract_loose_null_operand(left, right, unresolved_mark)?;
-            try_loose_chain_with_assign(
-                checked,
-                cons,
-                policy,
-                uninitialized_bindings,
-                binding_references,
-                unresolved_mark,
-            )
+            try_loose_chain_with_assign(checked, cons, policy, isolation, unresolved_mark)
         }
         _ => None,
     }
@@ -1807,8 +1682,7 @@ fn try_loose_chain_with_assign(
     checked: Expr,
     access: &Expr,
     policy: RewritePolicy,
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
+    isolation: &TempIsolation,
     unresolved_mark: Mark,
 ) -> Option<Expr> {
     if let Some((tmp, real_rhs)) = extract_assign_parts(&checked) {
@@ -1816,56 +1690,51 @@ fn try_loose_chain_with_assign(
         let recovered_real_rhs = recover_lowered_optional_chain_expr(real_rhs, unresolved_mark)
             .map(|recovered| recovered.chain);
         // Loose Babel lowering references the temp twice inside the chain:
-        // once in the null check and once in the final access/call.
-        if is_standard_temp_expr(
-            &tmp_ident_expr,
-            uninitialized_bindings,
-            binding_references,
-            3,
-        ) || is_generated_temp_expr(&tmp_ident_expr, binding_references, 2)
-            || is_generated_member_temp_expr(&tmp_ident_expr, real_rhs, binding_references, 2)
-            || is_nested_optional_chain_temp_expr(&tmp_ident_expr, real_rhs, binding_references, 2)
-            || temp_expr_is_safe_for_pattern(
-                &tmp_ident_expr,
-                &[&checked, access],
-                uninitialized_bindings,
-                binding_references,
-            )
-        {
+        // once in the null check and once in the final access/call. Only a
+        // declared temp proven isolated to the pattern may lose its
+        // assignment — at every level (Generated Temporaries hard rule).
+        let temp_proven = is_exact_temp_expr(&tmp_ident_expr, isolation, 2)
+            || temp_expr_is_safe_for_pattern(&tmp_ident_expr, &[&checked, access], isolation);
+        if !temp_proven {
+            return None;
+        }
+        let build = |rhs: &Expr, recovered_rhs: Option<&Expr>| {
             if let Some(chain) = make_optional_chain_replacing_preferred(
                 &tmp_ident_expr,
-                real_rhs,
-                recovered_real_rhs.as_ref(),
+                rhs,
+                recovered_rhs,
                 access,
                 unresolved_mark,
             ) {
                 return Some(chain);
             }
-        }
-        if policy.assumptions.pure_getters {
-            if let Some(recovered_access) =
-                recover_loose_repeated_optional_call_chain(access, unresolved_mark)
-            {
-                if let Some(chain) = make_optional_chain_replacing(
-                    &tmp_ident_expr,
-                    real_rhs,
-                    &recovered_access,
-                    unresolved_mark,
-                ) {
-                    return Some(chain);
+            if policy.assumptions.pure_getters {
+                if let Some(recovered_access) =
+                    recover_loose_repeated_optional_call_chain(access, unresolved_mark)
+                {
+                    return make_optional_chain_replacing(
+                        &tmp_ident_expr,
+                        rhs,
+                        &recovered_access,
+                        unresolved_mark,
+                    );
                 }
             }
+            None
+        };
+        let chain = build(real_rhs, recovered_real_rhs.as_ref())?;
+        // Only the temp's object slots are replaced; a computed key or an
+        // argument (`e[e.length - 1]`, `e.foo(e)`) is cloned and still reads
+        // it. Then the base keeps the assignment, which runs before the rest
+        // of the chain: `(e = expr)?.[e.length - 1]`.
+        if BindingUseIndex::collect_expr(&chain).use_count(&binding_id(&tmp)) == 0 {
+            return Some(chain);
         }
-        if policy.level < RewriteLevel::Aggressive {
-            return None;
-        }
-        make_optional_chain_replacing_preferred(
-            &tmp_ident_expr,
-            real_rhs,
-            recovered_real_rhs.as_ref(),
-            access,
-            unresolved_mark,
-        )
+        let assigned_base = Expr::Paren(ParenExpr {
+            span: DUMMY_SP,
+            expr: Box::new(strip_parens(&checked).clone()),
+        });
+        build(&assigned_base, None)
     } else {
         make_optional_chain(checked, access)
     }
@@ -2348,85 +2217,14 @@ fn extract_assign_ident_parts(expr: &Expr) -> Option<(Ident, &Box<Expr>)> {
     Some((id.id.clone(), &assign.right))
 }
 
-fn is_standard_temp_expr(
-    expr: &Expr,
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
-    expected_references: usize,
-) -> bool {
-    let Expr::Ident(Ident { sym, ctxt, .. }) = strip_parens(expr) else {
+/// A declared temp whose uses are exactly the `expected_uses` a fixed
+/// lowering shape consumes. Only a shape with no other reads of the temp may
+/// use this; any other shape proves isolation over its pattern expressions.
+fn is_exact_temp_expr(expr: &Expr, isolation: &TempIsolation, expected_uses: usize) -> bool {
+    let Expr::Ident(ident) = strip_parens(expr) else {
         return false;
     };
-    let binding_id = (sym.clone(), *ctxt);
-    uninitialized_bindings.contains(&binding_id)
-        && binding_references.get(&binding_id).copied() == Some(expected_references)
-}
-
-fn is_generated_temp_expr(
-    checked: &Expr,
-    binding_references: &HashMap<BindingId, usize>,
-    expected_references: usize,
-) -> bool {
-    let Expr::Ident(Ident { sym, ctxt, .. }) = strip_parens(checked) else {
-        return false;
-    };
-    let binding_id = (sym.clone(), *ctxt);
-    looks_generated_temp_sym(sym)
-        && binding_references.get(&binding_id).copied() == Some(expected_references)
-}
-
-fn is_nested_optional_chain_temp_expr(
-    checked: &Expr,
-    real_rhs: &Expr,
-    binding_references: &HashMap<BindingId, usize>,
-    expected_references: usize,
-) -> bool {
-    if !matches!(strip_parens(real_rhs), Expr::OptChain(_)) {
-        return false;
-    }
-    let Expr::Ident(Ident { sym, ctxt, .. }) = strip_parens(checked) else {
-        return false;
-    };
-    let binding_id = (sym.clone(), *ctxt);
-    looks_generated_temp_sym(sym)
-        && binding_references.get(&binding_id).copied() == Some(expected_references)
-}
-
-fn is_generated_member_temp_expr(
-    checked: &Expr,
-    real_rhs: &Expr,
-    binding_references: &HashMap<BindingId, usize>,
-    expected_references: usize,
-) -> bool {
-    if !matches!(strip_parens(real_rhs), Expr::Member(_)) {
-        return false;
-    }
-    let Expr::Ident(Ident { sym, ctxt, .. }) = strip_parens(checked) else {
-        return false;
-    };
-    let binding_id = (sym.clone(), *ctxt);
-    looks_generated_temp_sym(sym)
-        && binding_references.get(&binding_id).copied() == Some(expected_references)
-}
-
-fn is_babel_temp_sym(sym: &swc_core::atoms::Atom) -> bool {
-    sym.starts_with('_')
-}
-
-fn looks_generated_temp_sym(sym: &swc_core::atoms::Atom) -> bool {
-    is_babel_temp_sym(sym) || sym.chars().any(|ch| ch.is_ascii_digit())
-}
-
-#[derive(Default)]
-struct BindingReferenceCounter {
-    references: HashMap<BindingId, usize>,
-}
-
-impl Visit for BindingReferenceCounter {
-    fn visit_ident(&mut self, ident: &Ident) {
-        let binding_id = (ident.sym.clone(), ident.ctxt);
-        *self.references.entry(binding_id).or_insert(0) += 1;
-    }
+    isolation.is_isolated(&binding_id(ident), expected_uses)
 }
 
 #[cfg(test)]

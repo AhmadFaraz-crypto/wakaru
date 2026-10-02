@@ -677,3 +677,246 @@ function render(Object, props) {
 "#;
     assert_eq_normalized(&render_with_level(input, RewriteLevel::Standard), expected);
 }
+
+#[test]
+fn display_name_in_try_block_renames_the_enclosing_binding() {
+    // Emitted by the displayName plugins: the assignment is wrapped in
+    // `try`/`catch`, while the component binding lives in the enclosing scope.
+    let input = r#"
+var c = () => React.createElement("div", null);
+try {
+    c.displayName = "LoadableImage";
+} catch (e) {}
+var Baz = () => React.createElement(c, null);
+"#;
+    let expected = r#"
+var LoadableImage = () => <div />;
+try {
+    LoadableImage.displayName = "LoadableImage";
+} catch (e) {}
+var Baz = () => <LoadableImage />;
+"#;
+    assert_eq_normalized(&render_with_level(input, RewriteLevel::Standard), expected);
+}
+
+#[test]
+fn display_name_in_nested_block_renames_the_binding_declared_in_the_function() {
+    let input = r#"
+function o() {
+    let e = i.createContext[s];
+    if (!e) {
+        Object.defineProperty(i.createContext, s, {
+            value: e = i.createContext({}),
+            configurable: true
+        });
+        e.displayName = "ApolloContext";
+    }
+    return e;
+}
+"#;
+    let expected = r#"
+function o() {
+    let ApolloContext = i.createContext[s];
+    if (!ApolloContext) {
+        Object.defineProperty(i.createContext, s, {
+            value: ApolloContext = i.createContext({}),
+            configurable: true
+        });
+        ApolloContext.displayName = "ApolloContext";
+    }
+    return ApolloContext;
+}
+"#;
+    assert_eq_normalized(&render_with_level(input, RewriteLevel::Standard), expected);
+}
+
+#[test]
+fn hoisted_var_display_name_in_nested_block_renames_the_function_scope_binding() {
+    let input = r#"
+function F(x) {
+    if (x) {
+        var t = () => React.createElement("div", null);
+        t.displayName = "Foo";
+    }
+    return React.createElement(t, null);
+}
+"#;
+    let expected = r#"
+function F(x) {
+    if (x) {
+        var Foo = () => <div />;
+        Foo.displayName = "Foo";
+    }
+    return <Foo />;
+}
+"#;
+    assert_eq_normalized(&render_with_level(input, RewriteLevel::Standard), expected);
+}
+
+#[test]
+fn display_name_on_a_binding_declared_outside_the_processed_list_is_not_renamed() {
+    // `t` is a parameter: the body's statement list does not declare it, so
+    // renaming only the body would leave the parameter behind.
+    let input = r#"
+function F(t) {
+    t.displayName = "Foo";
+    return React.createElement(t, null);
+}
+"#;
+    let output = render_with_level(input, RewriteLevel::Standard);
+    assert!(!output.contains("Foo."), "{output}");
+    assert!(output.contains("function F(t)"), "{output}");
+    assert!(output.contains("t.displayName = \"Foo\";"), "{output}");
+}
+
+#[test]
+fn inline_component_alias_stays_inside_an_expression_bodied_arrow() {
+    // The tag expression reads the arrow's parameter and must be evaluated on
+    // every call; the alias belongs in the arrow's body, not before it.
+    let input = r#"
+const Icon = ({ type: t }) => React.createElement(pick(t), { className: "x" });
+"#;
+    let output = render_with_level(input, RewriteLevel::Standard);
+    assert!(!output.starts_with("const Component"), "{output}");
+    assert!(output.contains("const Component = pick(t);"), "{output}");
+    assert!(
+        output.contains("return <Component className=\"x\"/>;"),
+        "{output}"
+    );
+}
+
+#[test]
+fn inline_component_alias_is_not_hoisted_out_of_a_class_field_initializer() {
+    // No statement list inside the initializer can hold the alias, and the
+    // enclosing one runs in a different scope; leave the call as it is.
+    let input = r#"
+class Panel {
+    icon = React.createElement(pick(this.kind), null);
+}
+"#;
+    let output = render_with_level(input, RewriteLevel::Standard);
+    assert!(!output.contains("Component"), "{output}");
+    assert!(
+        output.contains("React.createElement(pick(this.kind), null)"),
+        "{output}"
+    );
+}
+
+#[test]
+fn no_substitution_template_literal_tag_is_a_string_tag() {
+    // `` createElement(`div`, …) `` names the intrinsic element the same way
+    // `createElement("div", …)` does; it was aliased as `const Component = \`div\``
+    // before.
+    let input = r#"
+function App() {
+  return React.createElement(`div`, { className: "a" }, "hello");
+}
+"#;
+    let expected = r#"
+function App() {
+  return <div className="a">hello</div>;
+}
+"#;
+    assert_eq_normalized(&render_with_level(input, RewriteLevel::Standard), expected);
+}
+
+#[test]
+fn const_template_literal_tag_is_inlined_like_a_string_const() {
+    // Whatever the string-const path does to the binding afterwards, the
+    // template spelling must come out the same.
+    let template = r#"
+const tag = `span`;
+function App() {
+  return React.createElement(tag, null, "hello");
+}
+"#;
+    let string = template.replace("`span`", "\"span\"");
+    let template_output = render_with_level(template, RewriteLevel::Standard);
+    assert!(
+        template_output.contains("<span>hello</span>"),
+        "{template_output}"
+    );
+    assert_eq_normalized(
+        &template_output.replace("`span`", "\"span\""),
+        &render_with_level(&string, RewriteLevel::Standard),
+    );
+}
+
+#[test]
+fn template_literal_tag_keeps_the_string_capitalization_rule() {
+    // A capitalized string tag names a component by string, which JSX cannot
+    // express; the template spelling is rejected the same way.
+    let input = r#"
+function App() {
+  return React.createElement(`Foo`, null, "hello");
+}
+"#;
+    assert_eq_normalized(&render_with_level(input, RewriteLevel::Aggressive), input);
+}
+
+#[test]
+fn template_literal_tag_with_substitution_is_not_a_string() {
+    let input = r#"
+function App(kind) {
+  return React.createElement(`h${kind}`, null, "hello");
+}
+"#;
+    let output = render_with_level(input, RewriteLevel::Standard);
+    assert!(output.contains("`h${kind}`"), "{output}");
+    assert!(!output.contains("<h"), "{output}");
+}
+
+#[test]
+fn unrepresentable_string_tags_preserve_the_runtime_tag() {
+    for tag in ["x.y", "x y", "x/y", "svg:", "svg:x:y"] {
+        for literal in [format!("\"{tag}\""), format!("`{tag}`")] {
+            let input = format!(
+                "function App() {{ return React.createElement({literal}, null, \"hello\"); }}"
+            );
+            let expected = format!(
+                "function App() {{ const Component = {literal}; return <Component>hello</Component>; }}"
+            );
+            assert_eq_normalized(&render_with_level(&input, RewriteLevel::Standard), &input);
+            assert_eq_normalized(
+                &render_with_level(&input, RewriteLevel::Aggressive),
+                &expected,
+            );
+        }
+    }
+}
+
+#[test]
+fn valid_string_tags_keep_intrinsic_and_namespace_names() {
+    for (literal, tag) in [
+        ("`my-widget`", "my-widget"),
+        ("`svg:path`", "svg:path"),
+        (r#"`d\u0069v`"#, "div"),
+    ] {
+        let input = format!("function App() {{ return React.createElement({literal}, null); }}");
+        let expected = format!("function App() {{ return <{tag} />; }}");
+        assert_eq_normalized(
+            &render_with_level(&input, RewriteLevel::Standard),
+            &expected,
+        );
+    }
+}
+
+#[test]
+fn unrepresentable_const_string_tag_keeps_its_runtime_value() {
+    let input = "const tag = `x.y`; function App() { return React.createElement(tag, null); }";
+    let expected = "const Tag = `x.y`; function App() { return <Tag />; }";
+    assert_eq_normalized(&render_with_level(input, RewriteLevel::Standard), expected);
+}
+
+#[test]
+fn lone_surrogate_strings_stay_string_literals() {
+    // A lone surrogate has no UTF-8 form; JSX text built from it would
+    // replace it with U+FFFD and change the rendered string.
+    let input = r#"
+const a = React.createElement("b", { title: "\uD83D" }, "\uD83D");
+"#;
+    let expected = r#"
+const a = <b title={"\uD83D"}>{"\uD83D"}</b>;
+"#;
+    assert_eq_normalized(&render_with_level(input, RewriteLevel::Standard), expected);
+}

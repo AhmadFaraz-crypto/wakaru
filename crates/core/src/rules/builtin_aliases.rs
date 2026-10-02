@@ -1,13 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::common::{Mark, Span};
 use swc_core::ecma::ast::{
-    CallExpr, Decl, Expr, Ident, MemberExpr, MemberProp, Module, ModuleItem, Pat, PropName, Stmt,
-    UnaryExpr, UnaryOp, UpdateExpr, VarDeclKind, WithStmt,
+    Decl, ExportSpecifier, Expr, Ident, MemberExpr, MemberProp, Module, ModuleDecl,
+    ModuleExportName, ModuleItem, Pat, PropName, Stmt, UnaryExpr, UnaryOp, UpdateExpr, VarDeclKind,
 };
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
-use super::eval_utils::is_direct_eval_call;
+use super::eval_utils::has_dynamic_scope_construct;
 use super::helper_matcher::{
     binding_key, collect_refs, remove_var_declarators_by_binding, var_declarator_binding_key,
     BindingKey,
@@ -15,11 +15,15 @@ use super::helper_matcher::{
 use crate::js_names::is_stable_builtin_alias_root;
 use crate::utils::paren::strip_parens;
 
+/// Inlining an alias reads the builtin (`Object`, `Math`) as the global at
+/// every former use site. A `with` statement or a direct eval in the same
+/// scope can bind that name at runtime, so both entry points skip when either
+/// construct is present, whatever the declaration kind
+/// (docs/rewrite-assumptions.md, dynamic-scope skip).
 #[derive(Clone, Copy)]
 pub(crate) struct BuiltinAliasInlineOptions {
     allow_var: bool,
     require_no_var_use_before_decl: bool,
-    reject_var_with_dynamic_scope: bool,
 }
 
 impl BuiltinAliasInlineOptions {
@@ -27,7 +31,6 @@ impl BuiltinAliasInlineOptions {
         Self {
             allow_var: false,
             require_no_var_use_before_decl: false,
-            reject_var_with_dynamic_scope: false,
         }
     }
 
@@ -35,7 +38,6 @@ impl BuiltinAliasInlineOptions {
         Self {
             allow_var: true,
             require_no_var_use_before_decl: true,
-            reject_var_with_dynamic_scope: true,
         }
     }
 }
@@ -62,8 +64,17 @@ pub(crate) fn inline_module_builtin_aliases(
         return false;
     }
 
-    if options.reject_var_with_dynamic_scope && module_has_dynamic_scope_construct(module) {
-        candidates.retain(|_, candidate| candidate.decl_kind != VarDeclKind::Var);
+    // `export { alias }` names the binding itself: the specifier cannot carry
+    // `Object.create`, so removing the declaration would leave it dangling and
+    // the module would fail to link. Keep exported aliases as they are.
+    let exported = collect_local_export_specifier_keys(module);
+    candidates.retain(|key, _| !exported.contains(key));
+    if candidates.is_empty() {
+        return false;
+    }
+
+    if has_dynamic_scope_construct(module) {
+        return false;
     }
 
     if options.require_no_var_use_before_decl {
@@ -100,18 +111,22 @@ pub(crate) fn inline_module_builtin_aliases(
     true
 }
 
+/// `pinned` bindings keep their declaration: module-scope aliases named by an
+/// `export { alias }` specifier (see `collect_local_export_specifier_keys`).
 pub(crate) fn inline_builtin_aliases_stmts(
     mut stmts: Vec<Stmt>,
     unresolved_mark: Option<Mark>,
     options: BuiltinAliasInlineOptions,
+    pinned: &HashSet<BindingKey>,
 ) -> Vec<Stmt> {
     let mut candidates = collect_stmt_candidates(&stmts, unresolved_mark, options);
+    candidates.retain(|key, _| !pinned.contains(key));
     if candidates.is_empty() {
         return stmts;
     }
 
-    if options.reject_var_with_dynamic_scope && stmts_have_dynamic_scope_construct(&stmts) {
-        candidates.retain(|_, candidate| candidate.decl_kind != VarDeclKind::Var);
+    if has_dynamic_scope_construct(stmts.as_slice()) {
+        return stmts;
     }
 
     if options.require_no_var_use_before_decl {
@@ -147,14 +162,37 @@ pub(crate) fn inline_builtin_aliases_stmts(
     stmts
 }
 
+/// The local bindings named by `export { local }` / `export { local as x }`
+/// specifiers without a source.
+pub(crate) fn collect_local_export_specifier_keys(module: &Module) -> HashSet<BindingKey> {
+    let mut keys = HashSet::default();
+    for item in &module.body {
+        let ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(export)) = item else {
+            continue;
+        };
+        if export.src.is_some() {
+            continue;
+        }
+        for specifier in &export.specifiers {
+            let ExportSpecifier::Named(named) = specifier else {
+                continue;
+            };
+            if let ModuleExportName::Ident(local) = &named.orig {
+                keys.insert(binding_key(local));
+            }
+        }
+    }
+    keys
+}
+
 fn collect_module_candidates(
     module: &Module,
     unresolved_mark: Option<Mark>,
     options: BuiltinAliasInlineOptions,
 ) -> HashMap<BindingKey, BuiltinAliasCandidate> {
-    let mut candidates = HashMap::new();
-    let mut seen_single_decl_keys = HashSet::new();
-    let mut duplicate_keys = HashSet::new();
+    let mut candidates = HashMap::default();
+    let mut seen_single_decl_keys = HashSet::default();
+    let mut duplicate_keys = HashSet::default();
 
     for (def_index, item) in module.body.iter().enumerate() {
         let ModuleItem::Stmt(stmt) = item else {
@@ -182,9 +220,9 @@ fn collect_stmt_candidates(
     unresolved_mark: Option<Mark>,
     options: BuiltinAliasInlineOptions,
 ) -> HashMap<BindingKey, BuiltinAliasCandidate> {
-    let mut candidates = HashMap::new();
-    let mut seen_single_decl_keys = HashSet::new();
-    let mut duplicate_keys = HashSet::new();
+    let mut candidates = HashMap::default();
+    let mut seen_single_decl_keys = HashSet::default();
+    let mut duplicate_keys = HashSet::default();
 
     for (def_index, stmt) in stmts.iter().enumerate() {
         collect_candidate_from_stmt(
@@ -337,7 +375,7 @@ fn is_builtin_alias_definition_stmt<T>(stmt: &Stmt, candidates: &HashMap<Binding
 }
 
 fn module_has_ref_before_index(module: &Module, key: &BindingKey, index: usize) -> bool {
-    let targets = HashSet::from([key.clone()]);
+    let targets = HashSet::from_iter([key.clone()]);
     module
         .body
         .iter()
@@ -346,7 +384,7 @@ fn module_has_ref_before_index(module: &Module, key: &BindingKey, index: usize) 
 }
 
 fn stmts_have_ref_before_index(stmts: &[Stmt], key: &BindingKey, index: usize) -> bool {
-    let targets = HashSet::from([key.clone()]);
+    let targets = HashSet::from_iter([key.clone()]);
     stmts
         .iter()
         .take(index)
@@ -410,7 +448,11 @@ impl Visit for BuiltinAliasUsageCounter<'_> {
         }
     }
 
-    fn visit_prop_name(&mut self, _: &PropName) {}
+    fn visit_prop_name(&mut self, prop: &PropName) {
+        if let PropName::Computed(computed) = prop {
+            computed.visit_with(self);
+        }
+    }
 }
 
 struct BuiltinAliasInliner<'a> {
@@ -442,7 +484,11 @@ impl VisitMut for BuiltinAliasInliner<'_> {
         }
     }
 
-    fn visit_mut_prop_name(&mut self, _: &mut PropName) {}
+    fn visit_mut_prop_name(&mut self, prop: &mut PropName) {
+        if let PropName::Computed(computed) = prop {
+            computed.visit_mut_with(self);
+        }
+    }
 }
 
 fn set_expr_span(expr: &mut Expr, span: Span) {
@@ -450,54 +496,5 @@ fn set_expr_span(expr: &mut Expr, span: Span) {
         Expr::Ident(id) => id.span = span,
         Expr::Member(member) => member.span = span,
         _ => {}
-    }
-}
-
-fn module_has_dynamic_scope_construct(module: &Module) -> bool {
-    let mut visitor = DynamicScopeConstructFinder::default();
-    module.visit_with(&mut visitor);
-    visitor.found
-}
-
-fn stmts_have_dynamic_scope_construct(stmts: &[Stmt]) -> bool {
-    let mut visitor = DynamicScopeConstructFinder::default();
-    stmts.visit_with(&mut visitor);
-    visitor.found
-}
-
-#[derive(Default)]
-struct DynamicScopeConstructFinder {
-    found: bool,
-}
-
-impl Visit for DynamicScopeConstructFinder {
-    fn visit_call_expr(&mut self, call: &CallExpr) {
-        if is_direct_eval_call(call) {
-            self.found = true;
-            return;
-        }
-        call.visit_children_with(self);
-    }
-
-    fn visit_with_stmt(&mut self, _: &WithStmt) {
-        self.found = true;
-    }
-
-    fn visit_expr(&mut self, expr: &Expr) {
-        if !self.found {
-            expr.visit_children_with(self);
-        }
-    }
-
-    fn visit_stmt(&mut self, stmt: &Stmt) {
-        if !self.found {
-            stmt.visit_children_with(self);
-        }
-    }
-
-    fn visit_module_item(&mut self, item: &ModuleItem) {
-        if !self.found {
-            item.visit_children_with(self);
-        }
     }
 }

@@ -7,6 +7,57 @@ use wakaru_core::facts::{
 use wakaru_core::rules::UnObjectSpread;
 
 #[test]
+fn nested_spread_recovery_moves_function_subtrees() {
+    use swc_core::common::Mark;
+    use swc_core::ecma::ast::{FnExpr, Function, Module};
+    use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
+
+    #[derive(Default)]
+    struct Functions(Vec<*const Function>);
+    impl Visit for Functions {
+        fn visit_fn_expr(&mut self, expr: &FnExpr) {
+            self.0.push(expr.function.as_ref() as *const Function);
+            expr.visit_children_with(self);
+        }
+    }
+
+    struct CheckAllocations(Mark);
+    impl VisitMut for CheckAllocations {
+        fn visit_mut_module(&mut self, module: &mut Module) {
+            let mut before = Functions::default();
+            module.visit_with(&mut before);
+            module.visit_mut_with(&mut UnObjectSpread::new_with_mark(self.0));
+            let mut after = Functions::default();
+            module.visit_with(&mut after);
+            assert_eq!(before.0.len(), 4);
+            assert_eq!(
+                before.0, after.0,
+                "spread recovery must move argument trees"
+            );
+        }
+    }
+
+    let input = r#"
+import _extends from "@babel/runtime/helpers/extends";
+var value = _extends(
+    { first: function first() { return 1; } },
+    _extends({}, { second: function second() { return 2; } }),
+    source(function third() { return 3; }),
+    { method() { return function fourth() { return 4; }; } }
+);
+"#;
+    let expected = r#"
+var value = {
+    first: function first() { return 1; },
+    second: function second() { return 2; },
+    ...source(function third() { return 3; }),
+    ...{ method() { return function fourth() { return 4; }; } }
+};
+"#;
+    assert_eq_normalized(&render_rule(input, CheckAllocations), expected);
+}
+
+#[test]
 fn replaces_object_spread2_with_spread_syntax() {
     let input = r#"
 var _objectSpread2 = require("@babel/runtime/helpers/objectSpread2");
@@ -1262,4 +1313,59 @@ var x = copyProps({}, source);
 "#;
     let output = render(input);
     insta::assert_snapshot!(output);
+}
+
+#[test]
+fn direct_tslib_assign_restores_fresh_object_targets() {
+    let input = "var result = require('tslib').__assign({}, source);";
+    assert_eq_normalized(
+        &render_rule(input, UnObjectSpread::new_with_mark),
+        "var result = { ...source };",
+    );
+}
+
+#[test]
+fn direct_tslib_assign_preserves_mutation_and_dynamic_lookup() {
+    for input in [
+        "var result = require('tslib').__assign(target, source);",
+        "function copy(require) { return require('tslib').__assign({}, source); }",
+        "with (scope) { var result = require('tslib').__assign({}, source); }",
+        "with (scope) { observe(); } var result = require('tslib').__assign({}, source);",
+        "eval(code); var result = require('tslib').__assign({}, source);",
+    ] {
+        assert_eq_normalized(&render_rule(input, UnObjectSpread::new_with_mark), input);
+    }
+}
+
+#[test]
+fn partially_converted_esbuild_spread_keeps_the_define_property_alias() {
+    // `__spreadValues(target, extra)` mutates a non-literal target and stays a
+    // call, so `__spreadValues` and `__defNormalProp` survive. `__defProp` is
+    // only referenced from inside `__defNormalProp`; a kept helper's references
+    // count, so the alias must survive with it.
+    let input = r#"
+var __defProp = Object.defineProperty;
+var __getOwnPropSymbols = Object.getOwnPropertySymbols;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __propIsEnum = Object.prototype.propertyIsEnumerable;
+var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __spreadValues = (a, b) => {
+    for (var prop in b || (b = {})) if (__hasOwnProp.call(b, prop)) __defNormalProp(a, prop, b[prop]);
+    if (__getOwnPropSymbols) for (var prop of __getOwnPropSymbols(b)) {
+        if (__propIsEnum.call(b, prop)) __defNormalProp(a, prop, b[prop]);
+    }
+    return a;
+};
+const out = __spreadValues({}, app_info);
+__spreadValues(target, extra);
+use(out);
+"#;
+    let output = render_rule(input, |_| UnObjectSpread::default());
+    assert!(output.contains("const out = {"), "{output}");
+    assert!(output.contains("__spreadValues(target, extra)"), "{output}");
+    assert!(output.contains("__defNormalProp = "), "{output}");
+    assert!(
+        output.contains("var __defProp = Object.defineProperty"),
+        "{output}"
+    );
 }

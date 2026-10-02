@@ -16,7 +16,7 @@
 //! Property-name positions (`obj.foo`, `{foo: ...}` keys, JSX attribute names)
 //! are not counted as references.
 
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use swc_core::atoms::Atom;
 use swc_core::common::{BytePos, SyntaxContext, DUMMY_SP};
@@ -41,10 +41,6 @@ impl DeadImports {
             preserved_spans: Some(preserved_spans.clone()),
         }
     }
-
-    pub(crate) fn preserve_currently_dead(module: &Module) -> Self {
-        Self::delta(&compute_pre_dead_import_spans(module))
-    }
 }
 
 impl VisitMut for DeadImports {
@@ -68,7 +64,7 @@ fn collect_references(module: &Module) -> HashSet<(Atom, SyntaxContext)> {
 }
 
 pub(crate) fn compute_pre_existing_import_spans(module: &Module) -> HashSet<(BytePos, BytePos)> {
-    let mut spans = HashSet::new();
+    let mut spans = HashSet::default();
     for item in &module.body {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
             continue;
@@ -89,7 +85,7 @@ pub(crate) fn compute_pre_existing_import_spans(module: &Module) -> HashSet<(Byt
 
 pub(crate) fn compute_pre_dead_import_spans(module: &Module) -> HashSet<(BytePos, BytePos)> {
     let referenced = collect_references(module);
-    let mut spans = HashSet::new();
+    let mut spans = HashSet::default();
     for item in &module.body {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
             continue;
@@ -147,7 +143,7 @@ fn dedup_side_effect_imports(module: &mut Module) {
         })
         .collect();
 
-    let mut seen_side_effect_sources = HashSet::new();
+    let mut seen_side_effect_sources = HashSet::default();
     module.body.retain(|item| {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
             return true;

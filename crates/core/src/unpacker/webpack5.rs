@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::common::{
@@ -10,6 +10,7 @@ use swc_core::ecma::ast::{
     MemberProp, Module, ModuleItem, ObjectLit, Pat, Prop, PropName, PropOrSpread, SeqExpr,
     SimpleAssignTarget, Stmt, Str, UnaryExpr, UnaryOp, VarDecl, VarDeclarator,
 };
+use swc_core::ecma::codegen::Config;
 use swc_core::ecma::transforms::base::resolver;
 use swc_core::ecma::utils::replace_ident;
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
@@ -23,9 +24,9 @@ use crate::unpacker::webpack_common::{
     numeric_id_from_expr, split_array_concat, FactoryNormalizationError,
 };
 use crate::unpacker::{
-    deconflict_runtime_binding_renames, emit_module_with_source_map, source_fallback_for_stmts,
-    spans_byte_ranges, BundleFormat, DetectedBundle, DetectedModuleFailure, PreparedModuleAst,
-    UnpackResult, UnpackedModule,
+    deconflict_runtime_binding_renames, emit_module_with_positions, source_fallback_for_stmts,
+    spans_byte_ranges, BundleFormat, DetectedBundle, DetectedModuleFailure, MappedCode,
+    PreparedModuleAst, SourcePositions, UnpackResult, UnpackedModule,
 };
 use crate::utils::paren::strip_parens;
 use crate::utils::swc_safety::apply_fixer;
@@ -259,13 +260,16 @@ pub fn detect_and_extract(source: &str) -> Option<UnpackResult> {
     GLOBALS.set(&Default::default(), || {
         let cm: Lrc<SourceMap> = Default::default();
         let module = super::parse_es_module(source, "webpack5.js", cm.clone()).ok()?;
-        detect_from_module_prepared(&module, cm)?.materialize().ok()
+        detect_from_module_prepared(&module, cm, SourcePositions::Discard)?
+            .materialize()
+            .ok()
     })
 }
 
 pub(super) fn detect_from_module_prepared(
     module: &Module,
     cm: Lrc<SourceMap>,
+    positions: SourcePositions,
 ) -> Option<DetectedBundle> {
     let span = tracing::info_span!("webpack5: detect_from_module");
     let _enter = span.enter();
@@ -276,13 +280,13 @@ pub(super) fn detect_from_module_prepared(
         let Some(bootstrap_body) = extract_iife_body(expr) else {
             continue;
         };
-        if let Some(result) = extract_webpack5_modules(bootstrap_body, cm.clone()) {
+        if let Some(result) = extract_webpack5_modules(bootstrap_body, cm.clone(), positions) {
             return Some(result);
         }
     }
     // Fallback: `output.iife: false` and `experiments.outputModule` emit the
     // bootstrap statements at the top level instead of inside an IIFE.
-    detect_webpack5_top_level(module, cm)
+    detect_webpack5_top_level(module, cm, positions)
 }
 
 /// Detect an unwrapped webpack 5 bootstrap (no IIFE): the modules container,
@@ -295,7 +299,11 @@ pub(super) fn detect_from_module_prepared(
 /// pipeline does not yet do, so a bundle with any top-level `ModuleDecl` is
 /// left untouched rather than extracted into an entry that silently loses its
 /// exports.
-fn detect_webpack5_top_level(module: &Module, cm: Lrc<SourceMap>) -> Option<DetectedBundle> {
+fn detect_webpack5_top_level(
+    module: &Module,
+    cm: Lrc<SourceMap>,
+    positions: SourcePositions,
+) -> Option<DetectedBundle> {
     // This fallback runs for every input the IIFE scan rejects, so decide by
     // reference before cloning anything: bail on any top-level ModuleDecl and
     // find the modules container in the same pass.
@@ -333,7 +341,7 @@ fn detect_webpack5_top_level(module: &Module, cm: Lrc<SourceMap>) -> Option<Dete
         span: DUMMY_SP,
         stmts,
     };
-    extract_webpack5_modules_with_plan(&bootstrap_body, cm, Some(require_plan))
+    extract_webpack5_modules_with_plan(&bootstrap_body, cm, Some(require_plan), positions)
 }
 
 pub(super) fn detect_runtime_entry_from_module(
@@ -358,6 +366,8 @@ pub(super) fn detect_runtime_entry_from_module(
                     inspection_context_ranges: Vec::new(),
                     source_input: String::new(),
                     generated_source_map: Vec::new(),
+                    verbatim_source_offset: Some(0),
+                    mapped_in_every_mode: false,
                 }],
                 BundleFormat::Webpack5,
             ));
@@ -379,7 +389,7 @@ pub fn detect_and_extract_chunk(source: &str) -> Option<UnpackResult> {
 }
 
 pub(crate) fn detect_chunk_ids_from_module(module: &Module) -> HashSet<usize> {
-    let mut ids = HashSet::new();
+    let mut ids = HashSet::default();
     for item in &module.body {
         let ModuleItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = item else {
             continue;
@@ -400,9 +410,9 @@ pub(super) fn detect_chunk_from_module_prepared(
     let _enter = span.enter();
     let mut all_modules = Vec::new();
     let mut all_prepared = Vec::new();
-    let mut all_failures = HashMap::new();
-    let mut all_numeric_module_ids = HashMap::new();
-    let mut all_legacy_module_i = HashSet::new();
+    let mut all_failures = HashMap::default();
+    let mut all_numeric_module_ids = HashMap::default();
+    let mut all_legacy_module_i = HashSet::default();
 
     for item in &module.body {
         let ModuleItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = item else {
@@ -725,7 +735,7 @@ fn region_fn_candidates(stmts: &[Stmt]) -> Vec<RegionFnCandidate<'_>> {
                 let Some(body) = &fn_decl.function.body else {
                     continue;
                 };
-                let mut excluded: HashSet<Id> = HashSet::new();
+                let mut excluded: HashSet<Id> = HashSet::default();
                 for param in &fn_decl.function.params {
                     collect_pat_binding_ids(&param.pat, &mut excluded);
                 }
@@ -749,7 +759,7 @@ fn region_fn_candidates(stmts: &[Stmt]) -> Vec<RegionFnCandidate<'_>> {
                             let Some(body) = &fn_expr.function.body else {
                                 continue;
                             };
-                            let mut excluded: HashSet<Id> = HashSet::new();
+                            let mut excluded: HashSet<Id> = HashSet::default();
                             for param in &fn_expr.function.params {
                                 collect_pat_binding_ids(&param.pat, &mut excluded);
                             }
@@ -767,7 +777,7 @@ fn region_fn_candidates(stmts: &[Stmt]) -> Vec<RegionFnCandidate<'_>> {
                             let ArrowFunctionBody::FunctionBody(body) = &*arrow.body else {
                                 continue;
                             };
-                            let mut excluded: HashSet<Id> = HashSet::new();
+                            let mut excluded: HashSet<Id> = HashSet::default();
                             for pat in &arrow.params {
                                 collect_pat_binding_ids(pat, &mut excluded);
                             }
@@ -835,7 +845,7 @@ fn require_candidate_from_call(stmt_idx: usize, call: &CallExpr) -> Option<Regio
         return None;
     };
 
-    let mut excluded = HashSet::new();
+    let mut excluded = HashSet::default();
     let body = match strip_parens(callee) {
         Expr::Fn(fn_expr) => {
             for param in &fn_expr.function.params {
@@ -904,7 +914,7 @@ fn module_id_literal(expr: &Expr) -> Option<String> {
 /// into nested functions); assignment targets are checked against the body's
 /// own declared bindings.
 fn body_is_webpack_require(excluded: &HashSet<Id>, stmts: &[Stmt], table_id: &Id) -> bool {
-    let mut body_declared = HashSet::new();
+    let mut body_declared = HashSet::default();
     let mut collector = BodyVarCollector {
         ids: &mut body_declared,
     };
@@ -913,10 +923,10 @@ fn body_is_webpack_require(excluded: &HashSet<Id>, stmts: &[Stmt], table_id: &Id
         table_id,
         excluded,
         body_declared: &body_declared,
-        local_modules: HashMap::new(),
-        table_call_args: HashSet::new(),
-        returned_exports_objs: HashSet::new(),
-        factory_holders: HashMap::new(),
+        local_modules: HashMap::default(),
+        table_call_args: HashSet::default(),
+        returned_exports_objs: HashSet::default(),
+        factory_holders: HashMap::default(),
     };
     stmts.visit_with(&mut scanner);
     scanner.local_modules.iter().any(|(module, cache_index)| {
@@ -1424,7 +1434,7 @@ fn extract_commonjs_chunk_modules_from_assign(
 }
 
 fn extract_commonjs_chunk_ids(expr: &Expr) -> HashSet<usize> {
-    let mut ids = HashSet::new();
+    let mut ids = HashSet::default();
     match strip_parens(expr) {
         Expr::Assign(assign) => {
             collect_commonjs_chunk_ids_from_assign(assign, &mut ids);
@@ -1508,7 +1518,7 @@ fn prepare_webpack5_factories(
     let can_isolate_runtime_parameter_reuse = module_entries
         .iter()
         .all(|entry| entry.id.parse::<usize>().is_ok());
-    let mut opaque_filenames = HashSet::new();
+    let mut opaque_filenames = HashSet::default();
 
     loop {
         // Every round uses one immutable graph snapshot. Newly unsupported
@@ -1532,7 +1542,7 @@ fn prepare_webpack5_factories(
             .collect();
 
         let mut prepared = Vec::with_capacity(module_entries.len());
-        let mut newly_opaque = HashSet::new();
+        let mut newly_opaque = HashSet::default();
         for entry in module_entries {
             if opaque_filenames.contains(&entry.filename) {
                 prepared.push(None);
@@ -1604,6 +1614,8 @@ fn extract_modules_from_container(
             inspection_context_ranges: Vec::new(),
             source_input: String::new(),
             generated_source_map: Vec::new(),
+            verbatim_source_offset: None,
+            mapped_in_every_mode: false,
         });
     }
 
@@ -1621,8 +1633,9 @@ fn extract_modules_from_container(
 fn extract_webpack5_modules(
     bootstrap_body: &swc_core::ecma::ast::FunctionBody,
     cm: Lrc<SourceMap>,
+    positions: SourcePositions,
 ) -> Option<DetectedBundle> {
-    extract_webpack5_modules_with_plan(bootstrap_body, cm, None)
+    extract_webpack5_modules_with_plan(bootstrap_body, cm, None, positions)
 }
 
 /// `require_plan`, when the caller already gated the region, is reused for
@@ -1632,6 +1645,7 @@ fn extract_webpack5_modules_with_plan(
     bootstrap_body: &swc_core::ecma::ast::FunctionBody,
     cm: Lrc<SourceMap>,
     mut require_plan: Option<RequireFnPlan>,
+    positions: SourcePositions,
 ) -> Option<DetectedBundle> {
     let span = tracing::info_span!("webpack5: extract_modules");
     let _enter = span.enter();
@@ -1700,6 +1714,8 @@ fn extract_webpack5_modules_with_plan(
                 inspection_context_ranges: Vec::new(),
                 source_input: String::new(),
                 generated_source_map: Vec::new(),
+                verbatim_source_offset: None,
+                mapped_in_every_mode: false,
             });
         }
     }
@@ -1710,7 +1726,7 @@ fn extract_webpack5_modules_with_plan(
     };
     let trailing_entry_body = direct_entry_id
         .is_none()
-        .then(|| extract_trailing_entry_body(bootstrap_body))
+        .then(|| extract_trailing_entry_body(bootstrap_body, &modules_sym, require_plan.as_ref()))
         .flatten();
     // Check for a trailing IIFE entry point. A directly invoked require
     // lifecycle is runtime machinery; its call argument identifies the real
@@ -1730,6 +1746,7 @@ fn extract_webpack5_modules_with_plan(
             str_id_to_filename,
             require_sym,
             Some(Atom::from("__webpack_exports__")),
+            positions,
         );
         append_synthetic_entry(&mut modules, &mut prepared, entry_ranges, code)
     } else if let Some(entry) = extract_ncc_inline_entry(bootstrap_body) {
@@ -1741,6 +1758,7 @@ fn extract_webpack5_modules_with_plan(
             str_id_to_filename,
             entry.require_sym,
             None,
+            positions,
         );
         append_synthetic_entry(&mut modules, &mut prepared, entry_ranges, code)
     } else {
@@ -1772,6 +1790,7 @@ fn extract_webpack5_modules_with_plan(
                 str_id_to_filename,
                 startup.require_sym,
                 startup.exports_sym,
+                positions,
             );
             append_synthetic_entry(&mut modules, &mut prepared, entry_ranges, code);
         }
@@ -1800,9 +1819,13 @@ fn append_synthetic_entry(
     modules: &mut Vec<UnpackedModule>,
     prepared: &mut Vec<Option<PreparedModuleAst>>,
     source_ranges: Vec<(u32, u32)>,
-    code: Option<String>,
+    code: Option<MappedCode>,
 ) -> bool {
-    let Some(code) = code else {
+    let Some(MappedCode {
+        code,
+        points: generated_source_map,
+    }) = code
+    else {
         return false;
     };
     modules.push(UnpackedModule {
@@ -1813,7 +1836,9 @@ fn append_synthetic_entry(
         source_ranges,
         inspection_context_ranges: Vec::new(),
         source_input: String::new(),
-        generated_source_map: Vec::new(),
+        generated_source_map,
+        verbatim_source_offset: None,
+        mapped_in_every_mode: false,
     });
     prepared.push(None);
     true
@@ -1826,7 +1851,8 @@ fn emit_webpack5_entry_module(
     str_id_to_filename: &HashMap<String, String>,
     require_sym: Atom,
     exports_sym: Option<Atom>,
-) -> Option<String> {
+    positions: SourcePositions,
+) -> Option<MappedCode> {
     let (mut synthetic_module, _) = normalize_extracted_webpack_entry_module(
         body_stmts,
         id_to_filename,
@@ -1835,7 +1861,13 @@ fn emit_webpack5_entry_module(
         exports_sym,
     );
     apply_fixer(&mut synthetic_module).ok()?;
-    emit_module(&synthetic_module, cm).ok()
+    emit_module_with_positions(
+        &synthetic_module,
+        cm,
+        Config::default().with_minify(false),
+        positions,
+    )
+    .ok()
 }
 
 /// Normalize a webpack5 runtime entry body into a standalone module.
@@ -1898,14 +1930,49 @@ fn normalize_extracted_webpack_entry_module(
 
 fn extract_trailing_entry_body(
     bootstrap_body: &swc_core::ecma::ast::FunctionBody,
+    modules_sym: &Atom,
+    require_plan: Option<&RequireFnPlan>,
 ) -> Option<Vec<Stmt>> {
-    bootstrap_body
+    // Most production entries are already inline. Avoid resolving/cloning
+    // their bootstrap again when there is no removable trailing call.
+    let candidate = bootstrap_body
         .stmts
         .iter()
         .rev()
-        .find(|stmt| !matches!(stmt, Stmt::Return(_)))
-        .and_then(extract_iife_stmt_body)
-        .map(|body| body.stmts.clone())
+        .find(|stmt| !matches!(stmt, Stmt::Return(_)))?;
+    extract_iife_stmt_body(candidate)?;
+
+    // A final IIFE is only the entry wrapper when it owns the entire startup
+    // region. Terser can inline an authored main() after imports or other
+    // entry statements; extracting only that call body would discard them.
+    let (startup, require_sym) =
+        extract_webpack5_startup_region(bootstrap_body, modules_sym, require_plan)?;
+    let entry_stmt = match startup.as_slice() {
+        [stmt] => stmt,
+        [anchor, stmt]
+            if empty_object_anchor(anchor).is_some_and(|(binding, var)| {
+                var.decls.len() == 1
+                    && (!stmts_reference_ident(std::slice::from_ref(stmt), &binding)
+                        || (binding == "__webpack_exports__" && {
+                            // Check the body at the scope it will occupy after unwrapping.
+                            // The canonical spelling alone does not prove that the object
+                            // is used exclusively by webpack's export machinery.
+                            let Some(body) = extract_iife_stmt_body(stmt) else {
+                                return false;
+                            };
+                            let mut region = vec![anchor.clone()];
+                            region.extend(body.stmts.iter().cloned());
+                            let evidence =
+                                anchor_export_helper_evidence(&region, &require_sym, &binding);
+                            evidence.helper && !evidence.other_uses
+                        }))
+            }) =>
+        {
+            stmt
+        }
+        _ => return None,
+    };
+    extract_iife_stmt_body(entry_stmt).map(|body| body.stmts.clone())
 }
 
 struct NccInlineEntry {
@@ -1979,6 +2046,67 @@ fn extract_webpack5_inline_startup(
     modules_sym: &Atom,
     require_plan: Option<&RequireFnPlan>,
 ) -> Option<Webpack5InlineStartup> {
+    let (entry_region, require_sym) =
+        extract_webpack5_startup_region(bootstrap_body, modules_sym, require_plan)?;
+
+    // The anchor, when present, is the *first* statement of the startup section
+    // (webpack emits it immediately after the runtime). Position and `{}` shape
+    // are not enough to treat it as the exports object: when a minifier has
+    // dropped the real anchor, an ordinary entry local such as `const app = {}`
+    // is the first statement instead, and renaming it to `exports` (plus
+    // dropping its declaration) corrupts the entry.
+    let (body_stmts, exports_sym) = match empty_object_anchor(&entry_region[0]) {
+        Some((binding, var_decl)) => {
+            // The region with the empty-object declarator removed.
+            let mut without_anchor: Vec<Stmt> = Vec::new();
+            if var_decl.decls.len() > 1 {
+                let mut rest = var_decl.clone();
+                rest.decls.remove(0);
+                without_anchor.push(Stmt::Decl(swc_core::ecma::ast::Decl::Var(Box::new(rest))));
+            }
+            without_anchor.extend(entry_region[1..].iter().cloned());
+
+            let evidence = anchor_export_helper_evidence(&entry_region, &require_sym, &binding);
+            if evidence.helper && !evidence.other_uses {
+                // Real exports anchor (`require.r(binding)` / `require.d(binding,
+                // ...)`): drop the declaration and rename the binding to
+                // `exports` so the export helpers are recovered.
+                (without_anchor, Some(binding))
+            } else if !stmts_reference_ident(&without_anchor, &binding) {
+                // A dead `__webpack_exports__ = {}` (app entries with no
+                // exports): drop the inert declaration, but do not rename.
+                (without_anchor, None)
+            } else {
+                // An ordinary entry local that happens to be `{}` first, or a
+                // library anchor a wrapper tail still consumes (`module.exports
+                // = t`) — dropping its declaration would break that use: keep
+                // the whole region untouched.
+                (entry_region.clone(), None)
+            }
+        }
+        None => (entry_region.clone(), None),
+    };
+
+    // Require the recovered entry to actually call the require binding so a
+    // bundle with no startup does not synthesize a bogus entry.
+    if body_stmts.is_empty() || !stmts_call_require(&body_stmts, &require_sym) {
+        return None;
+    }
+    Some(Webpack5InlineStartup {
+        body_stmts,
+        require_sym,
+        exports_sym,
+    })
+}
+
+/// Recover the complete startup region before choosing whether a trailing
+/// wrapper can be removed. Both entry paths must agree on the runtime boundary,
+/// including entry expressions merged into the final runtime sequence.
+fn extract_webpack5_startup_region(
+    bootstrap_body: &swc_core::ecma::ast::FunctionBody,
+    modules_sym: &Atom,
+    require_plan: Option<&RequireFnPlan>,
+) -> Option<(Vec<Stmt>, Atom)> {
     // Reuse the lifecycle plan that gated detection. Keep the loose fallback
     // for callers that do not already carry a plan.
     let (require_idx, require_sym) = match require_plan {
@@ -2064,54 +2192,7 @@ fn extract_webpack5_inline_startup(
         return None;
     }
 
-    // The anchor, when present, is the *first* statement of the startup section
-    // (webpack emits it immediately after the runtime). Position and `{}` shape
-    // are not enough to treat it as the exports object: when a minifier has
-    // dropped the real anchor, an ordinary entry local such as `const app = {}`
-    // is the first statement instead, and renaming it to `exports` (plus
-    // dropping its declaration) corrupts the entry.
-    let (body_stmts, exports_sym) = match empty_object_anchor(&entry_region[0]) {
-        Some((binding, var_decl)) => {
-            // The region with the empty-object declarator removed.
-            let mut without_anchor: Vec<Stmt> = Vec::new();
-            if var_decl.decls.len() > 1 {
-                let mut rest = var_decl.clone();
-                rest.decls.remove(0);
-                without_anchor.push(Stmt::Decl(swc_core::ecma::ast::Decl::Var(Box::new(rest))));
-            }
-            without_anchor.extend(entry_region[1..].iter().cloned());
-
-            let evidence = anchor_export_helper_evidence(&entry_region, &require_sym, &binding);
-            if evidence.helper && !evidence.other_uses {
-                // Real exports anchor (`require.r(binding)` / `require.d(binding,
-                // ...)`): drop the declaration and rename the binding to
-                // `exports` so the export helpers are recovered.
-                (without_anchor, Some(binding))
-            } else if !stmts_reference_ident(&without_anchor, &binding) {
-                // A dead `__webpack_exports__ = {}` (app entries with no
-                // exports): drop the inert declaration, but do not rename.
-                (without_anchor, None)
-            } else {
-                // An ordinary entry local that happens to be `{}` first, or a
-                // library anchor a wrapper tail still consumes (`module.exports
-                // = t`) — dropping its declaration would break that use: keep
-                // the whole region untouched.
-                (entry_region.clone(), None)
-            }
-        }
-        None => (entry_region.clone(), None),
-    };
-
-    // Require the recovered entry to actually call the require binding so a
-    // bundle with no startup does not synthesize a bogus entry.
-    if body_stmts.is_empty() || !stmts_call_require(&body_stmts, &require_sym) {
-        return None;
-    }
-    Some(Webpack5InlineStartup {
-        body_stmts,
-        require_sym,
-        exports_sym,
-    })
+    Some((entry_region, require_sym))
 }
 
 /// If `stmt` begins with an empty-object declarator (`var x = {}` — webpack's
@@ -2380,7 +2461,7 @@ fn find_inline_runtime_boundary(
         .map(|idx| (idx, None))
         .or_else(|| find_first_executed_startup(stmts, scan_from, require_id));
 
-    if let Some((startup_stmt_idx, startup_seq_idx)) = first_startup {
+    let stmt_idx = if let Some((startup_stmt_idx, startup_seq_idx)) = first_startup {
         if let Some(startup_expr_idx) = startup_seq_idx {
             let Stmt::Expr(stmt) = &stmts[startup_stmt_idx] else {
                 unreachable!("sequence startup point must belong to an expression statement");
@@ -2398,21 +2479,20 @@ fn find_inline_runtime_boundary(
             }
         }
 
-        return stmts[scan_from..startup_stmt_idx]
+        stmts[scan_from..startup_stmt_idx]
             .iter()
             .rposition(|stmt| contains_runtime_require_assignment(stmt, require_id))
-            .map(|offset| RuntimeBoundary {
-                stmt_idx: scan_from + offset,
-                seq_expr_idx: None,
-            });
-    }
-
-    // No eagerly evaluated loader use was found. Retain the previous fallback
-    // for deferred startup shapes whose require call lives in a callback.
-    let stmt_idx = stmts[scan_from..]
-        .iter()
-        .rposition(|stmt| contains_runtime_require_assignment(stmt, require_id))
-        .map(|offset| scan_from + offset)?;
+            .map(|offset| scan_from + offset)?
+    } else {
+        // No eagerly evaluated loader use was found. Retain the previous
+        // fallback for deferred startup shapes whose require call lives in a callback.
+        stmts[scan_from..]
+            .iter()
+            .rposition(|stmt| contains_runtime_require_assignment(stmt, require_id))
+            .map(|offset| scan_from + offset)?
+    };
+    // Even when the first loader call is in a later statement, a runtime
+    // sequence can already end with entry effects: `r.o = ..., recordStartup()`.
     let seq_expr_idx = match &stmts[stmt_idx] {
         Stmt::Expr(stmt) => match strip_parens(&stmt.expr) {
             Expr::Seq(seq) => last_runtime_require_assign_in_exprs(&seq.exprs, require_id),
@@ -2431,7 +2511,7 @@ fn find_first_executed_startup(
     scan_from: usize,
     require_id: &Id,
 ) -> Option<(usize, Option<usize>)> {
-    let mut seen_runtime_paths = HashSet::new();
+    let mut seen_runtime_paths = HashSet::default();
     for (stmt_idx, stmt) in stmts.iter().enumerate().skip(scan_from) {
         if let Stmt::Expr(expr_stmt) = stmt {
             if let Expr::Seq(seq) = strip_parens(&expr_stmt.expr) {
@@ -2658,7 +2738,7 @@ fn static_member_property_name(prop: &MemberProp) -> Option<&str> {
 /// Stable property names assigned by webpack's built-in runtime modules.
 /// This is intentionally positive: an unknown property may be authored by the
 /// entry through webpack's public raw-require variable and must be preserved.
-fn is_webpack_runtime_property(property: &str) -> bool {
+pub(crate) fn is_webpack_runtime_property(property: &str) -> bool {
     matches!(
         property,
         "amdD"
@@ -2847,7 +2927,7 @@ fn is_webpack5_runtime_entry_body(body: &swc_core::ecma::ast::FunctionBody) -> b
 }
 
 fn has_runtime_property_assignments(body: &swc_core::ecma::ast::FunctionBody) -> bool {
-    let mut bits_by_object: HashMap<Atom, u8> = HashMap::new();
+    let mut bits_by_object: HashMap<Atom, u8> = HashMap::default();
     for stmt in &body.stmts {
         let Stmt::Expr(ExprStmt { expr, .. }) = stmt else {
             continue;
@@ -3390,34 +3470,37 @@ fn extract_iife_stmt_body(stmt: &Stmt) -> Option<&swc_core::ecma::ast::FunctionB
 }
 
 fn extract_iife_body(expr: &Expr) -> Option<&swc_core::ecma::ast::FunctionBody> {
-    match expr {
-        Expr::Call(call) => extract_callee_body(&call.callee),
-        Expr::Unary(unary) if matches!(unary.op, swc_core::ecma::ast::UnaryOp::Bang) => {
-            let Expr::Call(call) = &*unary.arg else {
+    let call = match strip_parens(expr) {
+        Expr::Call(call) => call,
+        Expr::Unary(unary) if unary.op == UnaryOp::Bang => {
+            let Expr::Call(call) = strip_parens(&unary.arg) else {
                 return None;
             };
-            extract_callee_body(&call.callee)
+            call
         }
-        _ => None,
+        _ => return None,
+    };
+    // Extraction removes the call itself. It must not discard argument
+    // evaluation or turn an async/generator invocation into module execution.
+    if !call.args.is_empty() {
+        return None;
     }
+    extract_callee_body(&call.callee)
 }
 
 fn extract_callee_body(callee: &Callee) -> Option<&swc_core::ecma::ast::FunctionBody> {
     let Callee::Expr(callee_expr) = callee else {
         return None;
     };
-    match &**callee_expr {
-        Expr::Fn(FnExpr { function, .. }) => function.body.as_ref(),
-        Expr::Arrow(arrow) => match &*arrow.body {
-            swc_core::ecma::ast::ArrowFunctionBody::FunctionBody(body) => Some(body),
-            _ => None,
-        },
-        Expr::Paren(paren) => match &*paren.expr {
-            Expr::Fn(FnExpr { function, .. }) => function.body.as_ref(),
-            Expr::Arrow(arrow) => match &*arrow.body {
-                swc_core::ecma::ast::ArrowFunctionBody::FunctionBody(body) => Some(body),
-                _ => None,
-            },
+    match strip_parens(callee_expr) {
+        Expr::Fn(FnExpr {
+            ident: None,
+            function,
+        }) if !function.is_async && !function.is_generator && function.params.is_empty() => {
+            function.body.as_ref()
+        }
+        Expr::Arrow(arrow) if !arrow.is_async && arrow.params.is_empty() => match &*arrow.body {
+            ArrowFunctionBody::FunctionBody(body) => Some(body),
             _ => None,
         },
         _ => None,
@@ -3615,10 +3698,6 @@ fn build_module_from_stmts(stmts: Vec<Stmt>) -> Module {
         body: stmts.into_iter().map(ModuleItem::Stmt).collect(),
         shebang: None,
     }
-}
-
-fn emit_module(module: &Module, cm: Lrc<SourceMap>) -> anyhow::Result<String> {
-    emit_module_with_source_map(module, cm).map(|(code, _)| code)
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 mod common;
 
-use common::{assert_eq_normalized, render_pipeline, render_rule};
+use common::{assert_eq_normalized, render_pipeline, render_rule, render_with_level};
 use wakaru_core::{rules::VarDeclToLetConst, RewriteLevel};
 
 fn apply_rule(input: &str) -> String {
@@ -1748,4 +1748,526 @@ function f() {
 "#;
     let output = apply_rule(input);
     assert_eq_normalized(&output, input);
+}
+
+// Capture/reference analysis must not depend on call syntax.
+#[test]
+fn early_function_value_uses_preserve_captured_vars() {
+    for invocation in [
+        "write.call(null)",
+        "write.apply(null, [])",
+        "write[method](null)",
+        "Reflect.apply(write, null, [])",
+        "consume(write)",
+        "const alias = write",
+    ] {
+        let input = format!("{invocation}; var value; function write() {{ value = 1; }}");
+        assert_eq_normalized(&apply_rule(&input), &input);
+    }
+}
+
+#[test]
+fn transitive_function_value_uses_preserve_captured_vars() {
+    let input =
+        "start(); var value; function start() { consume(write); } function write() { value = 1; }";
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn recursive_function_value_uses_preserve_captured_vars() {
+    let input = "start(); var value; function start() { write(); } function write() { if (again) start(); value = 1; }";
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn initialized_capture_still_modernizes_with_indirect_use() {
+    let input = "var value = 1; consume(read); function read() { return value; }";
+    let expected = "const value = 1; consume(read); function read() { return value; }";
+    assert_eq_normalized(&apply_rule(input), expected);
+}
+
+#[test]
+fn same_spelling_different_binding_does_not_block_capture() {
+    let input = "(function(read) { consume(read); })(other); var value = 1; function read() { return value; } consume(read);";
+    let expected = "(function(read) { consume(read); })(other); const value = 1; function read() { return value; } consume(read);";
+    assert_eq_normalized(&apply_rule(input), expected);
+}
+
+#[test]
+fn deferred_parameter_default_preserves_capture_before_initialization() {
+    let input = "read(); var value; function read(arg = value) { return arg; }";
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn nested_deferred_capture_in_initializer_stays_var() {
+    let input = "var value = consume(() => () => () => value);";
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn same_block_initialized_capture_still_modernizes() {
+    let input = "if (condition) { var value = 1; consume(() => value); }";
+    let expected = "if (condition) { const value = 1; consume(() => value); }";
+    assert_eq_normalized(&apply_rule(input), expected);
+}
+
+#[test]
+fn indirect_early_write_preserves_hoisting_at_every_level() {
+    let input = "hoge.call(this, []); var zzz, xxx; function hoge() { xxx = 'ok'; zzz = 'x'; }";
+    for level in [
+        RewriteLevel::Minimal,
+        RewriteLevel::Standard,
+        RewriteLevel::Aggressive,
+    ] {
+        assert_eq_normalized(&apply_rule_with_level(input, level), input);
+    }
+}
+
+#[test]
+fn block_function_reference_before_capture_declaration_stays_var() {
+    let input =
+        "if (condition) { consume(read); var value = 1; function read() { return value; } }";
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn block_function_reference_after_capture_declaration_modernizes() {
+    let input =
+        "if (condition) { var value = 1; consume(read); function read() { return value; } }";
+    let expected =
+        "if (condition) { const value = 1; consume(read); function read() { return value; } }";
+    assert_eq_normalized(&apply_rule(input), expected);
+}
+
+#[test]
+fn capture_initialization_does_not_flow_across_branches() {
+    let input = "if (condition) { var value = 1; } else { consume(() => value); }";
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn capture_in_later_declarator_can_use_completed_declaration() {
+    let input = "var value = 1, read = () => value; consume(read);";
+    let expected = "const value = 1, read = () => value; consume(read);";
+    assert_eq_normalized(&apply_rule(input), expected);
+}
+
+#[test]
+fn function_reference_in_pattern_default_preserves_capture() {
+    let input =
+        "var { result = read.call(null) } = source; var value; function read() { return value; }";
+    let expected =
+        "const { result = read.call(null) } = source; var value; function read() { return value; }";
+    assert_eq_normalized(&apply_rule(input), expected);
+}
+
+#[test]
+fn deeply_nested_callback_and_computed_key_preserve_capture() {
+    for expression in [
+        "consume(() => () => () => value)",
+        "consume({ [read()]: 1 })",
+        "consume(class { method() { return () => value; } })",
+    ] {
+        let input = format!("{expression}; var value; function read() {{ return value; }}");
+        assert_eq_normalized(&apply_rule(&input), &input);
+    }
+}
+
+#[test]
+fn safe_self_reference_through_nested_closure_still_modernizes() {
+    let input = "var read = () => () => read; consume(read);";
+    let expected = "const read = () => () => read; consume(read);";
+    assert_eq_normalized(&apply_rule(input), expected);
+}
+
+#[test]
+fn reference_graph_handles_dense_cycles_and_many_exposures() {
+    let mut input = String::new();
+    for _ in 0..32 {
+        input.push_str("consume(f0); ");
+    }
+    input.push_str("var value; ");
+    for i in 0..32 {
+        input.push_str(&format!("function f{i}() {{ "));
+        for j in 0..32 {
+            input.push_str(&format!("consume(f{j}); "));
+        }
+        if i == 31 {
+            input.push_str("value = 1; ");
+        }
+        input.push_str("} ");
+    }
+    assert_eq_normalized(&apply_rule(&input), &input);
+}
+
+#[test]
+fn deeply_nested_capture_reaches_outer_binding() {
+    let mut expression = String::from("value");
+    for _ in 0..64 {
+        expression = format!("() => {expression}");
+    }
+    let input = format!("consume({expression}); var value;");
+    assert_eq_normalized(&apply_rule(&input), &input);
+}
+
+#[test]
+fn export_specifiers_do_not_execute_local_functions() {
+    for export in [
+        "export { read };",
+        "export { read as default };",
+        "export { read as renamed };",
+    ] {
+        let input = format!("{export} var value = 42; function read() {{ return value; }}");
+        for level in [
+            RewriteLevel::Minimal,
+            RewriteLevel::Standard,
+            RewriteLevel::Aggressive,
+        ] {
+            assert_eq_normalized(
+                &apply_rule_with_level(&input, level),
+                &input.replace("var value", "const value"),
+            );
+        }
+    }
+}
+
+#[test]
+fn export_specifier_does_not_hide_an_early_local_call() {
+    let input =
+        "export { read }; read.call(null); var value = 42; function read() { return value; }";
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn default_export_identifier_does_not_execute_function_body() {
+    for expression in ["read", "(read)", "((read))"] {
+        let input = format!(
+            "export default {expression}; var value = 42; function read() {{ return value; }}"
+        );
+        for level in [
+            RewriteLevel::Minimal,
+            RewriteLevel::Standard,
+            RewriteLevel::Aggressive,
+        ] {
+            assert_eq_normalized(
+                &apply_rule_with_level(&input, level),
+                "export default read; const value = 42; function read() { return value; }",
+            );
+        }
+    }
+}
+
+#[test]
+fn default_export_identifier_does_not_execute_simple_class_body() {
+    for input in [
+        "class Reader { read() { return value; } } export default Reader; var value = 42;",
+        // Reading the class before initialization still throws; only captures defer.
+        "export default (Reader); var value = 42; class Reader { read() { return value; } }",
+    ] {
+        for level in [
+            RewriteLevel::Minimal,
+            RewriteLevel::Standard,
+            RewriteLevel::Aggressive,
+        ] {
+            assert_eq_normalized(
+                &apply_rule_with_level(input, level),
+                &input
+                    .replace("var value", "const value")
+                    .replace("(Reader)", "Reader"),
+            );
+        }
+    }
+}
+
+#[test]
+fn complex_default_exports_still_expose_function_captures() {
+    for expression in [
+        "read()",
+        "read.call(null)",
+        "{ read }",
+        "[read]",
+        "(() => read)",
+        "(0, read)",
+    ] {
+        let input = format!(
+            "export default {expression}; var value = 42; function read() {{ return value; }}"
+        );
+        assert_eq_normalized(&apply_rule(&input), &input);
+    }
+}
+
+#[test]
+fn default_export_identifier_does_not_hide_local_execution() {
+    let input =
+        "export default read; read.call(null); var value = 42; function read() { return value; }";
+    assert_eq_normalized(&apply_rule(input), input);
+    let eager_class = "class Reader { static read() { return value; } static { this.read(); } } export default Reader; var value = 42;";
+    assert_eq_normalized(&apply_rule(eager_class), eager_class);
+}
+
+#[test]
+fn default_export_still_reads_variable_binding_before_declaration() {
+    let input = "export default (value); var value = 42;";
+    assert_eq_normalized(&apply_rule(input), "export default value; var value = 42;");
+}
+
+#[test]
+fn pipeline_cjs_default_function_export_keeps_initialized_capture_lexical() {
+    let input = "exports.default = run; var LIMIT = 10; function run() { return LIMIT; }";
+    let expected = "export default run; const LIMIT = 10; function run() { return LIMIT; }";
+    assert_eq_normalized(&render_pipeline(input), expected);
+}
+
+#[test]
+fn property_stores_and_getters_preserve_early_capture() {
+    for exposure in [
+        "const api = {}; api.read = read; console.log(api.read());",
+        "const api = { set read(fn) { fn(); } }; api.read = read;",
+        "const api = {}; Object.defineProperty(api, 'read', { get: () => read }); api.read();",
+        // Accepted residual: a local exports alias is not proof of deferred use.
+        "const exportsAlias = {}; exportsAlias.read = read;",
+    ] {
+        let input = format!("{exposure} var value = 42; function read() {{ return value; }}");
+        for level in [
+            RewriteLevel::Minimal,
+            RewriteLevel::Standard,
+            RewriteLevel::Aggressive,
+        ] {
+            assert_eq_normalized(&apply_rule_with_level(&input, level), &input);
+        }
+    }
+}
+
+#[test]
+fn simple_class_captures_wait_for_a_value_reference() {
+    for body in [
+        "read() { return value; }",
+        "constructor(arg = value) { this.arg = arg; }",
+        "get read() { return value; }",
+        "static read() { return value; }",
+        "field = value;",
+        "#field = value; read() { return this.#field; }",
+        "#read() { return value; } read() { return this.#read(); }",
+        "read() { return () => ({ [value]: value }); }",
+    ] {
+        let input = format!("class Reader {{ {body} }} var value = 42; consume(Reader);");
+        assert_eq_normalized(
+            &apply_rule(&input),
+            &input.replace("var value", "const value"),
+        );
+    }
+}
+
+#[test]
+fn early_simple_class_references_preserve_captures() {
+    for reference in [
+        "new Reader()",
+        "Reader.read()",
+        "consume(Reader)",
+        "const alias = Reader",
+        "api.Reader = Reader",
+    ] {
+        let input = format!(
+            "class Reader {{ static read() {{ return value; }} }} {reference}; var value = 42;"
+        );
+        assert_eq_normalized(&apply_rule(&input), &input);
+    }
+}
+
+#[test]
+fn simple_class_and_function_summaries_connect_in_both_directions() {
+    for input in [
+        "class Reader { read() { return read(); } } consume(Reader); var value = 42; function read() { return value; }",
+        "consume(start); class Reader { read() { return value; } } var value = 42; function start() { return new Reader(); }",
+        "class Reader { read() { return read(); } } consume(Reader); var value = 42; function read() { if (again) consume(Reader); return value; }",
+    ] {
+        assert_eq_normalized(&apply_rule(input), input);
+    }
+}
+
+#[test]
+fn simple_class_order_proof_stays_within_its_block() {
+    let safe = "if (condition) { class Reader { read() { return value; } } var value = 42; consume(Reader); }";
+    assert_eq_normalized(&apply_rule(safe), &safe.replace("var value", "const value"));
+    for input in [
+        "class Reader { read() { return value; } } if (condition) { var value = 42; consume(Reader); } consume(Reader);",
+        "class Reader { read() { return value; } } if (condition) { var value = 42; } else { consume(Reader); }",
+        "for (var value = 0; value < 2; value++) { class Reader { read() { return value; } } consume(Reader); }",
+    ] {
+        assert_eq_normalized(&apply_rule(input), input);
+    }
+}
+
+#[test]
+fn simple_class_matching_uses_resolver_identity() {
+    let input = "class Reader { read() { return value; } } function consumeOther(Reader) { consume(Reader); } var value = 42; consume(Reader);";
+    assert_eq_normalized(
+        &apply_rule(input),
+        &input.replace("var value", "const value"),
+    );
+}
+
+#[test]
+fn class_eager_parts_keep_declaration_exposure() {
+    for class in [
+        "class Reader extends Base { read() { return value; } }",
+        "class Reader { [key]() { return value; } }",
+        "class Reader { [key] = value; }",
+        "class Reader { static field = value; }",
+        "class Reader { static field; read() { return value; } }",
+        "class Reader { static #field = value; }",
+        "class Reader { static read() { return value; } static { this.read(); } }",
+        "class Reader { static read() { return value; } static field = this.read(); }",
+    ] {
+        let input = format!("{class} var value = 42;");
+        assert_eq_normalized(&apply_rule(&input), &input);
+    }
+}
+
+#[test]
+fn class_expressions_still_expose_captures_at_creation() {
+    let input = "consume(class Reader { read() { return value; } }); var value = 42;";
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn named_default_class_uses_local_reference_boundary() {
+    let input =
+        "export default class Reader { read() { return value; } } var value = 42; consume(Reader);";
+    assert_eq_normalized(
+        &apply_rule(input),
+        &input.replace("var value", "const value"),
+    );
+    let early =
+        "export default class Reader { read() { return value; } } consume(Reader); var value = 42;";
+    assert_eq_normalized(&apply_rule(early), early);
+    let anonymous = "export default class { read() { return value; } } var value = 42;";
+    assert_eq_normalized(&apply_rule(anonymous), anonymous);
+}
+
+#[test]
+fn simple_exported_class_methods_wait_for_local_reference() {
+    let input = "export class Reader { read() { return value; } } var value = 42; consume(Reader);";
+    assert_eq_normalized(
+        &apply_rule(input),
+        &input.replace("var value", "const value"),
+    );
+}
+
+#[test]
+fn early_class_references_wait_for_class_initialization() {
+    let input = "consume(start); var value = 42; class Reader { read() { return value; } } function start() { return new Reader(); }";
+    assert_eq_normalized(
+        &apply_rule(input),
+        &input.replace("var value", "const value"),
+    );
+    let chained = "consume(start); class First { read() { return new Second().read(); } } var value = 42; class Second { read() { return value; } } function start() { return new First(); }";
+    assert_eq_normalized(
+        &apply_rule(chained),
+        &chained.replace("var value", "const value"),
+    );
+    let late = "consume(start); class First { read() { return new Second().read(); } } class Second { read() { if (again) return new First().read(); return value; } } var value = 42; function start() { return new First(); }";
+    assert_eq_normalized(&apply_rule(late), late);
+}
+
+// A cached object can expose a hoisted function before its captures initialize.
+// Check both the rule and the pipeline: an early property store must not become
+// a deferred link merely because the surrounding function resembles a loader.
+fn assert_cached_capture_remains_var(input: &str) {
+    for level in [
+        RewriteLevel::Minimal,
+        RewriteLevel::Standard,
+        RewriteLevel::Aggressive,
+    ] {
+        for output in [
+            apply_rule_with_level(input, level),
+            render_with_level(input, level),
+        ] {
+            assert!(output.contains("var value = 42;"), "{level:?}: {output}");
+        }
+    }
+}
+
+#[test]
+fn cached_object_aliases_and_setters_can_read_uninitialized_captures() {
+    for (setup, before_store, after_store) in [
+        ("", "var alias = out;", "console.log(alias.read());"),
+        (
+            "",
+            "Object.defineProperty(out, 'read', { set(fn) { console.log(fn()); } });",
+            "",
+        ),
+        (
+            "var saved; function save(object) { saved = object; } function invoke() { console.log(saved.read()); }",
+            "save(out);",
+            "invoke();",
+        ),
+        (
+            "",
+            "Object.setPrototypeOf(out, { set read(fn) { console.log(fn()); } });",
+            "",
+        ),
+    ] {
+        let input = format!(
+            r#"
+            {setup}
+            var cache;
+            function factory() {{
+                if (cache) return cache;
+                var out = {{}};
+                cache = out;
+                {before_store}
+                out.read = read;
+                {after_store}
+                var value = 42;
+                function read() {{ return value; }}
+                return out;
+            }}
+            factory();
+            "#
+        );
+        assert_cached_capture_remains_var(&input);
+    }
+}
+
+#[test]
+fn cached_object_reentry_can_read_uninitialized_captures() {
+    assert_cached_capture_remains_var(
+        r#"
+        var cache;
+        function factory(callback) {
+            if (cache) return cache;
+            var out = {};
+            cache = out;
+            out.read = read;
+            callback();
+            var value = 42;
+            function read() { return value; }
+            return out;
+        }
+        factory(() => console.log(factory().read()));
+        "#,
+    );
+}
+
+#[test]
+fn cached_object_survives_exception_before_capture_initialization() {
+    assert_cached_capture_remains_var(
+        r#"
+        var cache;
+        function factory() {
+            if (cache) return cache;
+            var out = {};
+            cache = out;
+            out.read = read;
+            JSON.parse("invalid");
+            var value = 42;
+            function read() { return value; }
+            return out;
+        }
+        try { factory(); } catch {}
+        console.log(factory().read());
+        "#,
+    );
 }

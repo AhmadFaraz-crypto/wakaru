@@ -625,3 +625,284 @@ class Foo extends Base {
 "#;
     assert_eq_normalized(&render(input), input.trim());
 }
+
+#[test]
+fn private_backing_map_lifetime_is_preserved() {
+    for (members, suffix) in [
+        ("", "new Foo(); _Foo_x = new WeakMap();"),
+        (
+            "",
+            "_Foo_x = new WeakMap(); var first = new Foo(); _Foo_x = new WeakMap();",
+        ),
+        ("static first = new Foo();", "_Foo_x = new WeakMap();"),
+        ("", "var first = new Foo(), _Foo_x = new WeakMap();"),
+        (
+            "",
+            "_Foo_x = new WeakMap(); use(new Foo()), _Foo_x = new WeakMap();",
+        ),
+    ] {
+        let input = format!(
+            "var _Foo_x; class Foo {{ constructor() {{ _Foo_x.set(this, 1); }} {members} }} {suffix}"
+        );
+        let output = common::render_rule(&input, |mark| {
+            wakaru_core::rules::UnClassFields::new_with_mark(
+                mark,
+                wakaru_core::rules::RewriteLevel::Standard,
+            )
+        });
+        assert!(!output.contains("#x"), "{output}");
+        assert!(output.contains("_Foo_x.set(this, 1)"), "{output}");
+    }
+}
+
+#[test]
+fn private_backing_map_allows_local_export_between_class_and_initializer() {
+    let input = "var _Foo_x; class Foo { constructor() { _Foo_x.set(this, 1); } } export { Foo }; _Foo_x = new WeakMap();";
+    let output = common::render_rule(input, |mark| {
+        wakaru_core::rules::UnClassFields::new_with_mark(
+            mark,
+            wakaru_core::rules::RewriteLevel::Standard,
+        )
+    });
+    assert!(output.contains("#x = 1"), "{output}");
+    assert!(!output.contains("WeakMap"), "{output}");
+}
+
+fn apply_class_fields(input: &str) -> String {
+    common::render_rule(input, |mark| {
+        wakaru_core::rules::UnClassFields::new_with_mark(
+            mark,
+            wakaru_core::rules::RewriteLevel::Standard,
+        )
+    })
+}
+
+#[test]
+fn tslib_private_fields_match_proven_helper_delivery() {
+    for (prefix, get, set) in [
+        ("var ts = require('tslib');", "ts.__classPrivateFieldGet", "ts.__classPrivateFieldSet"),
+        ("import * as ts from 'tslib';", "ts.__classPrivateFieldGet", "ts.__classPrivateFieldSet"),
+        ("import {__classPrivateFieldGet as g, __classPrivateFieldSet as s} from 'tslib';", "g", "s"),
+        ("var g = require('tslib').__classPrivateFieldGet, s = require('tslib').__classPrivateFieldSet;", "g", "s"),
+        ("", "require('tslib').__classPrivateFieldGet", "require('tslib').__classPrivateFieldSet"),
+        ("var g = this && this.__classPrivateFieldGet || function(receiver, state) { return state.get(receiver); }; var s = this && this.__classPrivateFieldSet || function(receiver, state, value) { return state.set(receiver, value); };", "g", "s"),
+    ] {
+        let input = format!("{prefix} var _Foo_x; class Foo {{ constructor() {{ _Foo_x.set(this, 1); }} getX() {{ return {get}(this, _Foo_x, 'f'); }} setX(value) {{ {set}(this, _Foo_x, value, 'f'); }} }} _Foo_x = new WeakMap();");
+        let output = apply_class_fields(&input);
+        assert!(output.contains("#x = 1"), "{output}");
+        assert!(output.contains("return this.#x"), "{output}");
+        assert!(output.contains("this.#x = value"), "{output}");
+        assert!(!output.contains("WeakMap"), "{output}");
+    }
+}
+
+#[test]
+fn tslib_private_fields_keep_unsupported_calls_and_helper_writes() {
+    for (prefix, params, call, suffix) in [
+        (
+            "var ts = require('custom');",
+            "",
+            "ts.__classPrivateFieldGet(this, _Foo_x, 'f')",
+            "",
+        ),
+        (
+            "var ts = require('tslib');",
+            "ts",
+            "ts.__classPrivateFieldGet(this, _Foo_x, 'f')",
+            "",
+        ),
+        (
+            "var ts = require('tslib');",
+            "other",
+            "ts.__classPrivateFieldGet(other, _Foo_x, 'f')",
+            "",
+        ),
+        (
+            "var ts = require('tslib');",
+            "",
+            "ts.__classPrivateFieldGet(this, _Foo_x, 'a')",
+            "",
+        ),
+        (
+            "var ts = require('tslib');",
+            "",
+            "ts.__classPrivateFieldGet(this, _Foo_x, ...['f'])",
+            "",
+        ),
+        (
+            "var ts = require('tslib');",
+            "",
+            "ts.__classPrivateFieldGet(this, _Foo_x, 'f')",
+            "ts = custom;",
+        ),
+        (
+            "var ts = require('tslib');",
+            "",
+            "ts.__classPrivateFieldGet(this, _Foo_x, 'f')",
+            "ts.__classPrivateFieldGet = custom;",
+        ),
+        (
+            "var g = require('tslib').__classPrivateFieldGet;",
+            "",
+            "g(this, _Foo_x, 'f')",
+            "g = custom;",
+        ),
+        (
+            "var ts = require('tslib');",
+            "",
+            "ts.__classPrivateFieldGet(this, _Foo_x, 'f')",
+            "use(_Foo_x);",
+        ),
+        (
+            "function require(name) { return custom; }",
+            "",
+            "require('tslib').__classPrivateFieldGet(this, _Foo_x, 'f')",
+            "",
+        ),
+    ] {
+        let input = format!("{prefix} var _Foo_x; class Foo {{ constructor() {{ _Foo_x.set(this, 1); }} getX({params}) {{ return {call}; }} }} _Foo_x = new WeakMap(); {suffix}");
+        let output = apply_class_fields(&input);
+        assert!(!output.contains("#x"), "{output}");
+        assert!(output.contains("_Foo_x.set(this, 1)"), "{output}");
+    }
+}
+
+fn private_owner_source(owner: &str, between: &str) -> String {
+    let body = "constructor() { _Foo_x.set(this, 1); } getX() { return get(this, _Foo_x, 'f'); }";
+    format!(
+        "var get = this && this.__classPrivateFieldGet || function(receiver, state) {{ return state.get(receiver); }}; var _Foo_x; {} {between} _Foo_x = new WeakMap();",
+        owner.replace("BODY", body)
+    )
+}
+
+#[test]
+fn private_map_owner_accepts_default_class_declarations() {
+    for owner in [
+        "export default class Foo { BODY }",
+        "export default class { BODY }",
+    ] {
+        let output = apply_class_fields(&private_owner_source(owner, ""));
+        assert!(output.contains("#x = 1"), "{output}");
+        assert!(output.contains("return this.#x"), "{output}");
+        assert!(!output.contains("WeakMap"), "{output}");
+    }
+}
+
+#[test]
+fn private_map_owner_allows_export_default_of_the_owner_binding() {
+    let output = apply_class_fields(&private_owner_source(
+        "class Foo { BODY }",
+        "export default Foo;",
+    ));
+    assert!(output.contains("#x = 1"), "{output}");
+    assert!(output.contains("export default Foo"), "{output}");
+    assert!(!output.contains("WeakMap"), "{output}");
+}
+
+#[test]
+fn private_map_owner_accepts_single_class_expression_declarators() {
+    for owner in [
+        "const Foo = class { BODY };",
+        "let Foo = class { BODY };",
+        "var Foo = class { BODY };",
+        "export const Foo = class { BODY };",
+        "const Foo = (class Inner { BODY });",
+    ] {
+        let output = apply_class_fields(&private_owner_source(owner, ""));
+        assert!(output.contains("#x = 1"), "{output}");
+        assert!(!output.contains("WeakMap"), "{output}");
+    }
+}
+
+#[test]
+fn private_map_owner_accepts_lowered_class_assignment_to_local_binding() {
+    let output = apply_class_fields(&private_owner_source(
+        "var Foo; Foo = class { BODY };",
+        "export default Foo;",
+    ));
+    assert!(output.contains("#x = 1"), "{output}");
+    assert!(!output.contains("WeakMap"), "{output}");
+}
+
+#[test]
+fn private_map_owner_keeps_definition_and_intervening_execution_boundaries() {
+    for (owner, between) in [
+        ("export default class Foo { BODY }", "new Foo();"),
+        (
+            "export default class Foo { BODY static first = new Foo(); }",
+            "",
+        ),
+        ("const Foo = class { BODY };", "new Foo();"),
+        ("const Foo = class { BODY }, instance = new Foo();", ""),
+        ("const Foo = class { BODY static { invoke(); } };", ""),
+        ("var Foo; Foo = class { BODY };", "new Foo();"),
+        ("Foo = class { BODY };", ""),
+        ("class Foo { BODY }", "export default external;"),
+        ("let other; class Foo { BODY }", "export default other;"),
+        ("class Foo { BODY }", "export default new Foo();"),
+        ("class Foo { BODY }", "_Foo_x = new WeakMap();"),
+    ] {
+        let output = apply_class_fields(&private_owner_source(owner, between));
+        assert!(!output.contains("#x"), "{output}");
+        assert!(output.contains("_Foo_x.set(this, 1)"), "{output}");
+    }
+}
+
+#[test]
+fn private_map_owner_recovers_real_tsc_default_and_expression_modules() {
+    for source in [
+        include_str!("fixtures/private-field-owners/default-esm.js"),
+        include_str!("fixtures/private-field-owners/default-cjs.js"),
+        include_str!("fixtures/private-field-owners/expression-esm.js"),
+        include_str!("fixtures/private-field-owners/expression-cjs.js"),
+    ] {
+        let output = render(source);
+        assert!(output.contains("#x = 1"), "{output}");
+        assert!(output.contains("return this.#x"), "{output}");
+        assert!(!output.contains("WeakMap"), "{output}");
+    }
+}
+
+#[test]
+fn keeps_init_methods_when_module_has_dynamic_scope() {
+    // Inlining `__init` bodies and dropping the method (and private WeakMap
+    // declarations) removes bindings; the module-wide dynamic-scope skip in
+    // docs/rewrite-assumptions.md applies.
+    for hazard in ["eval(code);", "with (scope) { observe(); }"] {
+        let input = format!(
+            r#"
+class Foo {{
+    __init() {{
+        this._count = 0;
+    }}
+    constructor() {{
+        Foo.prototype.__init.call(this);
+    }}
+}}
+{hazard}
+"#
+        );
+        let output = render(&input);
+        assert!(output.contains("__init()"), "{output}");
+    }
+}
+
+#[test]
+fn recovered_private_field_keeps_an_exported_helper() {
+    let input = r#"
+var get = this && this.__classPrivateFieldGet || function(receiver, state) {
+  return state.get(receiver);
+};
+var _Foo_x;
+class Foo {
+  constructor() { _Foo_x.set(this, 1); }
+  getX() { return get(this, _Foo_x, 'f'); }
+}
+_Foo_x = new WeakMap();
+export { get };
+"#;
+    let output = apply_class_fields(input);
+    assert!(output.contains("return this.#x"), "{output}");
+    assert!(output.contains("var get ="), "{output}");
+    assert!(output.contains("export { get }"), "{output}");
+}

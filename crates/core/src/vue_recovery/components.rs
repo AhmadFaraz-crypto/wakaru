@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 
@@ -48,7 +48,7 @@ pub(super) fn component_script_imports(
             .cloned(),
     );
 
-    let mut aliases = HashMap::new();
+    let mut aliases = HashMap::default();
     let mut imports = Vec::new();
     for (import_ref, tag) in refs {
         if aliases.contains_key(&import_ref) || !ctx.script_imports.contains_key(&import_ref) {
@@ -80,7 +80,7 @@ fn component_import_reserved_bindings(
     ref_declarations: &[(String, String, String)],
     selected_local_declarations: &[&VueSetupLocalBinding],
 ) -> HashSet<Atom> {
-    let mut reserved = HashSet::new();
+    let mut reserved = HashSet::default();
     if let Some((binding, _)) = props_declaration {
         reserved.insert(Atom::from(binding.clone()));
     }

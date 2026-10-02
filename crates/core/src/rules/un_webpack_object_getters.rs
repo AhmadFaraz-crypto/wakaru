@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::common::{Mark, DUMMY_SP};
 use swc_core::ecma::ast::{
@@ -76,8 +76,8 @@ fn plan_webpack_namespace_rewrites(
     items: &[ModuleItem],
     unresolved_mark: Mark,
 ) -> (HashMap<usize, ModuleItem>, HashSet<usize>) {
-    let mut replacements = HashMap::new();
-    let mut removed = HashSet::new();
+    let mut replacements = HashMap::default();
+    let mut removed = HashSet::default();
 
     for index in 0..items.len() {
         if removed.contains(&index) {
@@ -514,7 +514,7 @@ fn extract_require_d_map_getters_module_item(
     };
 
     let mut getters = Vec::with_capacity(getter_map.props.len());
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     for prop in &getter_map.props {
         let PropOrSpread::Prop(prop) = prop else {
             return None;

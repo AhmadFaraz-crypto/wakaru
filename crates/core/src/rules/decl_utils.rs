@@ -1,10 +1,11 @@
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use swc_core::atoms::Atom;
-use swc_core::common::{SyntaxContext, DUMMY_SP};
+use swc_core::common::{Mark, Span, SyntaxContext, DUMMY_SP};
 use swc_core::ecma::ast::{
-    BindingIdent, Decl, Expr, Function, FunctionBody, Id, Ident, Lit, MethodKind, ObjectLit, Param,
-    Pat, Prop, PropName, PropOrSpread, Stmt, VarDecl, VarDeclKind,
+    ArrowExpr, AssignTarget, BindingIdent, Decl, Expr, ForHead, Function, FunctionBody, Id, Ident,
+    Lit, MethodKind, ObjectLit, Param, Pat, Prop, PropName, PropOrSpread, Stmt, VarDecl,
+    VarDeclKind,
 };
 use swc_core::ecma::utils::find_pat_ids;
 use swc_core::ecma::visit::{Visit, VisitWith};
@@ -12,6 +13,14 @@ use swc_core::ecma::visit::{Visit, VisitWith};
 use crate::utils::paren::strip_parens;
 
 pub(crate) use crate::analysis::{binding_id, ident_matches_binding, BindingId};
+
+/// A binding identifier a rule introduces. It gets a context of its own so
+/// later rules see one binding, distinct from every authored or synthesized
+/// name that shares the spelling. Printed JavaScript has no context, so the
+/// caller still proves the emitted name is free at the insertion site.
+pub(crate) fn fresh_binding_ident(sym: Atom, span: Span) -> Ident {
+    Ident::new(sym, span, SyntaxContext::empty().apply_mark(Mark::new()))
+}
 
 pub fn same_ident(left: &Ident, right: &Ident) -> bool {
     left.sym == right.sym && left.ctxt == right.ctxt
@@ -53,7 +62,7 @@ pub(crate) fn contains_use_strict_string_statement(body: &FunctionBody) -> bool 
 /// Duplicates are only legal in a simple (all-identifier) parameter list, so
 /// checking `Pat::Ident` syms is exhaustive.
 pub fn has_duplicate_param_names(params: &[Param]) -> bool {
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     params.iter().any(
         |param| matches!(&param.pat, Pat::Ident(binding) if !seen.insert(binding.id.sym.clone())),
     )
@@ -71,7 +80,7 @@ pub(crate) fn ensure_setter_has_value_param(function: &mut Function) {
         span: DUMMY_SP,
         decorators: vec![],
         pat: Pat::Ident(BindingIdent {
-            id: Ident::new(name, DUMMY_SP, SyntaxContext::empty()),
+            id: fresh_binding_ident(name, DUMMY_SP),
             type_ann: None,
         }),
     });
@@ -110,7 +119,7 @@ pub(crate) enum ClassAccessorDescriptorAttributes {
 pub(crate) fn class_accessor_descriptor_attributes(
     descriptor: &ObjectLit,
 ) -> Option<ClassAccessorDescriptorAttributes> {
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     let mut has_accessor = false;
     let mut configurable = false;
     let mut enumerable = false;
@@ -188,7 +197,7 @@ fn dummy_setter_param_name(function: &Function) -> Atom {
         }
     }
 
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
     function.visit_with(&mut Collector { names: &mut names });
     for candidate in ["_", "_v", "_0", "_1", "_2"] {
         let atom: Atom = candidate.into();
@@ -338,10 +347,6 @@ pub(crate) fn remove_prior_uninitialized_decls_by<F>(
     stmts.retain(|stmt| !matches!(stmt, Stmt::Decl(Decl::Var(var)) if var.decls.is_empty()));
 }
 
-pub(crate) fn ident_is_used_in_stmts_excluding_bindings(target: &Ident, stmts: &[Stmt]) -> bool {
-    ident_is_used_in_stmts_excluding_bindings_by(target, stmts, same_ident)
-}
-
 pub(crate) fn ident_is_used_in_stmts_excluding_bindings_by<F>(
     target: &Ident,
     stmts: &[Stmt],
@@ -357,13 +362,57 @@ where
         target: &'a Ident,
         matches_ident: F,
         found: bool,
+        /// Inside an assignment target or `for (x in …)` head, where a
+        /// `BindingIdent` is a write to an existing binding, not a declaration.
+        in_write_target: bool,
+    }
+
+    impl<F> UseFinder<'_, F>
+    where
+        F: Fn(&Ident, &Ident) -> bool + Copy,
+    {
+        fn visit_write_target<N: VisitWith<Self>>(&mut self, node: &N) {
+            let previous = std::mem::replace(&mut self.in_write_target, true);
+            node.visit_children_with(self);
+            self.in_write_target = previous;
+        }
     }
 
     impl<F> Visit for UseFinder<'_, F>
     where
         F: Fn(&Ident, &Ident) -> bool + Copy,
     {
-        fn visit_binding_ident(&mut self, _: &BindingIdent) {}
+        // A declaration is not a use, but a write to the binding still needs
+        // the declaration: `n = e` with `let n` removed is an undeclared
+        // assignment.
+        fn visit_binding_ident(&mut self, binding: &BindingIdent) {
+            if self.in_write_target && (self.matches_ident)(&binding.id, self.target) {
+                self.found = true;
+            }
+        }
+
+        fn visit_assign_target(&mut self, target: &AssignTarget) {
+            self.visit_write_target(target);
+        }
+
+        fn visit_for_head(&mut self, head: &ForHead) {
+            match head {
+                ForHead::Pat(_) => self.visit_write_target(head),
+                _ => head.visit_children_with(self),
+            }
+        }
+
+        fn visit_function(&mut self, function: &Function) {
+            let previous = std::mem::replace(&mut self.in_write_target, false);
+            function.visit_children_with(self);
+            self.in_write_target = previous;
+        }
+
+        fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+            let previous = std::mem::replace(&mut self.in_write_target, false);
+            arrow.visit_children_with(self);
+            self.in_write_target = previous;
+        }
 
         fn visit_ident(&mut self, ident: &Ident) {
             if (self.matches_ident)(ident, self.target) {
@@ -375,6 +424,7 @@ where
     let mut finder = UseFinder {
         target,
         matches_ident,
+        in_write_target: false,
         found: false,
     };
     for stmt in stmts {
@@ -407,4 +457,22 @@ where
                 && matches!(&decl.name, Pat::Ident(binding) if matches_ident(&binding.id, target))
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use swc_core::common::{Globals, GLOBALS};
+
+    use super::*;
+
+    #[test]
+    fn fresh_binding_ident_has_its_own_non_root_context() {
+        GLOBALS.set(&Globals::new(), || {
+            let first = fresh_binding_ident("tmp".into(), DUMMY_SP);
+            let second = fresh_binding_ident("tmp".into(), DUMMY_SP);
+            assert_eq!(first.sym, second.sym);
+            assert_ne!(first.ctxt, SyntaxContext::empty());
+            assert_ne!(first.ctxt, second.ctxt);
+        });
+    }
 }

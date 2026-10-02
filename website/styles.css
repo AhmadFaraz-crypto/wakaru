@@ -180,6 +180,11 @@ code {
   overflow: hidden;
 }
 
+.demo:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
 .demo-head {
   display: flex;
   align-items: center;
@@ -526,6 +531,10 @@ code {
 #faq .pipeline {
   margin: 0 0 20px 27px;
   max-width: calc(100% - 27px);
+}
+#faq details p.faq-more {
+  margin-top: -10px;
+  font-size: 14px;
 }
 
 /* closing cta */

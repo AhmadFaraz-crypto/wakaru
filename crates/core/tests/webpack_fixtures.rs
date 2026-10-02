@@ -355,6 +355,64 @@ fn wp5_inner_umd_commonjs_branches_recover_defaults() {
     assert_inner_umd_defaults("wp5-inner-umd-min/bundle.js");
 }
 
+#[test]
+fn wp5_variable_factory_call_recovers_the_default() {
+    let path = "wp5-variable-factory-min/bundle.js";
+    let raw = unpack_raw(
+        &fixture(path),
+        &DecompileOptions {
+            filename: path.into(),
+            ..Default::default()
+        },
+    )
+    .expect("generated factory should unpack");
+    assert!(raw
+        .modules
+        .iter()
+        .any(|(_, code)| code.contains(".call(exports, require, exports, module)")));
+    for maps in [false, true] {
+        let pairs = unpack_fixture_with_options(path, maps);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(validate_output_modules(&pairs), vec![]);
+        assert_eq!(
+            pairs
+                .iter()
+                .filter(|(_, code)| code.contains("export default"))
+                .count(),
+            2
+        );
+        assert!(pairs
+            .iter()
+            .all(|(_, code)| !code.contains("module.exports")));
+    }
+}
+
+#[test]
+fn wp5_amd_return_factories_preserve_both_export_paths() {
+    let path = "wp5-amd-return-min/bundle.js";
+    let raw = unpack_raw(&fixture(path), &DecompileOptions::default()).unwrap();
+    assert!(raw
+        .modules
+        .iter()
+        .any(|(_, code)| code.contains(".apply(exports, [])")));
+    assert!(raw
+        .modules
+        .iter()
+        .any(|(_, code)| code.contains(".call(exports, require, exports, module)")));
+    for maps in [false, true] {
+        let pairs = unpack_fixture_with_options(path, maps);
+        assert_eq!(pairs.len(), 4);
+        assert_eq!(validate_output_modules(&pairs), vec![]);
+        assert_eq!(
+            pairs
+                .iter()
+                .filter(|(_, code)| code.contains("export default"))
+                .count(),
+            4
+        );
+    }
+}
+
 fn assert_inner_umd_defaults(path: &str) {
     let source = fixture(path);
     let raw = unpack_raw(
@@ -764,4 +822,52 @@ fn wp5_umd_min_entry_is_a_valid_module() {
         "no top-level return may survive in entry.js, got:\n{}",
         entry.1
     );
+}
+
+#[test]
+fn wp5_trailing_user_iife_keeps_entry_dependencies_and_async_boundary() {
+    // webpack 5.101.3 production output: Terser inlines main() into a
+    // trailing async IIFE after three entry-scope require declarations.
+    let source = fixture("wp5-trailing-iife-min/bundle.js");
+    let raw = unpack_raw(&source, &DecompileOptions::default())
+        .expect("generated webpack bundle should unpack");
+    let raw_entry = &raw
+        .modules
+        .iter()
+        .find(|(name, _)| name == "entry.js")
+        .expect("entry")
+        .1;
+    for dependency in ["module-891.js", "module-878.js", "module-783.js"] {
+        assert!(
+            raw_entry.contains(dependency),
+            "lost entry dependency {dependency}: {}",
+            raw_entry
+        );
+    }
+    assert!(
+        raw_entry.contains("async"),
+        "async invocation must survive raw extraction: {}",
+        raw_entry
+    );
+    for source_map in [false, true] {
+        let pairs = unpack_fixture_with_options("wp5-trailing-iife-min/bundle.js", source_map);
+        assert_eq!(pairs.len(), 4);
+        let entry = &pairs
+            .iter()
+            .find(|(name, _)| name == "entry.js")
+            .expect("entry")
+            .1;
+        for dependency in ["module-891.js", "module-878.js", "module-783.js"] {
+            assert!(
+                entry.contains(dependency),
+                "lost entry dependency {dependency}: {entry}"
+            );
+        }
+        assert!(
+            entry.contains("async"),
+            "fire-and-forget call must not become top-level await: {entry}"
+        );
+        assert!(entry.contains("document.body.innerHTML"), "{entry}");
+        assert_eq!(validate_output_modules(&pairs), vec![]);
+    }
 }

@@ -39,6 +39,7 @@
   <div class="container nav-inner">
     <a href="/" class="brand"><img src="/public/icon.svg" class="brand-icon" width="24" height="24" alt="" aria-hidden="true">wakaru</a>
     <div class="nav-links">
+      <a href="/docs/">Docs</a>
       <a href="/playground/">Playground</a>
       <a href="https://github.com/pionxzh/wakaru" class="nav-github" aria-label="GitHub">
         <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -69,7 +70,7 @@
       </div>
 
       <!-- Animated demo pane -->
-      <figure class="demo" id="demo">
+      <figure class="demo" id="demo" tabindex="0" aria-label="Pipeline demo — use arrow keys to step">
         <div class="demo-head">
           <span class="demo-cmd"><span class="cmd-prompt">$</span> npx wakaru profile.min.js -o profile.js</span>
           <span class="demo-tag">step through the pipeline</span>
@@ -132,8 +133,8 @@
           <span class="stat-src">&rarr; test262-stats.json</span>
         </a>
         <a class="stat" href="https://github.com/pionxzh/wakaru/blob/main/scripts/repro/stats.json">
-          <span class="stat-value">97.4%</span>
-          <span class="stat-label">pattern recovery across 1,858 transpiler/minifier test shapes</span>
+          <span class="stat-value">93.9%</span>
+          <span class="stat-label">pattern recovery across 2,606 transpiler/minifier test shapes</span>
           <span class="stat-src">&rarr; scripts/repro/stats.json</span>
         </a>
         <a class="stat" href="https://github.com/pionxzh/wakaru#tested-like-a-compiler">
@@ -261,6 +262,7 @@
         <p>A formatter only changes whitespace and layout. Wakaru rewrites the JavaScript AST to
            reverse minifier artifacts, restore transpiled syntax, remove bundler runtime patterns,
            and split bundles back into modules.</p>
+        <p class="faq-more"><a href="/docs/what-is-wakaru">Docs: What is Wakaru</a></p>
       </details>
       <details>
         <summary>How do I unminify JavaScript?</summary>
@@ -268,6 +270,7 @@
            <a href="/playground/">playground</a>. Wakaru reverses minifier artifacts (sequence
            expressions, <code>!0</code>/<code>void 0</code> literal tricks, flipped comparisons) and
            transpiler helpers (Babel, TypeScript, SWC) to recover readable modern JavaScript.</p>
+        <p class="faq-more"><a href="/docs/guides/unminify-a-file">Docs: Unminify a file</a></p>
       </details>
       <details>
         <summary>How do I decompile a webpack bundle and extract its modules?</summary>
@@ -275,6 +278,8 @@
            esbuild, Bun, Metro, Browserify and Cocos Creator 2.x, Closure ModuleManager, SystemJS,
            AMD/UMD, and scope-hoisted Rollup/Vite output, plus Bun single-file executables, then
            splits the bundle into individual modules and decompiles each one.</p>
+        <p class="faq-more"><a href="/docs/guides/unminify-a-webpack-bundle">Docs: Unminify a webpack bundle</a>
+           &middot; <a href="/docs/guides/unpack-a-bundle">Unpack a bundle</a></p>
       </details>
       <details>
         <summary>Can Wakaru extract JavaScript from a Bun single-file executable?</summary>
@@ -283,6 +288,7 @@
            embedded module graph and decompiles the JavaScript entries without ever executing the
            binary. <code>npx wakaru bun extract ./compiled-app -o extracted/</code> dumps every
            embedded file, assets included.</p>
+        <p class="faq-more"><a href="/docs/guides/bun-single-file-executable">Docs: Bun single-file executable</a></p>
       </details>
       <details>
         <summary>Can Wakaru deobfuscate JavaScript?</summary>
@@ -294,6 +300,7 @@
 <span class="cmd-prompt">$</span> npx webcrack --no-unpack --no-unminify obfuscated.js &gt; deobfuscated.js
 <span class="tok-com"># 2. recover readable modules</span>
 <span class="cmd-prompt">$</span> npx wakaru deobfuscated.js --unpack -o out/</code></pre>
+        <p class="faq-more"><a href="/docs/guides/obfuscated-code">Docs: Obfuscated code</a></p>
       </details>
       <details>
         <summary>Can Wakaru tell me which npm packages a bundle uses?</summary>
@@ -309,19 +316,22 @@
            imports. Without one, it applies conservative renaming heuristics where the code gives
            evidence, but most mangled names stay short. Pair it with an LLM renamer like
            <a href="https://github.com/jehna/humanify">humanify</a> if you want guessed names.</p>
+        <p class="faq-more"><a href="/docs/guides/source-maps">Docs: Source maps</a></p>
       </details>
       <details>
         <summary>Is the output guaranteed to behave the same?</summary>
         <p>Wakaru is designed to preserve behavior while recovering readable structure. Its
-           <a href="https://github.com/pionxzh/wakaru/blob/main/docs/rewrite-assumptions.md">three rewrite levels</a>
+           <a href="/docs/guides/rewrite-levels">three rewrite levels</a>
            let you choose between behavioral fidelity and stronger readability-oriented recovery;
            use <code>minimal</code> when fidelity matters most. Semantic preservation is continuously
            measured with the Test262 round-trip harness.</p>
+        <p class="faq-more"><a href="/docs/project/correctness">Docs: Correctness</a></p>
       </details>
       <details>
         <summary>Does it run in the browser?</summary>
         <p>Yes — the <a href="/playground/">playground</a> is the WebAssembly build of the same
            Rust engine, running entirely in your browser. No code leaves your machine.</p>
+        <p class="faq-more"><a href="/docs/guides/playground">Docs: Playground</a></p>
       </details>
     </div>
   </section>
@@ -345,6 +355,7 @@
 <footer>
   <div class="container footer-inner">
     <div class="footer-links">
+      <a href="/docs/">Docs</a>
       <a href="/playground/">Playground</a>
       <a href="https://github.com/pionxzh/wakaru">GitHub</a>
       <a href="https://t.me/wakarujs">Telegram</a>

@@ -1,13 +1,12 @@
 #!/usr/bin/env node
 
+import { runNodeBatchSync } from "../lib/tool-process.mjs";
+
 import {
   runMatrix, batchRunner, withTerserVariants,
   babelPresetEnvBatch, ensureNodeTool, readOption, standardLowerers,
 } from "../lib/runner.mjs";
 import { mangleValidator } from "../lib/compare.mjs";
-import { join } from "node:path";
-import { writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 
 const snippets = [
   {
@@ -140,11 +139,11 @@ const babelProfiles = [
     modes: ["spec", "noDocumentAll", "loose"],
   },
   {
-    name: "babel-8-rc",
-    core: "8.0.0-rc.5",
-    optionalPlugin: ["@babel/plugin-transform-optional-chaining", "8.0.0-rc.5"],
-    nullishPlugin: ["@babel/plugin-transform-nullish-coalescing-operator", "8.0.0-rc.5"],
-    logicalAssignmentPlugin: ["@babel/plugin-transform-logical-assignment-operators", "8.0.0-rc.5"],
+    name: "babel-8",
+    core: "8.0.6",
+    optionalPlugin: ["@babel/plugin-transform-optional-chaining", "8.0.5"],
+    nullishPlugin: ["@babel/plugin-transform-nullish-coalescing-operator", "8.0.1"],
+    logicalAssignmentPlugin: ["@babel/plugin-transform-logical-assignment-operators", "8.0.1"],
     modes: ["spec", "noDocumentAll", "loose"],
   },
 ];
@@ -174,10 +173,7 @@ function babelOptionalNullishBatch(sources, profile, options) {
   ];
   const toolKey = `babel-${profile.core}-optional-nullish-logical-assignment`;
   const toolDir = ensureNodeTool(toolKey, packages);
-  const helper = join(toolDir, "babel-optional-nullish-batch.mjs");
-  writeFileSync(
-    helper,
-    `
+  const helperSource = `
 import fs from "node:fs";
 const babelModule = await import("@babel/core");
 const optionalModule = await import(${JSON.stringify(optionalName)});
@@ -206,23 +202,12 @@ const results = sources.map(source => {
   } catch (e) { return { error: e.message }; }
 });
 process.stdout.write(JSON.stringify(results));
-`,
-  );
-  const result = spawnSync("node", [helper], {
+`;
+  return runNodeBatchSync(helperSource, sources, {
+    label: "babel-optional-nullish-batch.mjs",
     cwd: toolDir,
-    input: JSON.stringify(sources),
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024 * 50,
-    env: { ...process.env, MATRIX_BABEL_OPTIONS: JSON.stringify(options) },
+    env: { MATRIX_BABEL_OPTIONS: JSON.stringify(options) },
   });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`babel batch exited ${result.status}: ${result.stderr}`);
-  const outputs = JSON.parse(result.stdout);
-  const map = new Map();
-  for (let i = 0; i < sources.length; i++) {
-    map.set(sources[i], outputs[i].error ? new Error(outputs[i].error) : outputs[i].code);
-  }
-  return map;
 }
 
 const allSources = snippets.map((s) => s.source);

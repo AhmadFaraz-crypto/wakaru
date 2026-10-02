@@ -1,15 +1,15 @@
+use crate::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::common::{Mark, SyntaxContext};
 use swc_core::ecma::ast::{
-    ArrowExpr, AssignPat, BlockStmt, CatchClause, Class, ClassDecl, ClassExpr, Decl, DefaultDecl,
-    ExportNamedSpecifier, Expr, FnDecl, FnExpr, Function, Ident, ImportDecl, ImportNamedSpecifier,
-    ImportSpecifier, JSXElementName, KeyValuePatProp, KeyValueProp, MemberProp, Module, ModuleDecl,
-    ModuleExportName, ModuleItem, ObjectPatProp, Pat, Prop, PropName, Stmt, VarDecl, VarDeclKind,
-    VarDeclarator,
+    ArrowExpr, AssignPat, BindingIdent, BlockStmt, CatchClause, Class, ClassDecl, ClassExpr, Decl,
+    DefaultDecl, ExportNamedSpecifier, Expr, FnDecl, FnExpr, Function, Ident, ImportDecl,
+    ImportNamedSpecifier, ImportSpecifier, JSXElementName, KeyValuePatProp, KeyValueProp,
+    MemberProp, Module, ModuleDecl, ModuleExportName, ModuleItem, ObjectPatProp, Pat, Prop,
+    PropName, Stmt, VarDecl, VarDeclKind, VarDeclarator,
 };
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
@@ -46,17 +46,18 @@ pub(crate) fn collect_jsx_tag_bindings(module: &Module) -> HashSet<BindingId> {
         }
     }
     let mut collector = TagCollector {
-        bindings: HashSet::new(),
+        bindings: HashSet::default(),
     };
     module.visit_with(&mut collector);
     collector.bindings
 }
 
-/// Names used by unresolved expression references in this module.
+/// Names used by unresolved identifier references in this module.
 ///
 /// A transform that introduces a module-scoped binding with one of these
 /// names would capture the reference even though their syntax contexts differ
-/// before the transform.
+/// before the transform. Visit identifiers directly so write targets and JSX
+/// element names are covered as well as value-position expressions.
 pub(crate) fn collect_unresolved_reference_names(
     module: &Module,
     unresolved_mark: Mark,
@@ -67,19 +68,87 @@ pub(crate) fn collect_unresolved_reference_names(
     }
 
     impl Visit for Collector {
-        fn visit_expr(&mut self, expr: &Expr) {
-            if let Expr::Ident(ident) = expr {
-                if ident.ctxt.outer() == self.unresolved_mark {
-                    self.names.insert(ident.sym.clone());
-                }
+        fn visit_ident(&mut self, ident: &Ident) {
+            if ident.ctxt.outer() == self.unresolved_mark {
+                self.names.insert(ident.sym.clone());
             }
-            expr.visit_children_with(self);
+        }
+
+        fn visit_jsx_element_name(&mut self, name: &swc_core::ecma::ast::JSXElementName) {
+            // A lowercase element name is an intrinsic tag string, not a
+            // reference, even though the resolver stamps it with the
+            // unresolved mark.
+            match name {
+                swc_core::ecma::ast::JSXElementName::Ident(ident)
+                    if starts_with_lowercase(&ident.sym) => {}
+                _ => name.visit_children_with(self),
+            }
         }
     }
 
     let mut collector = Collector {
         unresolved_mark,
-        names: HashSet::new(),
+        names: HashSet::default(),
+    };
+    module.visit_with(&mut collector);
+    collector.names
+}
+
+/// Like [`collect_unresolved_reference_names`], but only names that are real
+/// free references. The resolver visits export specifiers with
+/// `IdentType::Ref`, so the *exported* half of `export { o as compute }` and
+/// the name in `export * as ns` carry the unresolved mark without referencing
+/// anything; a caller deciding whether a name is safe to introduce as a binding
+/// must not treat those as occupied.
+pub(crate) fn collect_free_reference_names(
+    module: &Module,
+    unresolved_mark: Mark,
+) -> HashSet<Atom> {
+    struct Collector {
+        unresolved_mark: Mark,
+        names: HashSet<Atom>,
+    }
+
+    impl Visit for Collector {
+        fn visit_ident(&mut self, ident: &Ident) {
+            if ident.ctxt.outer() == self.unresolved_mark {
+                self.names.insert(ident.sym.clone());
+            }
+        }
+
+        fn visit_jsx_element_name(&mut self, name: &swc_core::ecma::ast::JSXElementName) {
+            // A lowercase element name is an intrinsic tag string, not a
+            // reference, even though the resolver stamps it with the
+            // unresolved mark.
+            match name {
+                swc_core::ecma::ast::JSXElementName::Ident(ident)
+                    if starts_with_lowercase(&ident.sym) => {}
+                _ => name.visit_children_with(self),
+            }
+        }
+
+        fn visit_export_named_specifier(&mut self, spec: &ExportNamedSpecifier) {
+            if let ModuleExportName::Ident(orig) = &spec.orig {
+                self.visit_ident(orig);
+            }
+        }
+
+        fn visit_export_namespace_specifier(
+            &mut self,
+            _: &swc_core::ecma::ast::ExportNamespaceSpecifier,
+        ) {
+        }
+
+        fn visit_export_default_specifier(
+            &mut self,
+            _: &swc_core::ecma::ast::ExportDefaultSpecifier,
+        ) {
+        }
+    }
+
+    let mut collector = Collector {
+        unresolved_mark,
+        names: HashSet::default(),
     };
     module.visit_with(&mut collector);
     collector.names
@@ -101,7 +170,7 @@ pub(crate) fn collect_exported_binding_ids(module: &Module) -> HashSet<BindingId
 }
 
 pub(crate) fn collect_exported_binding_ids_from_items(items: &[ModuleItem]) -> HashSet<BindingId> {
-    let mut bindings = HashSet::new();
+    let mut bindings = HashSet::default();
 
     for item in items {
         if let ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) = item {
@@ -171,7 +240,7 @@ impl RenameShadowIndex {
             fn push_scope(&mut self, declared_names: HashSet<Atom>) {
                 self.scope_stack.push(ScopeFrame {
                     declared_names,
-                    referenced_bindings: HashSet::new(),
+                    referenced_bindings: HashSet::default(),
                 });
             }
 
@@ -194,7 +263,7 @@ impl RenameShadowIndex {
             }
 
             fn collect_param_names(params: &[swc_core::ecma::ast::Param]) -> HashSet<Atom> {
-                let mut names = HashSet::new();
+                let mut names = HashSet::default();
                 for param in params {
                     collect_pat_names(&param.pat, &mut names);
                 }
@@ -202,7 +271,7 @@ impl RenameShadowIndex {
             }
 
             fn collect_arrow_param_names(params: &[Pat]) -> HashSet<Atom> {
-                let mut names = HashSet::new();
+                let mut names = HashSet::default();
                 for param in params {
                     collect_pat_names(param, &mut names);
                 }
@@ -264,13 +333,13 @@ impl RenameShadowIndex {
             }
 
             fn visit_block_stmt(&mut self, block: &BlockStmt) {
-                self.push_scope(HashSet::new());
+                self.push_scope(HashSet::default());
                 block.visit_children_with(self);
                 self.pop_scope();
             }
 
             fn visit_catch_clause(&mut self, catch: &CatchClause) {
-                let mut declared_names = HashSet::new();
+                let mut declared_names = HashSet::default();
                 if let Some(param) = &catch.param {
                     collect_pat_names(param, &mut declared_names);
                 }
@@ -279,7 +348,11 @@ impl RenameShadowIndex {
                 self.pop_scope();
             }
 
-            fn visit_prop_name(&mut self, _: &PropName) {}
+            fn visit_prop_name(&mut self, prop: &PropName) {
+                if let PropName::Computed(computed) = prop {
+                    computed.visit_with(self);
+                }
+            }
 
             fn visit_member_prop(&mut self, prop: &MemberProp) {
                 if let MemberProp::Computed(computed) = prop {
@@ -297,7 +370,7 @@ impl RenameShadowIndex {
             scope_stack: Vec::new(),
             index: Self {
                 indexed_bindings: bindings.clone(),
-                forbidden_names_by_binding: HashMap::new(),
+                forbidden_names_by_binding: HashMap::default(),
             },
         };
         module.visit_with(&mut builder);
@@ -327,8 +400,72 @@ impl RenameShadowIndex {
     }
 }
 
+/// Whether any scope in the module declares a binding spelled `name`: a
+/// variable, parameter, or catch pattern, a function or class name (declared
+/// or as a named expression), or an import local. Rules that synthesize a
+/// free reference to a global use it as the shadow check: `SyntaxContext`
+/// does not survive printing, so a same-named binding anywhere is enough to
+/// capture the emitted identifier.
+pub(crate) fn module_declares_binding_named(module: &Module, name: &str) -> bool {
+    struct Finder<'a> {
+        name: &'a str,
+        found: bool,
+    }
+
+    impl Finder<'_> {
+        fn declare(&mut self, ident: &Ident) {
+            if ident.sym == self.name {
+                self.found = true;
+            }
+        }
+    }
+
+    impl Visit for Finder<'_> {
+        fn visit_binding_ident(&mut self, binding: &BindingIdent) {
+            self.declare(&binding.id);
+        }
+
+        fn visit_fn_decl(&mut self, declaration: &FnDecl) {
+            self.declare(&declaration.ident);
+            declaration.function.visit_with(self);
+        }
+
+        fn visit_fn_expr(&mut self, expr: &FnExpr) {
+            if let Some(ident) = &expr.ident {
+                self.declare(ident);
+            }
+            expr.function.visit_with(self);
+        }
+
+        fn visit_class_decl(&mut self, declaration: &ClassDecl) {
+            self.declare(&declaration.ident);
+            declaration.class.visit_with(self);
+        }
+
+        fn visit_class_expr(&mut self, expr: &ClassExpr) {
+            if let Some(ident) = &expr.ident {
+                self.declare(ident);
+            }
+            expr.class.visit_with(self);
+        }
+
+        fn visit_import_specifier(&mut self, specifier: &ImportSpecifier) {
+            let local = match specifier {
+                ImportSpecifier::Named(named) => &named.local,
+                ImportSpecifier::Default(default) => &default.local,
+                ImportSpecifier::Namespace(namespace) => &namespace.local,
+            };
+            self.declare(local);
+        }
+    }
+
+    let mut finder = Finder { name, found: false };
+    module.visit_with(&mut finder);
+    finder.found
+}
+
 pub fn collect_module_names(module: &Module) -> HashSet<Atom> {
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
     for item in &module.body {
         match item {
             ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
@@ -404,7 +541,7 @@ pub fn collect_module_names(module: &Module) -> HashSet<Atom> {
 }
 
 pub fn collect_top_level_binding_infos(module: &Module) -> HashMap<Atom, TopLevelBindingInfo> {
-    let mut infos = HashMap::new();
+    let mut infos = HashMap::default();
 
     for (item_index, item) in module.body.iter().enumerate() {
         match item {
@@ -618,7 +755,11 @@ pub fn binding_replacement_would_be_shadowed(
             }
         }
 
-        fn visit_prop_name(&mut self, _: &PropName) {}
+        fn visit_prop_name(&mut self, prop: &PropName) {
+            if let PropName::Computed(computed) = prop {
+                computed.visit_with(self);
+            }
+        }
 
         fn visit_member_prop(&mut self, prop: &MemberProp) {
             if let MemberProp::Computed(computed) = prop {
@@ -700,7 +841,11 @@ fn block_binds_name(stmts: &[Stmt], name: &Atom) -> bool {
 
         fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
 
-        fn visit_prop_name(&mut self, _: &PropName) {}
+        fn visit_prop_name(&mut self, prop: &PropName) {
+            if let PropName::Computed(computed) = prop {
+                computed.visit_with(self);
+            }
+        }
 
         fn visit_member_prop(&mut self, prop: &MemberProp) {
             if let MemberProp::Computed(prop) = prop {
@@ -786,7 +931,7 @@ pub(crate) struct BindingRenamer {
 
 impl BindingRenamer {
     pub fn new(renames: &[BindingRename]) -> Self {
-        let mut rename_map = HashMap::new();
+        let mut rename_map = HashMap::default();
         for rename in renames {
             rename_map
                 .entry(rename.old.clone())
@@ -915,6 +1060,45 @@ impl VisitMut for BindingRenamer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_declares_binding_named_sees_every_binding_form() {
+        for source in [
+            "var Infinity = 1;",
+            "function f(Infinity) {}",
+            "try {} catch (Infinity) {}",
+            "const [Infinity] = xs;",
+            "function Infinity() {}",
+            "(function Infinity() {})();",
+            "class Infinity {}",
+            "const C = class Infinity {};",
+            "import Infinity from 'm';",
+            "import { x as Infinity } from 'm';",
+            "import * as Infinity from 'm';",
+            "export default function Infinity() {}",
+            "function outer() { function inner() { let Infinity; } }",
+        ] {
+            with_parsed_module(source, |module| {
+                assert!(
+                    module_declares_binding_named(module, "Infinity"),
+                    "{source}"
+                );
+            });
+        }
+        for source in [
+            "const x = Infinity;",
+            "obj.Infinity = 1;",
+            "const o = { Infinity: 1 };",
+            "Infinity: for (;;) break Infinity;",
+        ] {
+            with_parsed_module(source, |module| {
+                assert!(
+                    !module_declares_binding_named(module, "Infinity"),
+                    "{source}"
+                );
+            });
+        }
+    }
     use swc_core::common::{sync::Lrc, FileName, Mark, SourceMap, GLOBALS};
     use swc_core::ecma::parser::{lexer::Lexer, EsSyntax, Parser, StringInput, Syntax};
     use swc_core::ecma::transforms::base::resolver;
@@ -939,6 +1123,72 @@ mod tests {
             module.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, false));
             f(&module)
         })
+    }
+
+    fn with_resolved_module<R>(source: &str, f: impl FnOnce(&Module, Mark) -> R) -> R {
+        GLOBALS.set(&Default::default(), || {
+            let cm: Lrc<SourceMap> = Default::default();
+            let fm = cm.new_source_file(
+                FileName::Custom("test.js".to_string()).into(),
+                source.to_string(),
+            );
+            let lexer = Lexer::new(
+                Syntax::Es(EsSyntax {
+                    jsx: true,
+                    ..Default::default()
+                }),
+                Default::default(),
+                StringInput::from(&*fm),
+                None,
+            );
+            let mut module = Parser::new_from(lexer)
+                .parse_module()
+                .expect("failed to parse");
+            let unresolved_mark = Mark::new();
+            module.visit_mut_with(&mut resolver(unresolved_mark, Mark::new(), false));
+            f(&module, unresolved_mark)
+        })
+    }
+
+    #[test]
+    fn free_name_collectors_skip_intrinsic_jsx_tags() {
+        let source = r#"const x = <a href="/">{foo}</a>; const y = <Bar />;"#;
+        with_resolved_module(source, |module, unresolved_mark| {
+            for names in [
+                collect_unresolved_reference_names(module, unresolved_mark),
+                collect_free_reference_names(module, unresolved_mark),
+            ] {
+                assert!(names.contains(&Atom::from("foo")));
+                assert!(names.contains(&Atom::from("Bar")));
+                assert!(
+                    !names.contains(&Atom::from("a")),
+                    "an intrinsic tag is not a reference: {names:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn free_reference_names_skip_export_specifier_names() {
+        let source = r#"
+const o = 1;
+export { o as compute };
+export * as ns from "./x";
+use(globalName);
+"#;
+        with_resolved_module(source, |module, unresolved_mark| {
+            // The resolver visits the exported half as a reference, so the plain
+            // collector reports it; the free-reference collector must not.
+            let unresolved = collect_unresolved_reference_names(module, unresolved_mark);
+            assert!(unresolved.contains(&Atom::from("compute")));
+
+            let free = collect_free_reference_names(module, unresolved_mark);
+            assert!(free.contains(&Atom::from("globalName")));
+            assert!(free.contains(&Atom::from("use")));
+            assert!(!free.contains(&Atom::from("compute")));
+            assert!(!free.contains(&Atom::from("ns")));
+            assert!(!free.contains(&Atom::from("o")));
+        });
     }
 
     #[test]
@@ -966,7 +1216,7 @@ mod tests {
             "var target = 1; function wrapper() { var inner = 2; return target + inner; }",
             |module| {
                 let target = top_level_binding(module, "target");
-                let bindings = HashSet::from([target.clone()]);
+                let bindings = HashSet::from_iter([target.clone()]);
                 let index = RenameShadowIndex::for_bindings(module, &bindings);
                 assert!(index.rename_causes_shadowing(&target, &Atom::from("inner")));
                 assert!(!index.rename_causes_shadowing(&target, &Atom::from("other")));
@@ -978,7 +1228,7 @@ mod tests {
     fn indexed_binding_without_nested_conflicts_reports_no_shadowing() {
         with_parsed_module("var lonely = 1; use(lonely);", |module| {
             let lonely = top_level_binding(module, "lonely");
-            let bindings = HashSet::from([lonely.clone()]);
+            let bindings = HashSet::from_iter([lonely.clone()]);
             let index = RenameShadowIndex::for_bindings(module, &bindings);
             assert!(!index.rename_causes_shadowing(&lonely, &Atom::from("anything")));
         });
@@ -990,7 +1240,7 @@ mod tests {
     fn unindexed_binding_query_is_rejected() {
         with_parsed_module("var known = 1;", |module| {
             let known = top_level_binding(module, "known");
-            let bindings = HashSet::from([known]);
+            let bindings = HashSet::from_iter([known]);
             let index = RenameShadowIndex::for_bindings(module, &bindings);
             let stranger = (Atom::from("stranger"), SyntaxContext::empty());
             index.rename_causes_shadowing(&stranger, &Atom::from("x"));
@@ -1002,7 +1252,7 @@ mod tests {
     fn unindexed_binding_query_fails_closed() {
         with_parsed_module("var known = 1;", |module| {
             let known = top_level_binding(module, "known");
-            let bindings = HashSet::from([known]);
+            let bindings = HashSet::from_iter([known]);
             let index = RenameShadowIndex::for_bindings(module, &bindings);
             let stranger = (Atom::from("stranger"), SyntaxContext::empty());
             assert!(index.rename_causes_shadowing(&stranger, &Atom::from("x")));

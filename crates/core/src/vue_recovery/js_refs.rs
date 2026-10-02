@@ -1,23 +1,23 @@
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use swc_core::atoms::Atom;
 
 use crate::js_names::is_valid_identifier_name;
 
 pub(super) fn collect_js_unshadowed_ident_refs(source: &str, refs: &mut HashSet<Atom>) {
-    let mut scoped_refs = HashSet::new();
+    let mut scoped_refs = HashSet::default();
     collect_js_ident_refs(source, &mut scoped_refs);
     extend_unshadowed_expr_refs(source, scoped_refs, refs);
 }
 
 pub(super) fn collect_js_unshadowed_read_refs(source: &str, refs: &mut HashSet<Atom>) {
-    let mut scoped_refs = HashSet::new();
+    let mut scoped_refs = HashSet::default();
     collect_js_read_refs(source, &mut scoped_refs);
     extend_unshadowed_expr_refs(source, scoped_refs, refs);
 }
 
 fn extend_unshadowed_expr_refs(source: &str, scoped_refs: HashSet<Atom>, refs: &mut HashSet<Atom>) {
-    let mut shadowed_names = HashSet::new();
+    let mut shadowed_names = HashSet::default();
     collect_js_arrow_param_names(source, &mut shadowed_names);
     refs.extend(
         scoped_refs

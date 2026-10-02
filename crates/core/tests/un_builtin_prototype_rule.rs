@@ -32,7 +32,9 @@ const SIX_STANDARD_LITERAL_RECEIVERS: &str = r#"
 "#;
 
 fn apply(input: &str, level: RewriteLevel) -> String {
-    render_rule(input, |_| UnBuiltinPrototype::new(level))
+    render_rule(input, |unresolved_mark| {
+        UnBuiltinPrototype::new(unresolved_mark, level)
+    })
 }
 
 #[test]
@@ -52,7 +54,9 @@ fn minimal_preserves_literal_receivers() {
 #[test]
 fn default_rule_preserves_literal_receivers() {
     // Default construction must not bypass the aggressive-only gate.
-    let output = render_rule(SIX_LITERAL_RECEIVERS, |_| UnBuiltinPrototype::default());
+    let output = render_rule(SIX_LITERAL_RECEIVERS, |unresolved_mark| {
+        UnBuiltinPrototype::new(unresolved_mark, RewriteLevel::Standard)
+    });
 
     assert_eq_normalized(&output, SIX_LITERAL_RECEIVERS);
 }

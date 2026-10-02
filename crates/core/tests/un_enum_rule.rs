@@ -1009,7 +1009,335 @@ export { Mode };
 }
 
 #[test]
-fn exported_commonjs_enum_rejects_intervening_binding_use() {
+fn assign_of_exports_keeps_toplevel_read_and_function_body() {
+    // Top-level `use(Local)` runs before the IIFE and must still see the
+    // uninitialized binding. `readLater` only defines a read; it does not
+    // run in the gap. The object stays at the IIFE, not on `let Local`.
+    let input = r#"
+let Local;
+use(Local);
+function readLater() {
+  return Local.Dev;
+}
+(function (e) {
+  e[e.Dev = 0] = "Dev";
+})(Local = exports.Public || (exports.Public = {}));
+"#;
+    let expected = r#"
+let Local;
+export { Local as Public };
+use(Local);
+function readLater() {
+  return Local.Dev;
+}
+(function (e) {
+  e[e.Dev = 0] = "Dev";
+})(Local = {});
+"#;
+    assert_eq_normalized(&apply_resolved(input), expected);
+}
+
+#[test]
+fn assign_of_exports_ignores_shadowed_parameter() {
+    // A parameter named Local is a different binding, so the older in-place
+    // object fold still applies. The object is not moved onto `let Local`.
+    let input = r#"
+let Local;
+function nested(Local) {
+  return Local;
+}
+(function (e) {
+  e[e.Dev = 0] = "Dev";
+})(Local = exports.Public || (exports.Public = {}));
+"#;
+    let expected = r#"
+let Local;
+function nested(Local) {
+  return Local;
+}
+Local = {
+  Dev: 0,
+  0: "Dev"
+};
+export { Local as Public };
+"#;
+    assert_eq_normalized(&apply_resolved(input), expected);
+}
+
+#[test]
+fn assign_of_exports_keeps_cc_rf_push_module() {
+    let input = r#"
+cc._RF.push(module, "uuid", "ScriptName");
+let Local;
+function readLater() {
+  return Local.Dev;
+}
+(function (e) {
+  e[e.Dev = 0] = "Dev";
+})(Local = exports.Public || (exports.Public = {}));
+cc._RF.pop();
+"#;
+    let expected = r#"
+cc._RF.push(module, "uuid", "ScriptName");
+let Local;
+export { Local as Public };
+function readLater() {
+  return Local.Dev;
+}
+(function (e) {
+  e[e.Dev = 0] = "Dev";
+})(Local = {});
+cc._RF.pop();
+"#;
+    assert_eq_normalized(&apply_resolved(input), expected);
+}
+
+#[test]
+fn assign_of_exports_rejects_deferred_public_read() {
+    // `use(Local)` blocks the older object-literal fold, so only the
+    // keep-IIFE path could rewrite this. A deferred `exports.Public` read
+    // must still leave the argument alone.
+    let input = r#"
+let Local;
+use(Local);
+function later() {
+  return exports.Public;
+}
+(function (e) {
+  e[e.Dev = 0] = "Dev";
+})(Local = exports.Public || (exports.Public = {}));
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn assign_of_exports_rejects_direct_eval_reading_exports() {
+    let input = r#"
+let Local;
+use(Local);
+(function (e) {
+  e[e.Dev = 0] = "Dev";
+})(Local = exports.Public || (exports.Public = {}));
+observe(eval("exports.Public"));
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn assign_of_exports_rejects_nested_inner_enum() {
+    let input = r#"
+let Local;
+(function (t) {
+  (function (e) {
+    e[e.Dev = 0] = "Dev";
+  })(t.Inner || (t.Inner = {}));
+})(Local = exports.Public || (exports.Public = {}));
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn assign_of_exports_rejects_gap_write_to_local() {
+    // `export { Local as Public }` is live from the declaration on, so a
+    // gap write would publish `1` where `exports.Public` was still unset.
+    let input = r#"
+var Local;
+Local = 1;
+(function (e) {
+  e[e.Dev = 0] = "Dev";
+})(Local = exports.Public || (exports.Public = {}));
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn assign_of_exports_rejects_later_write_to_local() {
+    // `exports.Public` keeps the enum object after `Local = null`; a live
+    // export of `Local` would not.
+    let input = r#"
+var Local;
+use(Local);
+(function (e) {
+  e[e.Dev = 0] = "Dev";
+})(Local = exports.Public || (exports.Public = {}));
+Local = null;
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn assign_of_exports_rejects_deferred_write_to_local() {
+    let input = r#"
+var Local;
+use(Local);
+function reset() {
+  Local = undefined;
+}
+(function (e) {
+  e[e.Dev = 0] = "Dev";
+})(Local = exports.Public || (exports.Public = {}));
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn assign_of_exports_rejects_direct_eval_naming_local() {
+    let input = r#"
+var Local;
+use(Local);
+(function (e) {
+  e[e.Dev = 0] = "Dev";
+})(Local = exports.Public || (exports.Public = {}));
+eval("Local = null");
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn assign_of_exports_rejects_redeclared_local() {
+    let input = r#"
+var Local;
+use(Local);
+(function (e) {
+  e[e.Dev = 0] = "Dev";
+})(Local = exports.Public || (exports.Public = {}));
+var Local;
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn local_or_rejects_intervening_write() {
+    let input = r#"
+var Local;
+Local = {
+  keep: 1
+};
+(function (e) {
+  e[e.Dev = 0] = "Dev";
+})(Local || (exports.Public = Local = {}));
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn exported_enum_fold_rejects_later_write_to_local() {
+    // `exports.Public` keeps the enum object after `Local = null`; the
+    // folded `export { Local as Public }` would publish `null`.
+    let input = r#"
+var Local;
+(function (e) {
+  e[e.Dev = 0] = "Dev";
+})(Local = exports.Public || (exports.Public = {}));
+Local = null;
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn exported_enum_fold_rejects_deferred_write_to_local() {
+    let input = r#"
+function reset() {
+  Local = undefined;
+}
+var Local;
+(function (e) {
+  e["Dev"] = "dev";
+})(Local = exports.Public || (exports.Public = {}));
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn exported_enum_fold_rejects_direct_eval_naming_local() {
+    let input = r#"
+var Local;
+(function (e) {
+  e["Dev"] = "dev";
+})(Local = exports.Public || (exports.Public = {}));
+eval("Local = null");
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn exported_enum_fold_rejects_redeclared_local() {
+    let input = r#"
+var Local;
+(function (e) {
+  e["Dev"] = "dev";
+})(Local = exports.Public || (exports.Public = {}));
+var Local;
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn split_exported_enum_fold_rejects_later_write_to_local() {
+    let input = r#"
+var Local;
+var before = 1;
+(function (e) {
+  e[e.Dev = 0] = "Dev";
+})(Local = exports.Public || (exports.Public = {}));
+Local = null;
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn local_or_fold_rejects_later_write_to_local() {
+    let input = r#"
+var Local;
+(function (e) {
+  e[e.Dev = 0] = "Dev";
+})(Local || (exports.Public = Local = {}));
+Local = null;
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn split_local_or_fold_rejects_later_write_to_local() {
+    let input = r#"
+var Local;
+var before = 1;
+(function (e) {
+  e[e.Dev = 0] = "Dev";
+})(Local || (exports.Public = Local = {}));
+Local = null;
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn exported_enum_fold_ignores_write_to_shadowing_parameter() {
+    // `Local` inside `reset` is its own parameter, not the enum binding.
+    let input = r#"
+var Local;
+(function (e) {
+  e["Dev"] = "dev";
+})(Local = exports.Public || (exports.Public = {}));
+function reset(Local) {
+  Local = null;
+}
+"#;
+    let expected = r#"
+var Local = {
+  Dev: "dev"
+};
+export { Local as Public };
+function reset(Local) {
+  Local = null;
+}
+"#;
+    assert_eq_normalized(&apply_resolved(input), expected);
+}
+
+#[test]
+fn exported_commonjs_enum_keeps_iife_when_gap_reads_local() {
+    // A top-level read in the gap still runs before the write. Rewriting the
+    // argument must not move the object onto the bare declaration.
     let input = r#"
 var Mode;
 var before = observe(Mode);
@@ -1017,7 +1345,90 @@ var before = observe(Mode);
   e[e["Dev"] = 0] = "Dev";
 })(Mode = exports.Mode || (exports.Mode = {}));
 "#;
-    assert_eq_normalized(&apply_resolved(input), input);
+    let expected = r#"
+var Mode;
+export { Mode };
+var before = observe(Mode);
+(function (e) {
+  e[e["Dev"] = 0] = "Dev";
+})(Mode = {});
+"#;
+    assert_eq_normalized(&apply_resolved(input), expected);
+}
+
+#[test]
+fn exported_commonjs_enum_keeps_string_and_mixed_iife_when_gap_reads_local() {
+    // The IIFE body stays verbatim, so string members are as safe as numeric
+    // ones here.
+    let input = r#"
+var Mode;
+var before = observe(Mode);
+(function (e) {
+  e["Dev"] = "dev";
+  e[e["Prod"] = 1] = "Prod";
+})(Mode = exports.Mode || (exports.Mode = {}));
+"#;
+    let expected = r#"
+var Mode;
+export { Mode };
+var before = observe(Mode);
+(function (e) {
+  e["Dev"] = "dev";
+  e[e["Prod"] = 1] = "Prod";
+})(Mode = {});
+"#;
+    assert_eq_normalized(&apply_resolved(input), expected);
+}
+
+#[test]
+fn exported_commonjs_enum_keeps_string_iife_when_gap_function_reads_local() {
+    // Terser `toplevel` + `passes` over TypeScript 4.x ES5 output hoists
+    // `var Mode` above a function expression that reads it, so the fold
+    // declines and only the keep-IIFE path can publish the export.
+    let input = r#"
+var Mode;
+exports.getMode = function () {
+  return Mode.Dev;
+};
+(function (e) {
+  e.Dev = "dev";
+})(Mode = exports.Mode || (exports.Mode = {}));
+"#;
+    let expected = r#"
+var Mode;
+export { Mode };
+exports.getMode = function () {
+  return Mode.Dev;
+};
+(function (e) {
+  e.Dev = "dev";
+})(Mode = {});
+"#;
+    assert_eq_normalized(&apply_resolved(input), expected);
+}
+
+#[test]
+fn pipeline_recovers_string_enum_after_terser_hoists_its_var() {
+    let input = r#""use strict";var Mode,Num;Object.defineProperty(exports,"__esModule",{value:!0}),exports.Num=exports.getNum=exports.Mode=exports.getMode=void 0,exports.getMode=function(){return Mode.Dev},function(e){e.Dev="dev"}(Mode=exports.Mode||(exports.Mode={})),exports.getNum=function(){return Num.A},function(e){e[e.A=0]="A"}(Num=exports.Num||(exports.Num={}));"#;
+    let expected = r#"
+let Mode;
+export { Mode };
+let Num;
+export { Num };
+export const getMode = function() {
+  return Mode.Dev;
+};
+((e) => {
+  e.Dev = "dev";
+})(Mode = {});
+export const getNum = function() {
+  return Num.A;
+};
+((e) => {
+  e[e.A = 0] = "A";
+})(Num = {});
+"#;
+    assert_eq_normalized(&render_pipeline(input), expected);
 }
 
 #[test]

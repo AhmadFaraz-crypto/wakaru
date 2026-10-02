@@ -1,12 +1,11 @@
 #!/usr/bin/env node
 
+import { runNodeBatchSync } from "../lib/tool-process.mjs";
+
 import {
-  runMatrix, batchRunner, ensureNodeTool,
+  runMatrix, batchRunner, ensureSwcTool, babelPresetEnvBatch,
 } from "../lib/runner.mjs";
 import { mangleValidator } from "../lib/compare.mjs";
-import { join } from "node:path";
-import { writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 
 const profiles = [
   {
@@ -290,13 +289,87 @@ export const view = UserCard(props);
   },
 ];
 
+// Classes lowered by Babel preset-env (IE 11) before SWC minifies them. SWC
+// inlines the single-use `_createClass`, `_defineProperties`, and
+// `_classCallCheck` helpers into the class, so these rows track how much of
+// that shape class recovery handles. Babel 7.12 predates `_toPropertyKey` in
+// `_defineProperties`; 7.29 routes each key through it.
+const babelLowerers = [
+  { core: "7.12.17", preset: "7.12.17" },
+  { core: "7.29.7", preset: "7.29.7" },
+];
+const classSnippets = [
+  {
+    name: "class-methods",
+    source: `
+class Store {
+  constructor(items) { this.items = items; }
+  get(index) { return this.items[index]; }
+  get size() { return this.items.length; }
+}
+const first = new Store(["a", "b"]);
+const second = new Store(["c"]);
+use(first.get(1), first.size, second.size);
+`,
+    expected: ["class ", "get size()"],
+    rejected: ["Object.defineProperty(", "Cannot call a class"],
+    execute: {},
+  },
+  {
+    name: "class-static",
+    source: `
+class Parser {
+  static parse(text) { return text.trim(); }
+  static get version() { return 2; }
+}
+use(Parser.parse(" a "), Parser.version, Parser.parse("b"));
+`,
+    expected: ["class ", "static get version()"],
+    rejected: ["Object.defineProperty(", "Cannot call a class"],
+    execute: {},
+  },
+  {
+    name: "class-extends",
+    source: `
+class Base {
+  constructor(name) { this.name = name; }
+  label() { return this.name; }
+}
+class Child extends Base {
+  constructor(name) { super(name); this.kind = "child"; }
+  label() { return super.label() + ":" + this.kind; }
+}
+const first = new Child("a");
+const second = new Child("b");
+use(first.label(), second.label(), new Base("c").label());
+`,
+    expected: ["class ", " extends ", "super("],
+    rejected: ["Object.defineProperty(", "Cannot call a class", "Object.create("],
+    execute: {},
+  },
+];
+for (const lower of babelLowerers) {
+  for (const snippet of classSnippets) {
+    snippets.push({
+      ...snippet,
+      name: `babel-${lower.core}-${snippet.name}`,
+      bucket: "inline-iife",
+      // `inline-iife` turns every other compress default off, so constant
+      // folding and dead-code removal never finish the `_createClass`
+      // expansion (`if (protoProps) _defineProperties(...)` stays). The
+      // default compress options (the `all` profile) fold it away.
+      skipProfiles: ["inline-iife"],
+      // Same source per Babel version; the comment keeps batch keys distinct.
+      source: `// babel ${lower.core}${snippet.source}`,
+      lower,
+    });
+  }
+}
+
 // SWC minifier batch
 function swcMinifyBatch(sources, options) {
-  const toolDir = ensureNodeTool("swc", ["@swc/core@1"]);
-  const helper = join(toolDir, "swc-minify-batch.cjs");
-  writeFileSync(
-    helper,
-    `
+  const toolDir = ensureSwcTool();
+  const helperSource = `
 const fs = require("node:fs");
 const swc = require("@swc/core");
 const options = JSON.parse(process.env.SWC_MINIFY_OPTIONS);
@@ -311,31 +384,40 @@ const results = sources.map(source => {
   } catch (e) { return { error: e.message }; }
 });
 process.stdout.write(JSON.stringify(results));
-`,
-  );
-  const result = spawnSync("node", [helper], {
+`;
+  return runNodeBatchSync(helperSource, sources, {
+    label: "swc-minify-batch.cjs",
+    format: "commonjs",
     cwd: toolDir,
-    input: JSON.stringify(sources),
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024 * 50,
-    env: { ...process.env, SWC_MINIFY_OPTIONS: JSON.stringify(options) },
+    env: { SWC_MINIFY_OPTIONS: JSON.stringify(options) },
   });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`swc batch exited ${result.status}: ${result.stderr}`);
-  const outputs = JSON.parse(result.stdout);
-  const map = new Map();
-  for (let i = 0; i < sources.length; i++) {
-    map.set(sources[i], outputs[i].error ? new Error(outputs[i].error) : outputs[i].code);
-  }
-  return map;
 }
 
-const allSources = snippets.map((s) => s.source);
+// Snippets with `lower` reach SWC as the lowerer's output instead of source.
+const babelLowered = new Map();
+for (const lower of babelLowerers) {
+  const sources = snippets.filter((s) => s.lower === lower).map((s) => s.source);
+  const lowered = await babelPresetEnvBatch(sources, { ...lower, targets: { ie: "11" } });
+  for (const [source, code] of lowered) babelLowered.set(source, code);
+}
+function minifyInput(source) {
+  const lowered = babelLowered.get(source);
+  if (lowered instanceof Error) throw lowered;
+  return lowered ?? source;
+}
+const minifyInputs = snippets.map((s) => {
+  try {
+    return minifyInput(s.source);
+  } catch {
+    return s.source;
+  }
+});
 
 // Build per-profile batch runners (lazily cached)
 const profileRunners = new Map();
 for (const profile of profiles) {
-  profileRunners.set(profile.name, batchRunner(() => swcMinifyBatch(allSources, profile.options)));
+  const lookup = batchRunner(() => swcMinifyBatch(minifyInputs, profile.options));
+  profileRunners.set(profile.name, (source) => lookup(minifyInput(source)));
 }
 
 function profilesFor(snippet) {

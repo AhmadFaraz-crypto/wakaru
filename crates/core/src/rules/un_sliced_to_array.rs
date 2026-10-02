@@ -1,11 +1,14 @@
-use std::collections::HashSet;
+use crate::collections::HashSet;
+
+use crate::analysis::binding_uses::{BindingUseIndex, UseKind};
+use swc_core::atoms::Atom;
 
 use crate::facts::{ModuleFactsMap, TypeScriptHelperKind};
 use crate::utils::paren::strip_parens;
 use swc_core::common::{Mark, Spanned, SyntaxContext, DUMMY_SP};
 use swc_core::ecma::ast::{
     ArrayPat, ArrowExpr, ArrowFunctionBody, AssignExpr, AssignOp, AssignTarget, BinaryOp,
-    BindingIdent, Callee, Decl, Expr, ExprStmt, Function, FunctionBody, Lit, MemberExpr,
+    BindingIdent, Callee, Decl, Expr, ExprStmt, Function, FunctionBody, Ident, Lit, MemberExpr,
     MemberProp, Module, ModuleItem, Param, Pat, ReturnStmt, SimpleAssignTarget, Stmt, VarDecl,
     VarDeclKind, VarDeclarator,
 };
@@ -28,14 +31,9 @@ use super::transpiler_helper_utils::{
 use super::RewriteLevel;
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
-/// Detects and unwraps `_slicedToArray(expr, N)` helper calls.
-///
-/// Transforms:
-///   `var _ref = _slicedToArray(expr, N)` → `var _ref = expr`
-///   `var _ref = _slicedToArray(expr, 0)` → `var [] = expr`
-///
-/// The downstream `SmartInline` + destructuring rules handle converting
-/// `var a = _ref[0]; var b = _ref[1]` → `const [a, b] = expr`.
+/// Restores complete destructuring groups backed by iterator helpers.
+/// A helper call is retained when its materialized array still has uses that
+/// cannot be consumed by the recovered pattern.
 pub struct UnSlicedToArray<'a> {
     module_facts: Option<&'a ModuleFactsMap>,
     current_filename: Option<&'a str>,
@@ -173,12 +171,16 @@ fn run_un_sliced_to_array(
         return;
     }
     let maybe_array_like = collect_maybe_array_like_bindings(module);
+    let indexed_returns = (level >= RewriteLevel::Standard)
+        .then(|| IndexedReturnContext::collect(module))
+        .flatten();
     module.visit_mut_children_with(&mut SlicedToArrayRewriter {
         local_helpers,
         cross_module_helpers: &cross_module_helpers,
         maybe_array_like: &maybe_array_like,
         level,
         unresolved_mark,
+        indexed_returns,
     });
 
     local_helpers.remove_unused_ts_helper_bindings(module, TsHelperKind::Read);
@@ -219,6 +221,7 @@ struct SlicedToArrayRewriter<'a> {
     maybe_array_like: &'a HashSet<BindingKey>,
     level: RewriteLevel,
     unresolved_mark: Option<Mark>,
+    indexed_returns: Option<IndexedReturnContext>,
 }
 
 impl VisitMut for SlicedToArrayRewriter<'_> {
@@ -257,18 +260,6 @@ impl VisitMut for SlicedToArrayRewriter<'_> {
             self.maybe_array_like,
             self.unresolved_mark,
         );
-        for item in items {
-            let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
-                continue;
-            };
-            rewrite_sliced_to_array_decls(
-                &mut var.decls,
-                self.local_helpers,
-                self.cross_module_helpers,
-                self.maybe_array_like,
-                self.unresolved_mark,
-            );
-        }
     }
 
     fn visit_mut_stmts(&mut self, stmts: &mut Vec<Stmt>) {
@@ -281,18 +272,200 @@ impl VisitMut for SlicedToArrayRewriter<'_> {
             self.level,
             self.unresolved_mark,
         );
-        for stmt in stmts {
-            let Stmt::Decl(Decl::Var(var)) = stmt else {
-                continue;
-            };
-            rewrite_sliced_to_array_decls(
-                &mut var.decls,
-                self.local_helpers,
-                self.cross_module_helpers,
-                self.maybe_array_like,
-                self.unresolved_mark,
-            );
+        if let Some(context) = &mut self.indexed_returns {
+            for start in 0..stmts.len() {
+                let Some(extraction) = extract_sliced_to_array_stmt(
+                    &stmts[start],
+                    self.local_helpers,
+                    self.cross_module_helpers,
+                    self.maybe_array_like,
+                    self.unresolved_mark,
+                ) else {
+                    continue;
+                };
+                context.try_fold(stmts, start, extraction);
+            }
         }
+    }
+}
+
+/// A compressed return can recover only when it accounts for every use of
+/// the materialized array. Reserve all emitted names (including free and
+/// nested references), since resolver contexts alone do not prevent capture.
+/// At standard, this uses iterator_materialization_independence: equal N
+/// proves complete consumption, not identical helper/native iterator closing.
+struct IndexedReturnContext {
+    uses: BindingUseIndex,
+    names: HashSet<Atom>,
+}
+
+impl IndexedReturnContext {
+    fn collect(module: &Module) -> Option<Self> {
+        let mut eval = super::eval_utils::DirectEvalPresence::default();
+        module.visit_with(&mut eval);
+        if eval.found || super::eval_utils::module_has_with_stmt(module) {
+            return None;
+        }
+        #[derive(Default)]
+        struct Names {
+            names: HashSet<Atom>,
+        }
+        impl Visit for Names {
+            fn visit_ident(&mut self, ident: &Ident) {
+                self.names.insert(ident.sym.clone());
+            }
+        }
+        let mut names = Names::default();
+        module.visit_with(&mut names);
+        Some(Self {
+            uses: BindingUseIndex::collect(module),
+            names: names.names,
+        })
+    }
+
+    fn try_fold(&mut self, stmts: &mut [Stmt], start: usize, extraction: SlicedExtraction) {
+        let Some(length) = extraction.length.filter(|n| *n > 0) else {
+            return;
+        };
+        if extraction.source_ref.is_some() {
+            return;
+        }
+        let Stmt::Decl(Decl::Var(var)) = &stmts[start] else {
+            return;
+        };
+        let Some(Expr::Call(call)) = var.decls[0].init.as_deref() else {
+            return;
+        };
+        // Do not extend this proof through _maybeArrayLike(helper, source, N):
+        // that would also require proving the helper argument remains stable.
+        if call.args.len() != 2 || call.args.iter().any(|arg| arg.spread.is_some()) {
+            return;
+        }
+        let Callee::Expr(callee) = &call.callee else {
+            return;
+        };
+        let stable = match strip_parens(callee) {
+            Expr::Ident(id) => {
+                self.uses.has_single_declaration(&id.to_id())
+                    && !self.uses.has_direct_write(&id.to_id())
+            }
+            Expr::Member(member) => matches!(member.obj.as_ref(), Expr::Ident(id)
+                if self.uses.has_single_declaration(&id.to_id())
+                    && self.uses.has_only_static_member_reads_any(&id.to_id())),
+            _ => false,
+        };
+        let key = extraction.ref_binding.id.to_id();
+        let uses = self.uses.use_sites(&key);
+        if !stable
+            || uses.len() != length
+            || uses
+                .iter()
+                .any(|site| site.kind != UseKind::ComputedMemberRead)
+            || !self.uses.has_single_declaration(&key)
+        {
+            return;
+        }
+        let Some(end) = (start + 1..stmts.len()).find(|&index| {
+            !matches!(&stmts[index],
+                Stmt::Decl(Decl::Var(var)) if var.kind == VarDeclKind::Var
+                    && var.decls.iter().all(|decl| decl.init.is_none())
+            )
+        }) else {
+            return;
+        };
+        let Stmt::Return(ReturnStmt {
+            arg: Some(expr), ..
+        }) = &stmts[end]
+        else {
+            return;
+        };
+        let mut next = 0;
+        if !ordered_index_return(expr, &extraction.ref_binding.id, &mut next, length)
+            || next != length
+        {
+            return;
+        }
+        let ctxt = SyntaxContext::empty().apply_mark(Mark::new());
+        let mut suffix = 0;
+        let bindings: Vec<_> = (0..length)
+            .map(|_| loop {
+                suffix += 1;
+                let name: Atom = if suffix == 1 {
+                    "_item".into()
+                } else {
+                    format!("_item{suffix}").into()
+                };
+                if self.names.insert(name.clone()) {
+                    break Ident::new(name, DUMMY_SP, ctxt);
+                }
+            })
+            .collect();
+        struct Replace<'a> {
+            bindings: &'a [Ident],
+            next: usize,
+        }
+        impl VisitMut for Replace<'_> {
+            fn visit_mut_expr(&mut self, expr: &mut Expr) {
+                if matches!(expr, Expr::Member(_)) {
+                    *expr = Expr::Ident(self.bindings[self.next].clone());
+                    self.next += 1;
+                } else {
+                    expr.visit_mut_children_with(self);
+                }
+            }
+        }
+        // The grammar above admits only ordered indexed reads and eager
+        // binary operators, so this traversal replaces exactly N reads.
+        stmts[end].visit_mut_with(&mut Replace {
+            bindings: &bindings,
+            next: 0,
+        });
+        let Stmt::Decl(Decl::Var(var)) = &mut stmts[start] else {
+            unreachable!()
+        };
+        var.decls[0].name = Pat::Array(ArrayPat {
+            span: DUMMY_SP,
+            elems: bindings
+                .into_iter()
+                .map(|id| Some(Pat::Ident(id.into())))
+                .collect(),
+            optional: false,
+            type_ann: None,
+        });
+        var.decls[0].init = Some(extraction.source);
+    }
+}
+
+fn ordered_index_return(expr: &Expr, reference: &Ident, next: &mut usize, length: usize) -> bool {
+    match strip_parens(expr) {
+        Expr::Member(member) => {
+            if !matches!(member.obj.as_ref(), Expr::Ident(id) if id.to_id() == reference.to_id())
+                || member_index(member) != Some(*next)
+            {
+                return false;
+            }
+            *next += 1;
+            true
+        }
+        Expr::Bin(binary)
+            if !matches!(
+                binary.op,
+                BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::NullishCoalescing
+            ) =>
+        {
+            ordered_index_return(&binary.left, reference, next, length)
+                && ordered_index_return(&binary.right, reference, next, length)
+        }
+        // Conservative grammar shared across helper kinds. Babel/SWC array
+        // fast paths can alias the input: an earlier global-name getter may
+        // mutate elements before the lowered indexed reads. A new pattern
+        // reads those elements first. Do not generalize from __read's
+        // usual fresh-array path.
+        Expr::Ident(_)
+        | Expr::Lit(Lit::Num(_) | Lit::Str(_) | Lit::Bool(_) | Lit::Null(_) | Lit::BigInt(_)) => {
+            *next == length
+        }
+        _ => false,
     }
 }
 
@@ -827,9 +1000,6 @@ fn try_fold_sliced_to_array_module_item_group(
     ) else {
         return false;
     };
-    if extraction.length == Some(0) {
-        return false;
-    }
     if module_item_sliced_ref_is_unreferenced(body, start, &extraction.ref_binding.id) {
         let Some(length) = extraction.length else {
             return false;
@@ -965,9 +1135,6 @@ fn try_fold_sliced_to_array_stmt_group(
     ) else {
         return false;
     };
-    if extraction.length == Some(0) {
-        return false;
-    }
     if allow_assignment_index_folds
         && try_fold_sliced_to_array_stmt_assignment_access_group(stmts, start, extraction)
     {
@@ -1228,10 +1395,20 @@ fn try_fold_sliced_to_array_ref_assignment_stmt_group(
     else {
         return false;
     };
-    if ident_used_in_stmts(&stmts[start + 1 + length..], &extraction.ref_binding.id) {
+    // A lowered destructuring assignment statement ends its sequence with the
+    // temp, the value of the assignment expression. The statement discards it.
+    let mut consumed = length;
+    if stmts.get(start + 1 + length).is_some_and(|stmt| {
+        matches!(stmt, Stmt::Expr(ExprStmt { expr, .. })
+            if matches!(expr.as_ref(), Expr::Ident(ident)
+                if same_sliced_ref_ident(ident, &extraction.ref_binding.id)))
+    }) {
+        consumed += 1;
+    }
+    if ident_used_in_stmts(&stmts[start + 1 + consumed..], &extraction.ref_binding.id) {
         return false;
     }
-    if sliced_source_ref_is_used_in_stmts(&stmts[start + 1 + length..], &extraction) {
+    if sliced_source_ref_is_used_in_stmts(&stmts[start + 1 + consumed..], &extraction) {
         return false;
     }
 
@@ -1272,7 +1449,7 @@ fn try_fold_sliced_to_array_ref_assignment_stmt_group(
             definite: false,
         }],
     })));
-    stmts.drain(start + 1..start + 1 + length);
+    stmts.drain(start + 1..start + 1 + consumed);
     remove_prior_uninitialized_decls_by(
         stmts,
         start,
@@ -1552,26 +1729,6 @@ fn stmt_sliced_ref_is_unreferenced(
         .is_none_or(|_| !ident_used_in_stmts(&stmts[start + 1..], ref_ident))
 }
 
-fn rewrite_sliced_to_array_decls(
-    decls: &mut Vec<VarDeclarator>,
-    local_helpers: &LocalHelperContext,
-    cross_module_helpers: &CrossModuleHelperRefs,
-    maybe_array_like: &HashSet<BindingKey>,
-    unresolved_mark: Option<Mark>,
-) {
-    let mut i = 0;
-    while i < decls.len() {
-        try_unwrap_sliced_to_array(
-            &mut decls[i],
-            local_helpers,
-            cross_module_helpers,
-            maybe_array_like,
-            unresolved_mark,
-        );
-        i += 1;
-    }
-}
-
 fn extract_sliced_to_array_decl(
     decl: &VarDeclarator,
     local_helpers: &LocalHelperContext,
@@ -1669,42 +1826,6 @@ fn member_index(member: &MemberExpr) -> Option<usize> {
         return None;
     };
     numeric_length(num.value)
-}
-
-fn try_unwrap_sliced_to_array(
-    decl: &mut VarDeclarator,
-    local_helpers: &LocalHelperContext,
-    cross_module_helpers: &CrossModuleHelperRefs,
-    maybe_array_like: &HashSet<BindingKey>,
-    unresolved_mark: Option<Mark>,
-) {
-    let Some(init) = &decl.init else { return };
-    let Expr::Call(call) = init.as_ref() else {
-        return;
-    };
-
-    let Some((source, length_val)) = extract_sliced_call_args(
-        call,
-        local_helpers,
-        cross_module_helpers,
-        maybe_array_like,
-        unresolved_mark,
-    ) else {
-        return;
-    };
-    let Some(length) = numeric_length(length_val) else {
-        return;
-    };
-
-    if length == 0 {
-        decl.name = Pat::Array(ArrayPat {
-            span: DUMMY_SP,
-            elems: vec![],
-            optional: false,
-            type_ann: None,
-        });
-    }
-    decl.init = Some(Box::new(source.clone()));
 }
 
 fn is_sliced_to_array_callee(
@@ -1840,9 +1961,7 @@ fn same_sliced_ref_ident(
     obj: &swc_core::ecma::ast::Ident,
     ref_ident: &swc_core::ecma::ast::Ident,
 ) -> bool {
-    obj.sym == ref_ident.sym
-        && (obj.ctxt == ref_ident.ctxt
-            || (obj.ctxt == SyntaxContext::empty() && ref_ident.ctxt != SyntaxContext::empty()))
+    obj.sym == ref_ident.sym && obj.ctxt == ref_ident.ctxt
 }
 
 fn ident_used_in_items(items: &[ModuleItem], target: &swc_core::ecma::ast::Ident) -> bool {

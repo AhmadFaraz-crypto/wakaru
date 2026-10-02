@@ -564,3 +564,48 @@ fn webpack5_chunk_with_window_base() {
 
     assert_eq!(pairs.len(), 1);
 }
+
+#[test]
+fn export_initialization_chains_survive_repeated_unpack_recovery() {
+    for declaration in ["const", "var"] {
+        let source = format!(
+            r#"
+(self.webpackChunk_app = self.webpackChunk_app || []).push([[1], {{
+    100: function(module, exports, require) {{
+        exports.last = exports.run = exports.first = void 0;
+        const first = () => 1;
+        exports.first = first;
+        {declaration} run = () => 2;
+        exports.run = run;
+        const last = () => 3;
+        exports.last = last;
+        function dynamic(code) {{ return eval(code); }}
+    }}
+}}]);
+"#
+        );
+        for emit_source_map in [false, true] {
+            let output = unpack(
+                &source,
+                DecompileOptions {
+                    filename: "chunk.js".into(),
+                    emit_source_map,
+                    diagnostics: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(!output.has_errors(), "{:?}", output.warnings);
+            let findings = validate_output_modules(&output.modules);
+            assert!(findings.is_empty(), "{findings:?}\n{:?}", output.modules);
+            assert!(
+                output
+                    .modules
+                    .iter()
+                    .any(|(_, source)| source.contains("export") && source.contains("run")),
+                "{:?}",
+                output.modules
+            );
+        }
+    }
+}

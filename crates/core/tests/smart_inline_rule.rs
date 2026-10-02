@@ -1,7 +1,9 @@
 mod common;
 
 use common::{assert_eq_normalized, render_pipeline, render_rule};
-use wakaru_core::{decompile, rules::SmartInline, DecompileOptions, RewriteLevel};
+use wakaru_core::{
+    decompile, rules::SmartInline, validate_output_modules, DecompileOptions, RewriteLevel,
+};
 
 fn apply(input: &str) -> String {
     apply_with_level(input, RewriteLevel::Standard)
@@ -645,15 +647,17 @@ process(n);
 
 #[test]
 fn no_inline_into_nested_function() {
-    // t used inside nested fn — top-level count is 0, shouldn't inline
-    // ArrowFunction rule converts the function expression to an arrow function.
+    // t used inside nested fn — top-level count is 0, shouldn't inline.
+    // Named exports keep a constructable function expression.
     let input = r#"
 const t = foo;
 export const fn2 = function() { return t; };
 "#;
     let expected = r#"
 const t = foo;
-export const fn2 = () => t;
+export const fn2 = function() {
+    return t;
+};
 "#;
     let output = apply_pipeline(input);
     assert_eq_normalized(&output, expected);
@@ -1593,4 +1597,240 @@ console.log(e);
 "#;
     let output = apply(input);
     assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn exported_builtin_alias_declaration_is_kept() {
+    // `export { o }` names the alias binding. Inlining the uses is fine, but
+    // removing the declaration leaves the export specifier dangling and the
+    // module fails to link.
+    let input = r#"
+const o = Object.create;
+const d = Object.defineProperty;
+function f(q) {
+    return d(o(q), "x", { value: 1 });
+}
+export { o, f };
+"#;
+    let output = apply(input);
+    assert!(
+        output.contains("const o = Object.create"),
+        "exported alias declaration must survive, got:\n{output}"
+    );
+    assert!(
+        !output.contains("const d ="),
+        "non-exported alias should still be inlined, got:\n{output}"
+    );
+    assert!(output.contains("export { o, f }"), "{output}");
+}
+
+#[test]
+fn exported_builtin_alias_declaration_is_kept_through_pipeline() {
+    let input = r#"
+var o = Object.create;
+function f(q) {
+    return o(q);
+}
+export { o, f };
+"#;
+    // SmartRename may respell the binding; the export must still name a
+    // declared binding and the module must validate as a graph.
+    let output = apply_pipeline(input);
+    assert!(
+        output.contains("= Object.create;"),
+        "exported alias declaration must survive, got:\n{output}"
+    );
+    assert!(output.contains("as o, f }"), "{output}");
+    let findings = validate_output_modules(&[("input.js".to_string(), output)]);
+    assert!(findings.is_empty(), "{findings:#?}");
+}
+
+#[test]
+fn temp_read_in_a_computed_object_key_counts_as_a_use() {
+    // The computed key is the second read of `t`; the declaration must not be
+    // removed on the strength of the first one alone.
+    let input = r#"
+function read(foo) {
+    const t = foo;
+    use(t.value);
+    return { [t.key]: 1 };
+}
+"#;
+    let output = apply(input);
+    assert!(
+        !output.contains("[t.key]") || output.contains("const t = foo"),
+        "{output}"
+    );
+    assert!(
+        output.contains("[foo.key]: 1") || output.contains("const t = foo"),
+        "{output}"
+    );
+}
+
+#[test]
+fn single_read_temp_in_a_computed_object_key_is_inlined() {
+    let input = r#"
+function read(foo) {
+    const t = foo;
+    return { [t.key]: 1 };
+}
+"#;
+    let expected = r#"
+function read(foo) {
+    return {
+        [foo.key]: 1
+    };
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn generated_alias_chain_inlines_to_its_source() {
+    // `$` is replaced by its init `x`, and `x` by `D`; the replacement for `$`
+    // must already be `D`, or the removed middle link is left behind.
+    let input = r#"
+function factory(l) {
+    var D = function() {};
+    D.foo = 1;
+    const x = D;
+    const $ = x;
+    l.default = $;
+}
+"#;
+    let output = apply(input);
+    assert!(output.contains("l.default = D;"), "{output}");
+    assert!(!output.contains("const x"), "{output}");
+    assert!(!output.contains("const $"), "{output}");
+}
+
+#[test]
+fn generated_alias_chain_preserves_shadowed_source_at_final_use() {
+    let input = r#"
+function f(D) {
+    const x = D;
+    const y = x;
+    { let D = 2; console.log(y, D); }
+}
+"#;
+    let expected = r#"
+function f(D) {
+    const y = D;
+    { let D = 2; console.log(y, D); }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+    assert_eq_normalized(&apply_pipeline(input), expected);
+}
+
+#[test]
+fn longer_alias_chain_preserves_shadowed_source_at_final_use() {
+    let input = r#"
+function f(D) {
+    const x = D;
+    const y = x;
+    const z = y;
+    { let D = 2; console.log(z, D); }
+}
+"#;
+    let expected = r#"
+function f(D) {
+    const z = D;
+    { let D = 2; console.log(z, D); }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn exported_generated_alias_declaration_is_kept() {
+    // `export { qo as Text }` is a use the statement-run analysis cannot see.
+    // Inlining the one visible use is fine; the declaration must stay.
+    let input = r#"
+const Uo = create();
+const qo = Uo;
+const Yo = uo(qo);
+export { qo as Text, Yo };
+"#;
+    let output = apply(input);
+    assert!(output.contains("const qo = Uo"), "{output}");
+    assert!(output.contains("export { qo as Text, Yo }"), "{output}");
+}
+
+#[test]
+fn generated_alias_used_in_a_later_statement_run_is_kept() {
+    // The `import` splits the module body into two statement runs. The alias
+    // has one use in its own run and another in the function declared after
+    // the import; inlining it would leave that later use dangling.
+    let input = r#"
+const To = create();
+const Ko1 = To;
+const Po = uo(Ko1);
+import x from "./x.js";
+function View() {
+  return render(Ko1, x);
+}
+export { Po, View };
+"#;
+    let output = apply(input);
+    assert!(output.contains("const Ko1 = To"), "{output}");
+    assert!(output.contains("render(Ko1, x)"), "{output}");
+}
+
+#[test]
+fn alias_used_as_a_jsx_tag_keeps_its_declaration() {
+    // The temp inliner rewrites expression positions; a JSX tag name is not
+    // one. Counting the tag as the single use and then removing the
+    // declaration leaves `<I/>` naming nothing.
+    let input = r#"
+function View({ TypographyComponent, rest }) {
+  if (TypographyComponent) {
+    const I = TypographyComponent;
+    return <I Component="div" {...rest}/>;
+  }
+  return null;
+}
+"#;
+    let output = apply(input);
+    assert!(output.contains("const I = TypographyComponent"), "{output}");
+    assert!(output.contains("<I Component"), "{output}");
+}
+
+#[test]
+fn no_builtin_alias_inline_when_module_has_dynamic_scope() {
+    for hazard in ["eval(code);", "with (scope) { observe(); }"] {
+        let input = format!("const e = Object.freeze;\n{hazard}\nuse(e(value));\nuse(e(other));\n");
+        assert_eq_normalized(&apply(&input), &input);
+    }
+}
+
+#[test]
+fn no_builtin_alias_inline_inside_a_with_body() {
+    // The statement-list pass sees only the `with` body, where the enclosing
+    // `with` is invisible; the module-wide hazard has to reach it. Inlining
+    // here would read `Object` from the `with` object once per use instead of
+    // once at the alias.
+    let input = r#"
+with ({ get Object() { log('lookup'); return globalThis.Object; } }) {
+    const freeze = Object.freeze;
+    log(freeze({}));
+    log(freeze({}));
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+    assert_eq_normalized(&apply_pipeline(input), input);
+}
+
+#[test]
+fn no_builtin_alias_inline_in_function_body_when_module_has_direct_eval() {
+    // A sloppy direct eval at module level can declare `Object` in the scope
+    // the function body resolves against; the body's own scan cannot see it.
+    let input = r#"
+eval(code);
+function run() {
+    const freeze = Object.freeze;
+    return [freeze({}), freeze({})];
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
 }

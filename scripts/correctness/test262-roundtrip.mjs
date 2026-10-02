@@ -40,6 +40,7 @@ import {
   preflightTest262Baseline,
   validateTest262BaselineOptions,
 } from "./test262-baseline.mjs";
+import { parseExactSpec, releaseDateCutoff, RESOLUTION_WINDOW_DAYS } from "../repro/lib/release-date.mjs";
 
 export { parseTestMetadata, runnableVariants } from "./test262-metadata.mjs";
 
@@ -63,8 +64,8 @@ const supportedPipelines = new Set([
 const supportedLevels = new Set(["minimal", "standard", "aggressive"]);
 const terserPackages = [{ name: "terser", spec: "terser@5.31.6" }];
 const babelPackages = [
-  { name: "@babel/core", spec: "@babel/core@7.25.2" },
-  { name: "@babel/preset-env", spec: "@babel/preset-env@7.25.4" },
+  { name: "@babel/core", spec: "@babel/core@7.29.7" },
+  { name: "@babel/preset-env", spec: "@babel/preset-env@7.29.7" },
 ];
 const swcPackages = [{ name: "@swc/core", spec: "@swc/core@1.7.26" }];
 const esbuildPackages = [{ name: "esbuild", spec: "esbuild@0.23.1" }];
@@ -83,7 +84,7 @@ const producerDefinitions = {
     config: { compress: { passes: 2 }, mangle: { toplevel: true }, asciiOnly: true },
   },
   "babel-env-terser": {
-    version: "babel-7.25.2+preset-env-7.25.4+terser-5.31.6",
+    version: "babel-7.29.7+preset-env-7.29.7+terser-5.31.6",
     config: { babelTargets: { ie: "11" }, bugfixes: true, modules: false, terser: "light" },
   },
   "swc-minify": {
@@ -1824,7 +1825,17 @@ export function createToolValidationCache() {
   };
 }
 
+// Producer packages resolve their dependencies as of their release date (see
+// `release-date.mjs`). A root installed under another resolution rule is
+// reinstalled once instead of reused.
+const toolResolutionMarker = `npm --before: ${RESOLUTION_WINDOW_DAYS} day(s) after newest publish\n`;
+
 function ensureToolPackages(toolRoot, packages) {
+  const marker = join(toolRoot, ".installed");
+  if (!existsSync(marker) || readFileSync(marker, "utf8") !== toolResolutionMarker) {
+    rmSync(join(toolRoot, "node_modules"), { recursive: true, force: true });
+    rmSync(join(toolRoot, "package-lock.json"), { force: true });
+  }
   const missing = missingToolPackageSpecs(toolRoot, packages);
   if (missing.length === 0) {
     return;
@@ -1853,6 +1864,7 @@ function ensureToolPackages(toolRoot, packages) {
     rmSync(join(toolRoot, "package-lock.json"), { force: true });
     installToolPackages(toolRoot, packages);
   }
+  writeFileSync(marker, toolResolutionMarker);
 }
 
 export function missingToolPackageSpecs(toolRoot, packages) {
@@ -1860,21 +1872,27 @@ export function missingToolPackageSpecs(toolRoot, packages) {
   const toolRequire = existsSync(packageJson)
     ? createRequire(pathToFileURL(packageJson))
     : null;
-  return packages.filter(({ name }) => {
+  return packages.filter(({ name, spec }) => {
     if (!toolRequire) {
       return true;
     }
     try {
       toolRequire.resolve(name);
-      return false;
     } catch {
       return true;
     }
+    // A resolvable package at another version (an older root, or a bumped
+    // spec) is reinstalled rather than reused.
+    const manifest = join(toolRoot, "node_modules", name, "package.json");
+    const installed = existsSync(manifest) ? JSON.parse(readFileSync(manifest, "utf8")).version : null;
+    return installed !== parseExactSpec(spec)?.version;
   });
 }
 
 function installToolPackages(toolRoot, packages) {
-  runChecked("npm", ["install", "--silent", "--no-save", ...packages.map(({ spec }) => spec)], {
+  const specs = packages.map(({ spec }) => spec);
+  const cutoff = releaseDateCutoff(specs, (name) => runChecked("npm", ["view", name, "time", "--json"]).stdout);
+  runChecked("npm", ["install", "--silent", "--no-save", "--before", cutoff, ...specs], {
     cwd: toolRoot,
   });
 }

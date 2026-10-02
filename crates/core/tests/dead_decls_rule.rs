@@ -28,6 +28,20 @@ fn render_default(source: &str) -> String {
     .code
 }
 
+/// The CLI default: remove only declarations a rewrite made dead.
+fn render_transform_only(source: &str) -> String {
+    decompile(
+        source,
+        DecompileOptions {
+            filename: "fixture.js".to_string(),
+            dce_mode: wakaru_core::DceMode::TransformOnly,
+            ..Default::default()
+        },
+    )
+    .expect("decompile should succeed")
+    .code
+}
+
 #[test]
 fn unused_local_undefined_initializer_is_removed() {
     let input = r#"
@@ -474,4 +488,84 @@ export const x = a();
     let output = render_with_dce(input);
     // b must survive — a's var init (`() => b()`) still references it
     insta::assert_snapshot!(output);
+}
+
+#[test]
+fn helper_referenced_only_from_preserved_dead_code_is_kept() {
+    // Babel `_extends` helper. Its live call becomes an object spread, so after
+    // the rewrite the only remaining calls sit inside `unusedHistory`, which
+    // was already dead in the input and is therefore preserved by
+    // transform-only cleanup. The helper those calls reach must be preserved
+    // with it, or the kept code references a removed declaration.
+    let input = r#"
+function extend() {
+  return extend = Object.assign ? Object.assign.bind() : function(e) {
+    for (var t = 1; t < arguments.length; t++) {
+      var n = arguments[t];
+      for (var r in n) ({}).hasOwnProperty.call(n, r) && (e[r] = n[r]);
+    }
+    return e;
+  }, extend.apply(null, arguments);
+}
+function unusedHistory(state, next) {
+  extend(state, next);
+  return state;
+}
+export const merged = extend({}, base);
+"#;
+    let output = render_transform_only(input);
+    assert!(output.contains("extend(state, next)"), "{output}");
+    assert!(output.contains("function extend"), "{output}");
+    assert!(output.contains("merged = {"), "{output}");
+}
+
+#[test]
+fn with_statement_keeps_dead_declarations_module_wide() {
+    // `with` can resolve any name against its object at runtime; the
+    // module-wide skip in docs/rewrite-assumptions.md keeps every removable
+    // declaration, initialized or not.
+    let input = r#"
+function helper() { return 1; }
+function run(scope) {
+  var unused;
+  with (scope) { observe(); }
+  return 2;
+}
+export const value = run({});
+"#;
+    // Only the declaration kind changes; nothing is removed.
+    let expected = input.replace("var unused;", "let unused;");
+    assert_eq_normalized(&render_with_dce(input), expected.trim());
+}
+
+#[test]
+fn unknown_direct_eval_keeps_dead_declarations_module_wide() {
+    let input = r#"
+function helper() { return 1; }
+function run(source) {
+  return eval(source);
+}
+export const value = run("helper()");
+"#;
+    assert_eq_normalized(&render_with_dce(input), input.trim());
+}
+
+#[test]
+fn known_direct_eval_keeps_only_mentioned_dead_declarations() {
+    let input = r#"
+function helper() { return 1; }
+function other() { return 2; }
+function run() {
+  return eval("helper()");
+}
+export const value = run();
+"#;
+    let expected = r#"
+function helper() { return 1; }
+function run() {
+  return eval("helper()");
+}
+export const value = run();
+"#;
+    assert_eq_normalized(&render_with_dce(input), expected.trim());
 }

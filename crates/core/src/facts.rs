@@ -10,10 +10,8 @@
 //! These facts are the foundation for cross-module analysis in the multi-module
 //! `unpack()` path. Single-file `decompile()` does not use them.
 
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-};
+use crate::collections::{HashMap, HashSet};
+use std::fmt;
 
 use swc_core::atoms::Atom;
 use swc_core::common::Mark;
@@ -106,6 +104,7 @@ pub enum TypeScriptHelperKind {
     Awaiter,
     Generator,
     Values,
+    AsyncValues,
     Assign,
     Rest,
     Extends,
@@ -168,6 +167,28 @@ pub struct CommonJsDefaultObjectFact {
     pub composition_sources: Vec<Atom>,
 }
 
+/// `export { Imported as Exported } from "./source"`.
+///
+/// `ExportFact.local` is `None` for this shape. The imported name has to be
+/// kept separately so a later hop can follow `Imported`, not the local binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReexportFact {
+    pub exported: Atom,
+    pub imported: Atom,
+    pub source: Atom,
+}
+
+/// An import that is still the callee of `[[Call]]` on the facts AST.
+///
+/// `consumed_by_exports == None` means the call remains. `Some` means class
+/// recovery rewrites it to `super` unless one of those exports is itself pinned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportCallEdge {
+    pub source: Atom,
+    pub imported: Atom,
+    pub consumed_by_exports: Option<Vec<Atom>>,
+}
+
 /// Facts extracted from one module after Stage 2.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModuleFacts {
@@ -189,6 +210,15 @@ pub struct ModuleFacts {
     /// may depend on another provider, so local absence is not proof that a
     /// requested name should come from the default object.
     pub has_export_all: bool,
+    /// Specifiers of each `export * from`. Empty when `has_export_all` was set
+    /// without a recorded source. Multiple entries conflict; a single entry can
+    /// be followed to the defining module.
+    pub export_star_sources: Vec<Atom>,
+    pub reexports: Vec<ReexportFact>,
+    pub import_call_edges: Vec<ImportCallEdge>,
+    /// Names of `export default { Name: localIdent }` properties. A default
+    /// import's `mod.Name.call` still needs that local constructor.
+    pub default_object_ident_properties: Vec<Atom>,
     pub ts_helper_exports: Vec<TypeScriptHelperExportFact>,
     /// Exported zero-argument functions proven to return a CommonJS namespace
     /// object containing registered TypeScript helpers.
@@ -212,7 +242,7 @@ pub struct ModuleFacts {
 /// Canonical form: no leading `./`, preserves the rest (e.g. `"lib/foo.js"`).
 #[derive(Debug, Clone, Default)]
 pub struct ModuleFactsMap {
-    inner: std::collections::HashMap<String, ModuleFacts>,
+    inner: crate::collections::HashMap<String, ModuleFacts>,
 }
 
 impl ModuleFactsMap {
@@ -381,6 +411,7 @@ impl fmt::Display for TypeScriptHelperKind {
             TypeScriptHelperKind::Awaiter => write!(f, "ts:awaiter"),
             TypeScriptHelperKind::Generator => write!(f, "ts:generator"),
             TypeScriptHelperKind::Values => write!(f, "ts:values"),
+            TypeScriptHelperKind::AsyncValues => write!(f, "ts:asyncValues"),
             TypeScriptHelperKind::Assign => write!(f, "ts:assign"),
             TypeScriptHelperKind::Rest => write!(f, "ts:rest"),
             TypeScriptHelperKind::Extends => write!(f, "ts:extends"),
@@ -592,6 +623,30 @@ impl fmt::Display for ModuleFacts {
 /// This collector reads the reconstructed ESM declarations produced by `UnEsm`
 /// and the helper unwrapping rules. It should be called immediately after Stage 2,
 /// before later rules modify the import/export structure.
+fn object_ident_property_names(object: &ObjectLit) -> Vec<Atom> {
+    let mut names = Vec::new();
+    for prop in &object.props {
+        let PropOrSpread::Prop(prop) = prop else {
+            continue;
+        };
+        match prop.as_ref() {
+            Prop::Shorthand(ident) => names.push(ident.sym.clone()),
+            Prop::KeyValue(pair) => {
+                let name = match &pair.key {
+                    PropName::Ident(ident) => Some(ident.sym.clone()),
+                    PropName::Str(value) => value.value.as_str().map(Atom::from),
+                    PropName::Num(_) | PropName::BigInt(_) | PropName::Computed(_) => None,
+                };
+                if let (Some(name), Expr::Ident(_)) = (name, strip_parens(&pair.value)) {
+                    names.push(name);
+                }
+            }
+            Prop::Assign(_) | Prop::Getter(_) | Prop::Setter(_) | Prop::Method(_) => {}
+        }
+    }
+    names
+}
+
 pub fn collect_module_facts(module: &Module) -> ModuleFacts {
     let mut facts = ModuleFacts::default();
 
@@ -642,6 +697,12 @@ pub fn collect_module_facts(module: &Module) -> ModuleFacts {
             ModuleDecl::ExportDefaultExpr(export) => {
                 let local = match export.expr.as_ref() {
                     Expr::Ident(ident) => Some(ident.sym.clone()),
+                    Expr::Object(object) => {
+                        facts
+                            .default_object_ident_properties
+                            .extend(object_ident_property_names(object));
+                        None
+                    }
                     _ => None,
                 };
                 facts.exports.push(ExportFact {
@@ -693,6 +754,13 @@ pub fn collect_module_facts(module: &Module) -> ModuleFacts {
                             } else {
                                 ExportKind::Named
                             };
+                            if let Some(src) = &named.src {
+                                facts.reexports.push(ReexportFact {
+                                    exported: exported_name.clone(),
+                                    imported: local_name.clone(),
+                                    source: str_to_atom(&src.value),
+                                });
+                            }
                             facts.exports.push(ExportFact {
                                 exported: exported_name,
                                 local: named.src.is_none().then_some(local_name),
@@ -716,7 +784,12 @@ pub fn collect_module_facts(module: &Module) -> ModuleFacts {
                     }
                 }
             }
-            ModuleDecl::ExportAll(_) => facts.has_export_all = true,
+            ModuleDecl::ExportAll(export) => {
+                facts.has_export_all = true;
+                facts
+                    .export_star_sources
+                    .push(str_to_atom(&export.src.value));
+            }
             _ => {}
         }
     }
@@ -761,8 +834,8 @@ fn collect_ts_helper_namespace_factory_exports(module: &Module) -> Vec<Atom> {
 }
 
 fn body_returns_cjs_namespace(stmts: &[Stmt]) -> bool {
-    let mut namespace_objects = HashSet::new();
-    let mut declared_bindings = HashSet::new();
+    let mut namespace_objects = HashSet::default();
+    let mut declared_bindings = HashSet::default();
     for stmt in stmts {
         let Stmt::Decl(Decl::Var(var)) = stmt else {
             continue;
@@ -779,7 +852,7 @@ fn body_returns_cjs_namespace(stmts: &[Stmt]) -> bool {
         }
     }
 
-    let mut module_objects = HashSet::new();
+    let mut module_objects = HashSet::default();
     for stmt in stmts {
         let Stmt::Decl(Decl::Var(var)) = stmt else {
             continue;
@@ -1050,6 +1123,8 @@ fn helper_kind_from_transpiler(kind: TranspilerHelperKind) -> Option<HelperKind>
         TranspilerHelperKind::CallSuper => Some(HelperKind::CallSuper),
         TranspilerHelperKind::AsyncToGenerator => Some(HelperKind::AsyncToGenerator),
         TranspilerHelperKind::TaggedTemplateLiteral => Some(HelperKind::TaggedTemplateLiteral),
+        // Only same-module `for await` recovery consumes this helper today.
+        TranspilerHelperKind::AsyncIterator => None,
         TranspilerHelperKind::Typeof => None,
         TranspilerHelperKind::DefineProperty => None,
         TranspilerHelperKind::CreateClass => None,
@@ -1069,7 +1144,7 @@ pub fn collect_commonjs_default_object(
     unresolved_mark: Mark,
 ) -> Option<CommonJsDefaultObjectFact> {
     let uses = BindingUseIndex::collect(module);
-    let mut object_bindings: HashMap<_, &ObjectLit> = HashMap::new();
+    let mut object_bindings: HashMap<_, &ObjectLit> = HashMap::default();
 
     for item in &module.body {
         let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
@@ -1109,7 +1184,7 @@ pub fn collect_commonjs_default_object(
     };
     let object = object?;
 
-    let mut properties = HashSet::new();
+    let mut properties = HashSet::default();
     for prop in &object.props {
         let PropOrSpread::Prop(prop) = prop else {
             continue;
@@ -1566,7 +1641,7 @@ fn static_object_property_name(prop: &Prop) -> Option<Atom> {
 
 fn collect_default_object_helper_exports(module: &Module) -> Vec<HelperExportFact> {
     let local_helpers = collect_transpiler_helpers(module);
-    let local_kinds: std::collections::HashMap<Atom, HelperKind> = local_helpers
+    let local_kinds: crate::collections::HashMap<Atom, HelperKind> = local_helpers
         .iter()
         .filter_map(|((local, _), kind)| {
             helper_kind_from_transpiler(*kind).map(|kind| (local.clone(), kind))
@@ -1638,6 +1713,7 @@ fn helper_kind_from_ts(kind: TsHelperKind) -> TypeScriptHelperKind {
         TsHelperKind::Awaiter => TypeScriptHelperKind::Awaiter,
         TsHelperKind::Generator => TypeScriptHelperKind::Generator,
         TsHelperKind::Values => TypeScriptHelperKind::Values,
+        TsHelperKind::AsyncValues => TypeScriptHelperKind::AsyncValues,
         TsHelperKind::Assign => TypeScriptHelperKind::Assign,
         TsHelperKind::Rest => TypeScriptHelperKind::Rest,
         TsHelperKind::Extends => TypeScriptHelperKind::Extends,
@@ -1659,6 +1735,7 @@ fn ts_helper_kind_from_name(name: &str) -> Option<TypeScriptHelperKind> {
         "__awaiter" => Some(TypeScriptHelperKind::Awaiter),
         "__generator" => Some(TypeScriptHelperKind::Generator),
         "__values" | "_ts_values" => Some(TypeScriptHelperKind::Values),
+        "__asyncValues" => Some(TypeScriptHelperKind::AsyncValues),
         "__assign" => Some(TypeScriptHelperKind::Assign),
         "__rest" => Some(TypeScriptHelperKind::Rest),
         "__extends" => Some(TypeScriptHelperKind::Extends),

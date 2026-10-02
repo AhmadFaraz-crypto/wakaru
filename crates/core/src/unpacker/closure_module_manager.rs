@@ -6,7 +6,7 @@
 //! of inventing imports or exports that the input did not contain. Reject any
 //! unguarded statement whose placement cannot be preserved without guessing.
 
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::common::{sync::Lrc, SourceMap, Span, Spanned, DUMMY_SP};
@@ -93,7 +93,7 @@ pub(super) fn detect_from_module(
                 .and_then(|candidate| candidate.id.clone())
         });
 
-    let mut filenames = HashSet::new();
+    let mut filenames = HashSet::default();
     let mut modules = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let candidate_source_range = candidate.source_range(&cm)?;
@@ -116,6 +116,8 @@ pub(super) fn detect_from_module(
             inspection_context_ranges: Vec::new(),
             source_input: String::new(),
             generated_source_map: emitted.source_map,
+            verbatim_source_offset: None,
+            mapped_in_every_mode: true,
         });
     }
 
@@ -156,7 +158,7 @@ fn decode_module_graph(encoded: &str) -> Option<Vec<GraphModule>> {
     }
 
     let mut modules: Vec<GraphModule> = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     for record in encoded.split('/') {
         let (id, encoded_dependencies) = record
             .split_once(':')
@@ -748,7 +750,7 @@ fn assign_segment_ids(
         return None;
     }
 
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     for (index, candidate) in candidates.iter_mut().enumerate() {
         if let Some(positional_ids) = &positional_ids {
             let positional_id = positional_ids.get(index)?;
@@ -812,8 +814,8 @@ fn validate_boundary_helpers(
     candidates: &[SegmentCandidate],
     initializer: Option<&Initializer>,
 ) -> Option<()> {
-    let mut begin_counts: HashMap<&str, usize> = HashMap::new();
-    let mut end_counts: HashMap<&str, usize> = HashMap::new();
+    let mut begin_counts: HashMap<&str, usize> = HashMap::default();
+    let mut end_counts: HashMap<&str, usize> = HashMap::default();
     let has_positional_basis = proven_response_order(candidates, initializer)
         .is_some_and(|ids| ids.len() == candidates.len());
     for candidate in candidates
@@ -981,7 +983,7 @@ mod tests {
 
     #[test]
     fn preserves_case_insensitive_javascript_extensions() {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         assert_eq!(module_filename("feature.JS", &mut seen), "feature.JS");
         assert_eq!(module_filename("lazy.MjS", &mut seen), "lazy.MjS");
         assert_eq!(module_filename("server.CJS", &mut seen), "server.CJS");

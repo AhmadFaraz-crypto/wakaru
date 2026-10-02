@@ -1,7 +1,7 @@
+use crate::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::cell::Cell;
 use std::cell::OnceCell;
-use std::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::common::Mark;
@@ -13,6 +13,7 @@ use swc_core::ecma::ast::{
 use super::helper_matcher::{
     binding_key, collect_refs, expr_matches_binding, member_prop_name,
     remaining_refs_outside_declarations, remaining_refs_outside_var_declarators,
+    removable_without_remaining_refs, removable_without_remaining_var_declarator_refs,
     remove_fn_decls_from_body_by_binding, remove_import_specifiers_by_binding,
     remove_var_declarators_by_binding, static_member_prop_name,
 };
@@ -92,6 +93,7 @@ pub(crate) enum TranspilerHelperKind {
     Inherits,
     CallSuper,
     AsyncToGenerator,
+    AsyncIterator,
     TaggedTemplateLiteral,
     DefineProperty,
     CreateClass,
@@ -104,6 +106,7 @@ pub(crate) enum TsHelperKind {
     Awaiter,
     Generator,
     Values,
+    AsyncValues,
     Assign,
     Rest,
     Extends,
@@ -158,8 +161,15 @@ impl LocalHelperContext {
         let tslib_namespaces = collect_tslib_namespace_bindings(module, unresolved_mark);
         let (swc_member_helpers, swc_member_helper_namespaces) =
             collect_swc_member_helpers(module, unresolved_mark);
+        let mut helpers = collect_transpiler_helpers_inner(module, unresolved_mark);
+        // A modern SWC runtime require returns a namespace, not its `_` export.
+        // Async consumers use the separate member facts for these bindings.
+        helpers.retain(|key, kind| {
+            *kind != TranspilerHelperKind::AsyncToGenerator
+                || !swc_member_helper_namespaces.contains_key(key)
+        });
         Self {
-            helpers: collect_transpiler_helpers_inner(module, unresolved_mark),
+            helpers,
             swc_member_helpers,
             swc_member_helper_namespaces,
             ts_helpers: collect_ts_helpers(module, &tslib_namespaces, unresolved_mark),
@@ -237,11 +247,7 @@ impl LocalHelperContext {
             return;
         }
 
-        let remaining = remaining_refs_outside_declarations(module, &helper_keys, &helper_keys);
-        let removable: HashSet<BindingKey> = helper_keys
-            .into_iter()
-            .filter(|key| !remaining.contains(key))
-            .collect();
+        let removable = removable_without_remaining_refs(module, &helper_keys);
         if !removable.is_empty() {
             remove_var_declarators_by_binding(&mut module.body, &removable);
             remove_fn_decls_from_body_by_binding(&mut module.body, &removable);
@@ -255,11 +261,7 @@ impl LocalHelperContext {
             return;
         }
 
-        let remaining = remaining_refs_outside_var_declarators(module, &helper_keys, &helper_keys);
-        let removable: HashSet<BindingKey> = helper_keys
-            .into_iter()
-            .filter(|key| !remaining.contains(key))
-            .collect();
+        let removable = removable_without_remaining_var_declarator_refs(module, &helper_keys);
         if removable.is_empty() {
             return;
         }
@@ -331,7 +333,7 @@ impl LocalHelperContext {
             .filter(|(key, _)| !remaining_roots.contains(key))
             .collect();
         if removable_roots.is_empty() {
-            return HashMap::new();
+            return HashMap::default();
         }
 
         let helper_dependencies = self.helper_dependencies(module, &removable_roots);

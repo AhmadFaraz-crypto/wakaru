@@ -30,7 +30,7 @@ console.log(obj);
 "#;
     let expected = r#"
 const obj = {};
-obj["k"] = 1;
+obj.k = 1;
 console.log(obj);
 "#;
     assert_eq_normalized(&render(input), expected.trim());
@@ -55,8 +55,8 @@ console.log(r);
 "#;
     let expected = r#"
 let r;
-(r = {})["FETCH_START"] = (e) => ({ ...e, isLoading: true });
-r["FETCH_SUCCESS"] = (e, data) => ({ ...e, data });
+(r = {}).FETCH_START = (e) => ({ ...e, isLoading: true });
+r.FETCH_SUCCESS = (e, data) => ({ ...e, data });
 console.log(r);
 "#;
     assert_eq_normalized(&render(input), expected.trim());
@@ -191,7 +191,7 @@ console.log(obj);
 "#;
     let expected = r#"
 const obj = {};
-obj["k"] = 1;
+obj.k = 1;
 console.log(obj);
 "#;
     assert_eq_normalized(&render_rule(input, |_| UnDefineProperty), expected.trim());
@@ -207,7 +207,7 @@ console.log(obj);
 "#;
     let expected = r#"
 const obj = {};
-obj["k"] = 1;
+obj.k = 1;
 console.log(obj);
 "#;
     assert_eq_normalized(&render(input), expected);
@@ -340,4 +340,122 @@ const result = helper({}, key, value);
 const result = { [key]: value };
 "#;
     assert_eq_normalized(&render(input), expected);
+}
+
+#[test]
+fn side_effect_imports_survive_helper_removal() {
+    // Removing the helper's own imports must not sweep up imports that never
+    // had a specifier to begin with.
+    let input = r#"
+import "./side.js";
+import "./other.css";
+function a(e, t, n) {
+    return (t = i(t)) in e ? Object.defineProperty(e, t, { value: n, enumerable: !0, configurable: !0, writable: !0 }) : e[t] = n, e;
+}
+function i(e) {
+    var t = function(e, t) {
+        if ("object" != typeof e || !e) return e;
+        var n = e[Symbol.toPrimitive];
+        if (void 0 !== n) {
+            var o = n.call(e, t || "default");
+            if ("object" != typeof o) return o;
+            throw new TypeError("@@toPrimitive must return a primitive value.");
+        }
+        return ("string" === t ? String : Number)(e);
+    }(e, "string");
+    return "symbol" == typeof t ? t : t + "";
+}
+var o = {};
+a(o, "x", 1);
+export { o };
+"#;
+    let output = render(input);
+    assert!(output.contains(r#"import "./side.js";"#), "{output}");
+    assert!(output.contains(r#"import "./other.css";"#), "{output}");
+    assert!(!output.contains("function a("), "{output}");
+}
+
+#[test]
+fn helper_dependency_stays_while_a_surviving_helper_still_calls_it() {
+    // `a` (_defineProperty) goes away, `i` (toPropertyKey) stays because `o`
+    // (_defineProperties) still calls it, so `r` (_typeof), which only `i`
+    // calls, must stay too.
+    let input = r#"
+function r(e) {
+    return (r = "function" == typeof Symbol && "symbol" == typeof Symbol.iterator ? function(e) {
+        return typeof e;
+    } : function(e) {
+        return e && "function" == typeof Symbol && e.constructor === Symbol && e !== Symbol.prototype ? "symbol" : typeof e;
+    })(e);
+}
+function o(e, t) {
+    for (var n = 0; n < t.length; n++) {
+        var r = t[n];
+        r.enumerable = r.enumerable || !1;
+        r.configurable = !0;
+        "value" in r && (r.writable = !0);
+        Object.defineProperty(e, i(r.key), r);
+    }
+}
+function a(e, t, n) {
+    return (t = i(t)) in e ? Object.defineProperty(e, t, { value: n, enumerable: !0, configurable: !0, writable: !0 }) : e[t] = n, e;
+}
+function i(e) {
+    var t = function(e, t) {
+        if ("object" != r(e) || !e) return e;
+        var n = e[Symbol.toPrimitive];
+        if (void 0 !== n) {
+            var o = n.call(e, t || "default");
+            if ("object" != r(o)) return o;
+            throw new TypeError("@@toPrimitive must return a primitive value.");
+        }
+        return ("string" === t ? String : Number)(e);
+    }(e, "string");
+    return "symbol" == r(t) ? t : t + "";
+}
+var c = {};
+a(c, "x", 1);
+o(c, [{ key: "y", value: 2 }]);
+export { c };
+"#;
+    let output = render(input);
+    assert!(!output.contains("function a("), "{output}");
+    assert!(output.contains("function o("), "{output}");
+    assert!(output.contains("function i("), "{output}");
+    let calls_typeof_helper = output.contains(" r(") || output.contains("(r(");
+    assert!(
+        !calls_typeof_helper || output.contains("function r("),
+        "typeof helper is called but not declared:\n{output}"
+    );
+}
+
+#[test]
+fn normalizes_literal_keys_it_synthesizes() {
+    // UnDefineProperty runs after UnBracketNotation, so it normalizes the
+    // keys it builds itself.
+    let input = r#"
+function a(e, t, n) {
+    if (t in e) {
+        Object.defineProperty(e, t, { value: n, enumerable: true, configurable: true, writable: true });
+    } else {
+        e[t] = n;
+    }
+    return e;
+}
+const obj = {};
+a(obj, "default", 1);
+a(obj, "1", 2);
+a(obj, "a-b", 3);
+a(obj, k, 4);
+use(a({}, "name", 5), a({}, "x-y", 6));
+"#;
+    let expected = r#"
+const obj = {};
+obj.default = 1;
+obj[1] = 2;
+obj["a-b"] = 3;
+obj[k] = 4;
+use({ name: 5 }, { ["x-y"]: 6 });
+"#;
+    assert_eq_normalized(&render(input), expected.trim());
 }

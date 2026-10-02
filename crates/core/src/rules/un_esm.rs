@@ -1,16 +1,19 @@
-use std::collections::{hash_map::Entry, HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
+use std::cell::OnceCell;
+use std::collections::hash_map::Entry;
 
 use swc_core::atoms::Atom;
 use swc_core::common::{Mark, Span, SyntaxContext, DUMMY_SP};
 use swc_core::ecma::ast::{
-    ArrowExpr, ArrowFunctionBody, AssignExpr, AssignOp, AssignTarget, BinaryOp, BindingIdent,
-    BlockStmt, CallExpr, Callee, CondExpr, Decl, ExportAll, ExportDecl, ExportDefaultExpr,
-    ExportNamedSpecifier, ExportSpecifier, Expr, ExprStmt, ForHead, ForInStmt, Function,
-    FunctionBody, Id, Ident, IdentName, IfStmt, ImportDecl, ImportDefaultSpecifier,
-    ImportNamedSpecifier, ImportSpecifier, Lit, MemberExpr, MemberProp, Module, ModuleDecl,
-    ModuleExportName, ModuleItem, NamedExport, ObjectPatProp, OptCall, OptChainBase, Pat, Prop,
-    PropName, PropOrSpread, ReturnStmt, SeqExpr, SimpleAssignTarget, Stmt, Str, TaggedTpl,
-    ThisExpr, UnaryOp, VarDecl, VarDeclKind, VarDeclarator,
+    ArrowExpr, ArrowFunctionBody, AssignExpr, AssignOp, AssignTarget, AutoAccessor, BinaryOp,
+    BindingIdent, BlockStmt, CallExpr, Callee, ClassProp, CondExpr, Constructor, Decl, ExportAll,
+    ExportDecl, ExportDefaultExpr, ExportNamedSpecifier, ExportSpecifier, Expr, ExprStmt, ForHead,
+    ForInStmt, ForOfStmt, Function, FunctionBody, Id, Ident, IdentName, IfStmt, ImportDecl,
+    ImportDefaultSpecifier, ImportNamedSpecifier, ImportSpecifier, ImportStarAsSpecifier, Lit,
+    MemberExpr, MemberProp, Module, ModuleDecl, ModuleExportName, ModuleItem, NamedExport,
+    ObjectPatProp, OptCall, OptChainBase, OptChainExpr, Pat, PrivateProp, Prop, PropName,
+    PropOrSpread, ReturnStmt, SeqExpr, SimpleAssignTarget, Stmt, Str, TaggedTpl, ThisExpr,
+    UnaryExpr, UnaryOp, UpdateExpr, VarDecl, VarDeclKind, VarDeclarator,
 };
 use swc_core::ecma::utils::{find_pat_ids, ExprFactory};
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
@@ -24,12 +27,15 @@ use crate::provider_namespace_repair::run_provider_namespace_repair;
 use crate::utils::paren::strip_parens;
 use crate::utils::prototype_members::is_prototype_mutating_member_name;
 
-use super::decl_utils::{collect_decl_names, collect_pat_names, same_ident};
+use super::decl_utils::{collect_decl_names, collect_pat_names, fresh_binding_ident, same_ident};
 use super::eval_utils::{
-    direct_eval_call_source, js_source_mentions_binding, DirectEvalAnalyzer, EvalCallSource,
+    direct_eval_call_source, js_source_mentions_binding, DirectEvalAnalyzer, DirectEvalPresence,
+    EvalCallSource,
 };
 use super::helper_matcher::count_binding_refs;
-use super::rename_utils::{collect_unresolved_reference_names, rename_bindings, BindingRename};
+use super::rename_utils::{
+    collect_module_names, collect_unresolved_reference_names, rename_bindings, BindingRename,
+};
 use super::RewriteLevel;
 
 pub struct UnEsm {
@@ -89,6 +95,7 @@ enum CjsExportKind {
         name: Atom,
         expr: Box<Expr>,
         is_void: bool,
+        is_live: bool,
     },
     /// exports.default = expr → export default expr
     NamedDefault { expr: Box<Expr> },
@@ -158,18 +165,52 @@ impl VisitMut for UnEsm {
         if self.level < RewriteLevel::Standard {
             return;
         }
+        // UnAssignmentMerging owns safe chain splitting. UnEsm recovers the
+        // remaining top-level named-export chains as whole operations. If a
+        // chain still remains, keep the CommonJS boundary before any
+        // import/export rewrites; converting only its outer write leaves an
+        // orphaned RHS.
+        let original_body = normalize_named_export_chains(module, self.unresolved_mark);
         let current_filename = self.current_filename.clone();
         let has_local_self_require =
             contains_local_self_require(module, self.unresolved_mark, current_filename.as_deref());
-        // The named-member argument pre-pass cannot prove that a self export
-        // is initialized before the call. Keep the whole CommonJS boundary;
-        // otherwise an early partial-object read becomes an ESM TDZ read.
+        let conditional_original_body = match recover_conditional_named_exports(
+            module,
+            self.unresolved_mark,
+            has_local_self_require,
+        ) {
+            ConditionalExportRecovery::NotApplicable => None,
+            ConditionalExportRecovery::Recovered(original) => Some(original),
+            ConditionalExportRecovery::Unsupported => {
+                if let Some(original) = original_body {
+                    module.body = original;
+                }
+                return;
+            }
+        };
+        if has_unhandled_named_export_chain(module, self.unresolved_mark) {
+            if let Some(original) = original_body
+                .as_ref()
+                .or(conditional_original_body.as_ref())
+            {
+                module.body = original.clone();
+            }
+            return;
+        }
+        // Named/default member argument pre-passes cannot prove that a self
+        // export is initialized before the call. Keep the whole CommonJS
+        // boundary; otherwise an early partial-object read becomes an ESM TDZ
+        // read.
         if has_local_self_require
-            && has_toplevel_require_named_member_self_arg(
+            && (has_toplevel_require_named_member_self_arg(
                 &module.body,
                 self.unresolved_mark,
                 current_filename.as_deref(),
-            )
+            ) || has_toplevel_require_default_member_self_arg(
+                &module.body,
+                self.unresolved_mark,
+                current_filename.as_deref(),
+            ))
         {
             return;
         }
@@ -178,16 +219,28 @@ impl VisitMut for UnEsm {
         } else {
             None
         };
+        if !prepare_swc_async_namespace_requires(module, self.unresolved_mark) {
+            if let Some(original) = conditional_original_body {
+                module.body = original;
+            }
+            return;
+        }
         recover_coupled_commonjs_default_binding(module, self.unresolved_mark);
         // Phase -1: hoist require() calls out of complex expressions
         hoist_embedded_requires(module, self.unresolved_mark);
+        // Parallel to the named-member pass inside hoist_embedded_requires.
+        // Must not sit behind has_hoistable_require: a file whose only
+        // hoistable shape is `require(mod).default` as a call argument would
+        // otherwise skip the pre-pass entirely.
+        hoist_toplevel_require_default_member_args(module, self.unresolved_mark);
         split_called_module_exports_assignments(module, self.unresolved_mark);
         split_chained_local_module_exports_assignments(module, self.unresolved_mark);
         // Phase 0: split compound `var s = exports.X = expr` →
         //          `var s = expr; exports.X = s;`
         split_compound_exports(module, self.unresolved_mark);
         rewrite_commonjs_export_star_loops(module, self.unresolved_mark);
-        rewrite_webpack_export_getters(module, self.unresolved_mark);
+        let live_webpack_export_assignments =
+            rewrite_webpack_export_getters(module, self.unresolved_mark);
         rewrite_recovered_default_only_default_compat_block(module, self.unresolved_mark);
         remove_dead_named_only_default_compat_blocks(module, self.unresolved_mark);
         lower_exported_cjs_requires(module, self.unresolved_mark);
@@ -195,19 +248,82 @@ impl VisitMut for UnEsm {
         let unresolved_reference_names =
             collect_unresolved_reference_names(module, self.unresolved_mark);
         let all_declared_names = collect_all_declared_names(module);
-        let binding_uses = BindingUseIndex::collect(module);
-        let commonjs_read_recovery =
-            collect_commonjs_read_recovery_evidence(module, self.unresolved_mark, &binding_uses);
-        let require_bindings =
-            collect_stable_require_bindings(module, &binding_uses, self.unresolved_mark);
+        // The name inventory already proves whether any CommonJS runtime
+        // binding exists. Pure ESM still needs import ordering and export
+        // cleanup below, but cannot use any of these CommonJS proofs.
+        let (binding_uses, commonjs_read_recovery, require_bindings) =
+            if ["require", "exports", "module"]
+                .iter()
+                .any(|name| unresolved_reference_names.contains(&Atom::from(*name)))
+            {
+                let uses = BindingUseIndex::collect(module);
+                let evidence =
+                    collect_commonjs_read_recovery_evidence(module, self.unresolved_mark, &uses);
+                let requires = collect_stable_require_bindings(module, &uses, self.unresolved_mark);
+                (uses, evidence, requires)
+            } else {
+                Default::default()
+            };
 
+        let hoisted_bindings = collect_hoisted_top_level_bindings(module);
         let items = std::mem::take(&mut module.body);
 
         // Phase 1: classify
         let mut classified: Vec<Classified> = Vec::with_capacity(items.len());
 
+        let mut stable_default = None;
         for item in items {
-            classified.push(classify_item(item, self.unresolved_mark, &require_bindings));
+            let property_write = stable_default.as_ref().and_then(|binding| {
+                preserve_default_property_write(&item, binding, self.unresolved_mark)
+            });
+            let next_default =
+                top_level_module_exports_ident_assignment(&item, self.unresolved_mark).filter(
+                    |(span, _)| {
+                        Some(*span) == commonjs_read_recovery.stable_default_assignment_span
+                    },
+                );
+            let mut entry = classify_item(item, self.unresolved_mark, &require_bindings);
+            // The webpack pre-pass lowers getters to ordinary assignments.
+            // Restore their live semantics before snapshot analysis.
+            if let Classified::CjsExport {
+                span,
+                kind: CjsExportKind::Named { name, is_live, .. },
+            } = &mut entry
+            {
+                if live_webpack_export_assignments
+                    .iter()
+                    .any(|(live_span, live_name)| live_span == span && live_name == name)
+                {
+                    *is_live = true;
+                }
+            }
+            if let (
+                Some(write),
+                Classified::CjsExport {
+                    kind: CjsExportKind::Named { expr, is_void, .. },
+                    ..
+                },
+            ) = (property_write, &mut entry)
+            {
+                if matches!(expr.as_ref(), Expr::Ident(id)
+                    if stable_default.as_ref().is_some_and(|binding| same_ident(id, binding)))
+                {
+                    // Reading the proven stable default again is harmless;
+                    // keep the original named binding instead of an alias.
+                    classified.push(Classified::Keep(ModuleItem::Stmt(Stmt::Expr(ExprStmt {
+                        span: DUMMY_SP,
+                        expr: write,
+                    }))));
+                } else {
+                    *expr = write;
+                    // Even an undefined sentinel writes an observable property.
+                    *is_void = false;
+                }
+            }
+            classified.push(entry);
+            if let Some((_, binding)) = next_default {
+                stable_default = Some(binding);
+            }
         }
 
         // Webpack/Babel interop often emits:
@@ -263,7 +379,7 @@ impl VisitMut for UnEsm {
         }
 
         // For each unique name, find the last non-void index
-        let mut last_real: HashMap<Option<Atom>, usize> = HashMap::new();
+        let mut last_real: HashMap<Option<Atom>, usize> = HashMap::default();
         for e in &export_entries {
             if !e.is_void {
                 last_real.insert(e.name.clone(), e.classified_idx);
@@ -271,7 +387,8 @@ impl VisitMut for UnEsm {
         }
 
         // Build drop set
-        let mut drop_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut drop_set: crate::collections::HashSet<usize> =
+            crate::collections::HashSet::default();
         for e in &export_entries {
             if e.is_void {
                 drop_set.insert(e.classified_idx);
@@ -286,7 +403,7 @@ impl VisitMut for UnEsm {
         // longer needs a local import. The export-from declaration itself is
         // the module evaluation dependency. If any getter is dropped or the
         // binding has another use, retain the ordinary import.
-        let mut kept_reexport_counts: HashMap<BindingId, usize> = HashMap::new();
+        let mut kept_reexport_counts: HashMap<BindingId, usize> = HashMap::default();
         for (idx, item) in classified.iter().enumerate() {
             if drop_set.contains(&idx) {
                 continue;
@@ -308,10 +425,11 @@ impl VisitMut for UnEsm {
 
         // Phase 3: collect imports — build source_map keyed by String
         let mut source_order: Vec<String> = Vec::new();
-        let mut source_map: HashMap<String, SourceEntry> = HashMap::new();
+        let mut source_map: HashMap<String, SourceEntry> = HashMap::default();
 
         // First pass: mark which sources have CJS requires
-        let mut cjs_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cjs_sources: crate::collections::HashSet<String> =
+            crate::collections::HashSet::default();
         for c in classified.iter() {
             let src = match c {
                 Classified::CjsRequire(CjsRequireKind::Bare { source }) => source.clone(),
@@ -466,7 +584,7 @@ impl VisitMut for UnEsm {
         // Collect local names that conflict with export names. Export names
         // take priority (they're meaningful from the original source), so we
         // rename the conflicting locals to free up the name for the export.
-        let mut local_names: HashSet<Atom> = HashSet::new();
+        let mut local_names: HashSet<Atom> = HashSet::default();
         for item in &import_decls {
             if let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item {
                 for spec in &import.specifiers {
@@ -493,7 +611,7 @@ impl VisitMut for UnEsm {
         // Find export names that clash with existing locals.
         // Export names take priority (meaningful from original source), so
         // rename the conflicting locals before building export items.
-        let mut export_names: HashSet<Atom> = HashSet::new();
+        let mut export_names: HashSet<Atom> = HashSet::default();
         for (idx, c) in classified.iter().enumerate() {
             if drop_set.contains(&idx) {
                 continue;
@@ -504,6 +622,7 @@ impl VisitMut for UnEsm {
                         name,
                         expr,
                         is_void: false,
+                        ..
                     },
                 ..
             } = c
@@ -514,6 +633,37 @@ impl VisitMut for UnEsm {
                 }
             }
         }
+
+        // A CommonJS property assignment snapshots its RHS at this statement.
+        // Keep an identifier export as a live alias only when its binding is
+        // stable; a later direct or deferred write must not update the public
+        // property retroactively. Getter-based exports are deliberately live.
+        // Record this before conflict renames change binding identities.
+        let snapshot_export_indices: HashSet<usize> = classified
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, classified)| {
+                let Classified::CjsExport {
+                    kind:
+                        CjsExportKind::Named {
+                            expr,
+                            is_void: false,
+                            is_live: false,
+                            ..
+                        },
+                    ..
+                } = classified
+                else {
+                    return None;
+                };
+                let Expr::Ident(ident) = expr.as_ref() else {
+                    return None;
+                };
+                binding_uses
+                    .has_direct_write(&binding_id(ident))
+                    .then_some(idx)
+            })
+            .collect();
 
         // Rename conflicting locals before building exports. The export
         // expression can reference a conflicting module-level local, so apply
@@ -576,13 +726,24 @@ impl VisitMut for UnEsm {
                 Classified::CjsRequire(_) => {}     // skip, replaced by import
                 Classified::CjsExport { span, kind } => {
                     if drop_set.contains(&idx) {
-                        new_body.extend(build_dropped_export_side_effect_items(span, kind));
+                        new_body.extend(build_dropped_export_side_effect_items(
+                            span,
+                            kind,
+                            self.unresolved_mark,
+                            &hoisted_bindings,
+                        ));
                     } else {
+                        // A global has no module binding to re-export, so
+                        // copy its value like the CommonJS write did.
+                        let snapshot_ident = snapshot_export_indices.contains(&idx)
+                            || exports_unresolved_ident(&kind, self.unresolved_mark);
                         new_body.extend(build_export_items(
                             span,
                             kind,
+                            snapshot_ident,
                             &mut used_export_binding_names,
                             &unresolved_reference_names,
+                            &all_declared_names,
                         ));
                     }
                 }
@@ -779,21 +940,6 @@ fn collect_commonjs_read_recovery_evidence(
     }
 }
 
-#[derive(Default)]
-struct DirectEvalPresence {
-    found: bool,
-}
-
-impl Visit for DirectEvalPresence {
-    fn visit_call_expr(&mut self, call: &CallExpr) {
-        if direct_eval_call_source(call).is_some() {
-            self.found = true;
-            return;
-        }
-        call.visit_children_with(self);
-    }
-}
-
 /// Recover Babel runtime helpers whose mutable CommonJS value is always kept
 /// identical to one top-level function binding:
 ///
@@ -818,7 +964,8 @@ fn recover_coupled_commonjs_default_binding(module: &mut Module, unresolved_mark
     };
 
     // UnAssignmentMerging may have expanded a simple
-    // `module.exports = helper = value` into two adjacent assignments. Prove
+    // `module.exports = helper = value` into two adjacent assignments, written
+    // innermost first (`helper = value; module.exports = value;`). Prove
     // against a normalized clone so a failed proof never mutates the input.
     let mut proof_module = module.clone();
     if !merge_candidate_split_assignments(&mut proof_module, &plan.binding, unresolved_mark)
@@ -1068,10 +1215,19 @@ fn merge_split_coupled_assignment_pair(
     binding: &BindingId,
     unresolved_mark: Mark,
 ) -> Option<AssignExpr> {
+    // The split keeps the chained write order: the inner binding write comes
+    // first, the outer `module.exports` write second.
     let Stmt::Expr(first_statement) = first else {
         return None;
     };
-    let Expr::Assign(module_assignment) = strip_parens(&first_statement.expr) else {
+    let Expr::Assign(binding_assignment) = strip_parens(&first_statement.expr) else {
+        return None;
+    };
+
+    let Stmt::Expr(second_statement) = second else {
+        return None;
+    };
+    let Expr::Assign(module_assignment) = strip_parens(&second_statement.expr) else {
         return None;
     };
     if module_assignment.op != AssignOp::Assign {
@@ -1083,13 +1239,6 @@ fn merge_split_coupled_assignment_pair(
     if !is_module_exports_member(target, unresolved_mark) {
         return None;
     }
-
-    let Stmt::Expr(second_statement) = second else {
-        return None;
-    };
-    let Expr::Assign(binding_assignment) = strip_parens(&second_statement.expr) else {
-        return None;
-    };
     if binding_assignment.op != AssignOp::Assign
         || !assign_target_matches_binding(&binding_assignment.left, binding)
         || !same_split_coupled_value(&module_assignment.right, &binding_assignment.right)
@@ -1437,6 +1586,38 @@ fn collect_stable_default_assignment_span(
     Some(*span)
 }
 
+/// A named ESM export alone does not preserve a property on the default
+/// object. Keep that write as the export initializer, so aliases still observe
+/// it and its RHS/setter run once at the original position. The caller only
+/// enables this after the existing whole-module stable-default proof succeeds;
+/// writes to the initial `exports` object are a different lifetime.
+fn preserve_default_property_write(
+    item: &ModuleItem,
+    binding: &Ident,
+    unresolved_mark: Mark,
+) -> Option<Box<Expr>> {
+    let ModuleItem::Stmt(Stmt::Expr(statement)) = item else {
+        return None;
+    };
+    let Expr::Assign(assignment) = strip_parens(&statement.expr) else {
+        return None;
+    };
+    if assignment.op != AssignOp::Assign {
+        return None;
+    }
+    let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assignment.left else {
+        return None;
+    };
+    if !is_module_exports_expr(strip_parens(&member.obj), unresolved_mark) {
+        return None;
+    }
+    let mut assignment = assignment.clone();
+    let mut member = member.clone();
+    member.obj = Box::new(Expr::Ident(binding.clone()));
+    assignment.left = AssignTarget::Simple(SimpleAssignTarget::Member(member));
+    Some(Box::new(Expr::Assign(assignment)))
+}
+
 fn collect_stable_named_properties(
     module: &Module,
     unresolved_mark: Mark,
@@ -1450,8 +1631,8 @@ fn collect_stable_named_properties(
         undefined_after_value: bool,
     }
 
-    let mut direct_writes: HashMap<Atom, DirectWrites> = HashMap::new();
-    let mut exports_bindings = HashSet::new();
+    let mut direct_writes: HashMap<Atom, DirectWrites> = HashMap::default();
+    let mut exports_bindings = HashSet::default();
     for item in &module.body {
         let ModuleItem::Stmt(Stmt::Expr(statement)) = item else {
             continue;
@@ -1488,7 +1669,7 @@ fn collect_stable_named_properties(
         }
     }
     if exports_bindings.len() != 1 {
-        return HashSet::new();
+        return HashSet::default();
     }
     let exports_binding = exports_bindings
         .iter()
@@ -1498,7 +1679,7 @@ fn collect_stable_named_properties(
     // A bare escape/rebinding of `exports`, a computed access, or a delete
     // could change any named property. Keep the proof deliberately local to
     // modules whose complete runtime surface is static member access.
-    let mut write_counts: HashMap<Atom, usize> = HashMap::new();
+    let mut write_counts: HashMap<Atom, usize> = HashMap::default();
     for site in uses.use_sites(exports_binding) {
         match &site.kind {
             UseKind::StaticMemberRead(property) | UseKind::StaticMemberWrite(property)
@@ -1508,13 +1689,13 @@ fn collect_stable_named_properties(
                 // property as an accessor, and a `__proto__` write changes
                 // lookup for names without an own write. Neither surfaces as
                 // a write of the affected name, so the whole proof fails.
-                return HashSet::new();
+                return HashSet::default();
             }
             UseKind::StaticMemberRead(_) | UseKind::TypeofOperand => {}
             UseKind::StaticMemberWrite(property) => {
                 *write_counts.entry(property.clone()).or_default() += 1;
             }
-            _ => return HashSet::new(),
+            _ => return HashSet::default(),
         }
     }
 
@@ -1528,7 +1709,7 @@ fn collect_stable_named_properties(
             .iter()
             .any(|site| !matches!(site.kind, UseKind::TypeofOperand))
     }) {
-        return HashSet::new();
+        return HashSet::default();
     }
 
     direct_writes
@@ -1557,7 +1738,7 @@ impl<'a> UnresolvedBindingIdCollector<'a> {
         Self {
             name,
             unresolved_mark,
-            ids: HashSet::new(),
+            ids: HashSet::default(),
         }
     }
 }
@@ -1589,8 +1770,8 @@ fn recover_stable_commonjs_reads(
 
     let uses = BindingUseIndex::collect_module_items(body);
     let mut default_binding = None;
-    let mut stable_named_bindings = HashMap::new();
-    let mut named_bindings = HashMap::new();
+    let mut stable_named_bindings = HashMap::default();
+    let mut named_bindings = HashMap::default();
 
     for item in body {
         item.visit_mut_with(&mut CommonJsReadRewriter {
@@ -2036,6 +2217,15 @@ fn get_or_insert<'a>(
 /// perform arbitrary work. The require binding must also have no uses outside
 /// this adjacent pair before it is replaced with a native live re-export.
 fn rewrite_commonjs_export_star_loops(module: &mut Module, unresolved_mark: Mark) {
+    // Match the local shape before building a whole-module use index. Most
+    // modules (especially later UnEsm passes) have no export-star loop.
+    if !module.body.windows(2).any(|pair| {
+        extract_single_require_binding(&pair[0], unresolved_mark).is_some_and(|(binding, _, _)| {
+            is_commonjs_export_star_loop(&pair[1], &binding, unresolved_mark)
+        })
+    }) {
+        return;
+    }
     let binding_uses = BindingUseIndex::collect(module);
     let mut body = std::mem::take(&mut module.body).into_iter().peekable();
     let mut rewritten = Vec::with_capacity(body.size_hint().0);
@@ -2067,6 +2257,55 @@ fn rewrite_commonjs_export_star_loops(module: &mut Module, unresolved_mark: Mark
     }
 
     module.body = rewritten;
+}
+
+/// SWC's modern async runtime exports `_`, not a default function. Preserve
+/// this namespace identity across helper-context rebuilds after UnEsm. Only
+/// read-only `_` uses can become an ESM namespace: mutation, escape or dynamic
+/// lookup must retain the CommonJS module boundary and its mutable object.
+fn prepare_swc_async_namespace_requires(module: &mut Module, unresolved_mark: Mark) -> bool {
+    let candidates: Vec<_> = module
+        .body
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let (local, source, _) = extract_single_require_binding(item, unresolved_mark)?;
+            (source == "@swc/helpers/_/_async_to_generator").then_some((index, local, source))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return true;
+    }
+    let uses = BindingUseIndex::collect(module);
+    let mut eval = DirectEvalPresence::default();
+    module.visit_with(&mut eval);
+    if eval.found
+        || super::eval_utils::module_has_with_stmt(module)
+        || candidates.iter().any(|(_, local, _)| {
+            !uses.has_single_declaration(&local.to_id())
+                || !uses.has_only_static_member_reads(&local.to_id(), "_")
+        })
+    {
+        return false;
+    }
+    for (index, local, source) in candidates {
+        module.body[index] = ModuleItem::ModuleDecl(ModuleDecl::Import(ImportDecl {
+            span: DUMMY_SP,
+            specifiers: vec![ImportSpecifier::Namespace(ImportStarAsSpecifier {
+                span: DUMMY_SP,
+                local,
+            })],
+            src: Box::new(Str {
+                span: DUMMY_SP,
+                value: source.into(),
+                raw: None,
+            }),
+            type_only: false,
+            with: None,
+            phase: Default::default(),
+        }));
+    }
+    true
 }
 
 fn extract_single_require_binding(
@@ -2292,10 +2531,11 @@ fn is_computed_key_member(
             if matches!(strip_parens(computed.expr.as_ref()), Expr::Ident(id) if same_ident(id, key)))
 }
 
-fn rewrite_webpack_export_getters(module: &mut Module, unresolved_mark: Mark) {
+fn rewrite_webpack_export_getters(module: &mut Module, unresolved_mark: Mark) -> Vec<(Span, Atom)> {
     expose_unused_iife_webpack_export_getters(module, unresolved_mark);
 
     let mut converted_getter_map = false;
+    let mut live_named_assignments = Vec::new();
     let mut new_body = Vec::with_capacity(module.body.len());
     // Webpack5 getter maps appear at the top of the module, before the
     // declarations they reference.  Deferring all converted exports to the
@@ -2317,6 +2557,7 @@ fn rewrite_webpack_export_getters(module: &mut Module, unresolved_mark: Mark) {
                         unresolved_mark,
                     ));
                 } else {
+                    live_named_assignments.push((item_span, name.clone()));
                     deferred_named.push(make_exports_assign_expr_item(
                         item_span,
                         (name, expr),
@@ -2342,6 +2583,7 @@ fn rewrite_webpack_export_getters(module: &mut Module, unresolved_mark: Mark) {
                 } else {
                     // Keep named assignments in place so the ordinary export
                     // classifier can merge them with nearby declarations.
+                    live_named_assignments.push((item_span, name.clone()));
                     new_body.push(make_exports_assign_expr_item(
                         item_span,
                         (name, expr),
@@ -2364,6 +2606,7 @@ fn rewrite_webpack_export_getters(module: &mut Module, unresolved_mark: Mark) {
     new_body.extend(deferred_named);
     new_body.extend(deferred_default);
     module.body = new_body;
+    live_named_assignments
 }
 
 /// Rewrite ncc's CommonJS default-object adapter when the complete generated
@@ -3588,7 +3831,7 @@ fn build_import_decls(src: &str, entry: &SourceEntry, out: &mut Vec<ModuleItem>)
             specifiers.push(ImportSpecifier::Named(ImportNamedSpecifier {
                 span: DUMMY_SP,
                 local: local.clone(),
-                imported: Some(ModuleExportName::Ident(make_ident(imported.clone()))),
+                imported: Some(ModuleExportName::Ident(make_name_ident(imported.clone()))),
                 is_type_only: false,
             }));
         }
@@ -3625,11 +3868,27 @@ fn make_import_decl(src: &str, specifiers: Vec<ImportSpecifier>) -> ImportDecl {
     }
 }
 
+/// `exports.name = global` with a plain (non-getter) write of an unresolved
+/// identifier.
+fn exports_unresolved_ident(kind: &CjsExportKind, unresolved_mark: Mark) -> bool {
+    matches!(
+        kind,
+        CjsExportKind::Named {
+            expr,
+            is_void: false,
+            is_live: false,
+            ..
+        } if matches!(&**expr, Expr::Ident(id) if id.ctxt.outer() == unresolved_mark)
+    )
+}
+
 fn build_export_items(
     span: Span,
     kind: CjsExportKind,
+    snapshot_ident: bool,
     used_names: &mut HashSet<Atom>,
     unresolved_reference_names: &HashSet<Atom>,
+    declared_names: &HashSet<Atom>,
 ) -> Vec<ModuleItem> {
     match kind {
         CjsExportKind::EsModuleFlag => vec![],
@@ -3666,8 +3925,19 @@ fn build_export_items(
             name,
             expr,
             is_void: false,
+            ..
         } => {
             if let Expr::Ident(id) = *expr {
+                if snapshot_ident {
+                    return build_named_export_snapshot(
+                        span,
+                        name,
+                        id,
+                        used_names,
+                        unresolved_reference_names,
+                        declared_names,
+                    );
+                }
                 if id.sym == name {
                     // export { foo }
                     vec![ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(
@@ -3692,7 +3962,7 @@ fn build_export_items(
                             specifiers: vec![ExportSpecifier::Named(ExportNamedSpecifier {
                                 span: DUMMY_SP,
                                 orig: ModuleExportName::Ident(id),
-                                exported: Some(ModuleExportName::Ident(make_ident(name))),
+                                exported: Some(ModuleExportName::Ident(make_name_ident(name))),
                                 is_type_only: false,
                             })],
                             src: None,
@@ -3703,7 +3973,7 @@ fn build_export_items(
                 }
             } else if is_reserved_binding_name(&name) || unresolved_reference_names.contains(&name)
             {
-                let local = make_ident(fresh_prefixed_name(&name, used_names));
+                let local = fresh_binding_ident(fresh_prefixed_name(&name, used_names), DUMMY_SP);
                 vec![
                     ModuleItem::Stmt(Stmt::Decl(Decl::Var(Box::new(VarDecl {
                         span,
@@ -3725,7 +3995,7 @@ fn build_export_items(
                         specifiers: vec![ExportSpecifier::Named(ExportNamedSpecifier {
                             span: DUMMY_SP,
                             orig: ModuleExportName::Ident(local),
-                            exported: Some(ModuleExportName::Ident(make_ident(name))),
+                            exported: Some(ModuleExportName::Ident(make_name_ident(name))),
                             is_type_only: false,
                         })],
                         src: None,
@@ -3745,7 +4015,7 @@ fn build_export_items(
                         decls: vec![VarDeclarator {
                             span: DUMMY_SP,
                             name: Pat::Ident(BindingIdent {
-                                id: make_ident(name),
+                                id: fresh_binding_ident(name, DUMMY_SP),
                                 type_ann: None,
                             }),
                             init: Some(expr),
@@ -3760,7 +4030,76 @@ fn build_export_items(
     }
 }
 
-fn build_dropped_export_side_effect_items(span: Span, kind: CjsExportKind) -> Vec<ModuleItem> {
+fn build_named_export_snapshot(
+    span: Span,
+    name: Atom,
+    value: Ident,
+    used_names: &mut HashSet<Atom>,
+    unresolved_reference_names: &HashSet<Atom>,
+    declared_names: &HashSet<Atom>,
+) -> Vec<ModuleItem> {
+    if !is_reserved_binding_name(&name)
+        && !unresolved_reference_names.contains(&name)
+        && !declared_names.contains(&name)
+    {
+        return vec![ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl {
+            span,
+            decl: Decl::Var(Box::new(VarDecl {
+                span: DUMMY_SP,
+                ctxt: Default::default(),
+                kind: VarDeclKind::Const,
+                declare: false,
+                decls: vec![VarDeclarator {
+                    span: DUMMY_SP,
+                    name: Pat::Ident(BindingIdent {
+                        id: fresh_binding_ident(name, DUMMY_SP),
+                        type_ann: None,
+                    }),
+                    init: Some(Box::new(Expr::Ident(value))),
+                    definite: false,
+                }],
+            })),
+        }))];
+    }
+
+    let local = fresh_binding_ident(fresh_prefixed_name(&name, used_names), DUMMY_SP);
+    vec![
+        ModuleItem::Stmt(Stmt::Decl(Decl::Var(Box::new(VarDecl {
+            span,
+            ctxt: Default::default(),
+            kind: VarDeclKind::Var,
+            declare: false,
+            decls: vec![VarDeclarator {
+                span: DUMMY_SP,
+                name: Pat::Ident(BindingIdent {
+                    id: local.clone(),
+                    type_ann: None,
+                }),
+                init: Some(Box::new(Expr::Ident(value))),
+                definite: false,
+            }],
+        })))),
+        ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(NamedExport {
+            span,
+            specifiers: vec![ExportSpecifier::Named(ExportNamedSpecifier {
+                span: DUMMY_SP,
+                orig: ModuleExportName::Ident(local),
+                exported: Some(ModuleExportName::Ident(make_name_ident(name))),
+                is_type_only: false,
+            })],
+            src: None,
+            type_only: false,
+            with: None,
+        })),
+    ]
+}
+
+fn build_dropped_export_side_effect_items(
+    span: Span,
+    kind: CjsExportKind,
+    unresolved_mark: Mark,
+    hoisted_bindings: &HashSet<BindingId>,
+) -> Vec<ModuleItem> {
     let expr = match kind {
         CjsExportKind::ModuleExportsDefault { expr }
         | CjsExportKind::NamedDefault { expr }
@@ -3775,8 +4114,62 @@ fn build_dropped_export_side_effect_items(span: Span, kind: CjsExportKind) -> Ve
         | CjsExportKind::DefaultMirror
         | CjsExportKind::SelfRef => return vec![],
     };
+    if dropped_export_value_is_inert(&expr, unresolved_mark, hoisted_bindings) {
+        return vec![];
+    }
 
     vec![ModuleItem::Stmt(Stmt::Expr(ExprStmt { span, expr }))]
+}
+
+/// True when evaluating a dropped export's value can neither run code nor
+/// throw, so the dropped assignment needs no leftover statement. Babel's
+/// `exports.default = void 0` placeholder and the first of
+/// `module.exports = f; module.exports.default = f;` take this path.
+fn dropped_export_value_is_inert(
+    expr: &Expr,
+    unresolved_mark: Mark,
+    hoisted_bindings: &HashSet<BindingId>,
+) -> bool {
+    match strip_parens(expr) {
+        Expr::Lit(_) => true,
+        Expr::Unary(UnaryExpr {
+            op: UnaryOp::Void,
+            arg,
+            ..
+        }) => matches!(strip_parens(arg), Expr::Lit(_)),
+        // A lexical binding can throw before initialization and an
+        // unresolved name can throw a ReferenceError. Function and `var`
+        // bindings are hoisted, so reading them cannot throw.
+        Expr::Ident(id) => {
+            is_undefined_ident(id, unresolved_mark)
+                || hoisted_bindings.contains(&(id.sym.clone(), id.ctxt))
+        }
+        _ => false,
+    }
+}
+
+/// Top-level function and `var` bindings, whose reads cannot throw.
+fn collect_hoisted_top_level_bindings(module: &Module) -> HashSet<BindingId> {
+    let mut bindings = HashSet::default();
+    for item in &module.body {
+        let decl = match item {
+            ModuleItem::Stmt(Stmt::Decl(decl)) => decl,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => &export.decl,
+            _ => continue,
+        };
+        match decl {
+            Decl::Fn(function) => {
+                bindings.insert((function.ident.sym.clone(), function.ident.ctxt));
+            }
+            Decl::Var(var) if var.kind == VarDeclKind::Var => {
+                for declarator in &var.decls {
+                    bindings.extend(find_pat_ids::<_, Id>(&declarator.name));
+                }
+            }
+            _ => {}
+        }
+    }
+    bindings
 }
 
 // ============================================================
@@ -3867,10 +4260,10 @@ fn hoist_embedded_requires(module: &mut Module, unresolved_mark: Mark) {
                     if let Callee::Expr(callee) = &outer_call.callee {
                         if let Expr::Call(inner_call) = strip_parens(callee) {
                             if is_require_call(inner_call, unresolved_mark).is_some() {
-                                let local = make_ident(fresh_prefixed_name(
-                                    &Atom::from("default"),
-                                    &mut used_names,
-                                ));
+                                let local = fresh_binding_ident(
+                                    fresh_prefixed_name(&Atom::from("default"), &mut used_names),
+                                    DUMMY_SP,
+                                );
                                 new_body.push(make_require_var_item(
                                     local.clone(),
                                     Box::new(Expr::Call(inner_call.clone())),
@@ -4082,7 +4475,7 @@ impl RequireNamedMemberMutationCollector {
         let mut collector = Self {
             unresolved_mark,
             write_target_depth: 0,
-            mutations: HashSet::new(),
+            mutations: HashSet::default(),
         };
         module.visit_with(&mut collector);
         collector.mutations
@@ -4253,11 +4646,11 @@ fn prove_toplevel_require_named_member_args(
     let uses = BindingUseIndex::collect(module);
     let provider_member_mutations =
         RequireNamedMemberMutationCollector::collect(module, unresolved_mark);
-    let mut claimed_source_by_local: HashMap<Atom, String> = HashMap::new();
-    let mut claimed_local: HashMap<Atom, Ident> = HashMap::new();
+    let mut claimed_source_by_local: HashMap<Atom, String> = HashMap::default();
+    let mut claimed_local: HashMap<Atom, Ident> = HashMap::default();
     let mut plan = ToplevelRequireNamedMemberPlan {
-        replacements: HashMap::new(),
-        inserts: HashMap::new(),
+        replacements: HashMap::default(),
+        inserts: HashMap::default(),
     };
 
     for candidate in candidates {
@@ -4300,7 +4693,7 @@ fn prove_toplevel_require_named_member_args(
         {
             return None;
         } else {
-            let local = make_ident(candidate.name.clone());
+            let local = fresh_binding_ident(candidate.name.clone(), DUMMY_SP);
             claimed_source_by_local.insert(candidate.name.clone(), candidate.source.clone());
             claimed_local.insert(candidate.name.clone(), local.clone());
             let init = candidate_named_member_init(&module.body, candidate)?;
@@ -4350,6 +4743,399 @@ fn apply_toplevel_require_named_member_args(
     module.body = new_body;
 }
 
+/// Top-level immediately-evaluated Call whose direct argument is
+/// `require("mod").default`. Hoist to `const L = require("mod").default`
+/// immediately before the statement so the existing DefaultProp classifier
+/// can emit `import L from "mod"`.
+///
+/// Independent of the named-member pass: a failed default proof must not
+/// roll back named recovery, and vice versa. This pass is all-or-nothing
+/// for `.default` arguments only.
+fn hoist_toplevel_require_default_member_args(module: &mut Module, unresolved_mark: Mark) {
+    let candidates = collect_toplevel_require_default_member_args(&module.body, unresolved_mark);
+    if candidates.is_empty() {
+        return;
+    }
+    let Some(plan) =
+        prove_toplevel_require_default_member_args(module, unresolved_mark, &candidates)
+    else {
+        return;
+    };
+    apply_toplevel_require_default_member_args(module, plan);
+}
+
+struct ToplevelRequireDefaultMemberArg {
+    item_index: usize,
+    arg_index: usize,
+    source: String,
+}
+
+struct ToplevelRequireDefaultMemberInsert {
+    local: Ident,
+    init: Box<Expr>,
+}
+
+struct ToplevelRequireDefaultMemberPlan {
+    replacements: HashMap<usize, Vec<(usize, Ident)>>,
+    inserts: HashMap<usize, Vec<ToplevelRequireDefaultMemberInsert>>,
+}
+
+fn collect_toplevel_require_default_member_args(
+    items: &[ModuleItem],
+    unresolved_mark: Mark,
+) -> Vec<ToplevelRequireDefaultMemberArg> {
+    let mut candidates = Vec::new();
+    for (item_index, item) in items.iter().enumerate() {
+        let Some(call) = toplevel_item_call_expr(item) else {
+            continue;
+        };
+        for (arg_index, arg) in call.args.iter().enumerate() {
+            if arg.spread.is_some() {
+                continue;
+            }
+            let Some(source) = match_require_default_member_expr(&arg.expr, unresolved_mark) else {
+                continue;
+            };
+            candidates.push(ToplevelRequireDefaultMemberArg {
+                item_index,
+                arg_index,
+                source,
+            });
+        }
+    }
+    candidates
+}
+
+fn has_toplevel_require_default_member_self_arg(
+    items: &[ModuleItem],
+    unresolved_mark: Mark,
+    current_filename: Option<&str>,
+) -> bool {
+    let Some(current_filename) = current_filename else {
+        return false;
+    };
+    let Some((normalized_filename, current_key)) = current_module_path_context(current_filename)
+    else {
+        return false;
+    };
+
+    collect_toplevel_require_default_member_args(items, unresolved_mark)
+        .into_iter()
+        .any(|candidate| {
+            resolve_relative_specifier(&normalized_filename, &candidate.source).as_deref()
+                == Some(&current_key)
+        })
+}
+
+/// Direct argument of a top-level Call: `require("mod").default` with a
+/// static string specifier (Ident or computed ident string). Does not share
+/// `match_require_named_member`, which must keep skipping `.default`.
+fn match_require_default_member_expr(expr: &Expr, unresolved_mark: Mark) -> Option<String> {
+    let Expr::Member(member) = strip_parens(expr) else {
+        return None;
+    };
+    match_require_default_member(member, unresolved_mark)
+}
+
+fn match_require_default_member(member: &MemberExpr, unresolved_mark: Mark) -> Option<String> {
+    let Expr::Call(call) = strip_parens(member.obj.as_ref()) else {
+        return None;
+    };
+    let source = is_require_call(call, unresolved_mark)?;
+    let prop = is_ident_prop(&member.prop)?;
+    if prop.as_ref() != "default" {
+        return None;
+    }
+    Some(source)
+}
+
+/// Collect direct mutations of `require(source).default`. Folding later
+/// default-member reads into one recovered import is unsafe when the
+/// CommonJS object can be changed through the same static edge.
+struct RequireDefaultMemberMutationCollector {
+    unresolved_mark: Mark,
+    write_target_depth: usize,
+    mutations: HashSet<String>,
+}
+
+impl RequireDefaultMemberMutationCollector {
+    fn collect(module: &Module, unresolved_mark: Mark) -> HashSet<String> {
+        let mut collector = Self {
+            unresolved_mark,
+            write_target_depth: 0,
+            mutations: HashSet::default(),
+        };
+        module.visit_with(&mut collector);
+        collector.mutations
+    }
+}
+
+impl Visit for RequireDefaultMemberMutationCollector {
+    fn visit_member_expr(&mut self, member: &MemberExpr) {
+        if self.write_target_depth > 0 {
+            if let Some(source) = match_require_default_member(member, self.unresolved_mark) {
+                self.mutations.insert(source);
+            }
+        }
+        member.visit_children_with(self);
+    }
+
+    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
+        self.write_target_depth += 1;
+        assignment.left.visit_with(self);
+        self.write_target_depth -= 1;
+        assignment.right.visit_with(self);
+    }
+
+    fn visit_update_expr(&mut self, update: &swc_core::ecma::ast::UpdateExpr) {
+        self.write_target_depth += 1;
+        update.arg.visit_with(self);
+        self.write_target_depth -= 1;
+    }
+
+    fn visit_unary_expr(&mut self, unary: &swc_core::ecma::ast::UnaryExpr) {
+        if unary.op == UnaryOp::Delete {
+            self.write_target_depth += 1;
+            unary.arg.visit_with(self);
+            self.write_target_depth -= 1;
+        } else {
+            unary.visit_children_with(self);
+        }
+    }
+
+    fn visit_for_in_stmt(&mut self, stmt: &ForInStmt) {
+        self.write_target_depth += 1;
+        stmt.left.visit_with(self);
+        self.write_target_depth -= 1;
+        stmt.right.visit_with(self);
+        stmt.body.visit_with(self);
+    }
+
+    fn visit_for_of_stmt(&mut self, stmt: &swc_core::ecma::ast::ForOfStmt) {
+        self.write_target_depth += 1;
+        stmt.left.visit_with(self);
+        self.write_target_depth -= 1;
+        stmt.right.visit_with(self);
+        stmt.body.visit_with(self);
+    }
+}
+
+fn existing_require_default_prop_item(
+    item: &ModuleItem,
+    source: &str,
+    unresolved_mark: Mark,
+) -> Option<Ident> {
+    let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
+        return None;
+    };
+    if var.decls.len() != 1 {
+        return None;
+    }
+    let decl = &var.decls[0];
+    let Pat::Ident(binding) = &decl.name else {
+        return None;
+    };
+    let init = decl.init.as_deref()?;
+    match match_require_default_member_expr(init, unresolved_mark) {
+        Some(ref existing_source) if existing_source == source => Some(binding.id.clone()),
+        _ => None,
+    }
+}
+
+fn existing_default_import_item(item: &ModuleItem, source: &str) -> Option<Ident> {
+    let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
+        return None;
+    };
+    if import.type_only || wtf8_to_string(&import.src.value) != source {
+        return None;
+    }
+    import.specifiers.iter().find_map(|spec| match spec {
+        ImportSpecifier::Default(default) => Some(default.local.clone()),
+        _ => None,
+    })
+}
+
+/// Reuse a DefaultProp local or an existing default import only when it is
+/// declared *before* the call and never written. A later
+/// `var L = require(src).default` is not a stable identity for an earlier
+/// argument; a mutated local is not the original member read.
+fn reusable_require_default_local(
+    items: &[ModuleItem],
+    source: &str,
+    before_item_index: usize,
+    unresolved_mark: Mark,
+    uses: &BindingUseIndex,
+) -> Option<Ident> {
+    let mut reusable = None;
+    for (index, item) in items.iter().enumerate() {
+        if index >= before_item_index {
+            break;
+        }
+        let ident = existing_require_default_prop_item(item, source, unresolved_mark)
+            .or_else(|| existing_default_import_item(item, source));
+        let Some(ident) = ident else {
+            continue;
+        };
+        if uses.has_direct_write(&binding_id(&ident)) {
+            // A mutated earlier DefaultProp is not reusable, but a later
+            // stable binding of the same source still is.
+            continue;
+        }
+        reusable = Some(ident);
+    }
+    reusable
+}
+
+fn candidate_default_member_init(
+    items: &[ModuleItem],
+    candidate: &ToplevelRequireDefaultMemberArg,
+) -> Option<Box<Expr>> {
+    let call = toplevel_item_call_expr(&items[candidate.item_index])?;
+    let arg = call.args.get(candidate.arg_index)?;
+    Some(Box::new(strip_parens(arg.expr.as_ref()).clone()))
+}
+
+fn specifier_basename(source: &str) -> Option<Atom> {
+    let last = source.rsplit('/').next().unwrap_or(source);
+    let stem = last.strip_suffix(".js").unwrap_or(last);
+    if stem.is_empty() {
+        return None;
+    }
+    if !is_valid_identifier_name(stem) || is_reserved_binding_name(stem) {
+        return None;
+    }
+    Some(Atom::from(stem))
+}
+
+fn direct_eval_mentions_name(analyzer: &DirectEvalAnalyzer, name: &Atom) -> bool {
+    analyzer
+        .known_direct_eval_sources
+        .iter()
+        .any(|source| js_source_mentions_binding(source, name))
+}
+
+fn fresh_default_import_name(used_names: &mut HashSet<Atom>) -> Atom {
+    let base = Atom::from("defaultExport");
+    if used_names.insert(base.clone()) {
+        return base;
+    }
+    for suffix in 1usize.. {
+        let candidate = Atom::from(format!("defaultExport_{suffix}"));
+        if used_names.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+fn prove_toplevel_require_default_member_args(
+    module: &Module,
+    unresolved_mark: Mark,
+    candidates: &[ToplevelRequireDefaultMemberArg],
+) -> Option<ToplevelRequireDefaultMemberPlan> {
+    let mut eval_analyzer = DirectEvalAnalyzer::default();
+    module.visit_with(&mut eval_analyzer);
+    if eval_analyzer.unknown_direct_eval {
+        return None;
+    }
+
+    let declared_names = collect_all_declared_names(module);
+    let unresolved_reference_names = collect_unresolved_reference_names(module, unresolved_mark);
+    let uses = BindingUseIndex::collect(module);
+    let provider_member_mutations =
+        RequireDefaultMemberMutationCollector::collect(module, unresolved_mark);
+    let mut used_names = declared_names;
+    used_names.extend(unresolved_reference_names);
+    let mut claimed_local_by_source: HashMap<String, Ident> = HashMap::default();
+    let mut plan = ToplevelRequireDefaultMemberPlan {
+        replacements: HashMap::default(),
+        inserts: HashMap::default(),
+    };
+    for candidate in candidates {
+        if provider_member_mutations.contains(&candidate.source) {
+            return None;
+        }
+
+        let local = if let Some(existing) = claimed_local_by_source.get(&candidate.source) {
+            existing.clone()
+        } else if let Some(existing) = reusable_require_default_local(
+            &module.body,
+            &candidate.source,
+            candidate.item_index,
+            unresolved_mark,
+            &uses,
+        ) {
+            claimed_local_by_source.insert(candidate.source.clone(), existing.clone());
+            existing
+        } else {
+            let basename = specifier_basename(&candidate.source);
+            let local_name = if let Some(ref name) = basename {
+                if !used_names.contains(name) && !direct_eval_mentions_name(&eval_analyzer, name) {
+                    used_names.insert(name.clone());
+                    name.clone()
+                } else {
+                    let synthetic = fresh_default_import_name(&mut used_names);
+                    if direct_eval_mentions_name(&eval_analyzer, &synthetic) {
+                        return None;
+                    }
+                    synthetic
+                }
+            } else {
+                let synthetic = fresh_default_import_name(&mut used_names);
+                if direct_eval_mentions_name(&eval_analyzer, &synthetic) {
+                    return None;
+                }
+                synthetic
+            };
+            let local = fresh_binding_ident(local_name, DUMMY_SP);
+            claimed_local_by_source.insert(candidate.source.clone(), local.clone());
+            let init = candidate_default_member_init(&module.body, candidate)?;
+            plan.inserts.entry(candidate.item_index).or_default().push(
+                ToplevelRequireDefaultMemberInsert {
+                    local: local.clone(),
+                    init,
+                },
+            );
+            local
+        };
+
+        plan.replacements
+            .entry(candidate.item_index)
+            .or_default()
+            .push((candidate.arg_index, local));
+    }
+
+    Some(plan)
+}
+
+fn apply_toplevel_require_default_member_args(
+    module: &mut Module,
+    plan: ToplevelRequireDefaultMemberPlan,
+) {
+    let mut new_body = Vec::with_capacity(module.body.len() + plan.inserts.len());
+    for (index, mut item) in std::mem::take(&mut module.body).into_iter().enumerate() {
+        if let Some(inserts) = plan.inserts.get(&index) {
+            for insert in inserts {
+                new_body.push(make_require_var_item(
+                    insert.local.clone(),
+                    insert.init.clone(),
+                ));
+            }
+        }
+        if let Some(replacements) = plan.replacements.get(&index) {
+            if let Some(call) = toplevel_item_call_expr_mut(&mut item) {
+                for (arg_index, ident) in replacements {
+                    if let Some(arg) = call.args.get_mut(*arg_index) {
+                        *arg.expr = Expr::Ident(ident.clone());
+                    }
+                }
+            }
+        }
+        new_body.push(item);
+    }
+    module.body = new_body;
+}
+
 /// Find inline Babel interop wrappers that are observably just default-import
 /// aliases. Both bindings must be closed over by the matched helper shape:
 ///
@@ -4364,8 +5150,8 @@ fn collect_default_only_inline_interop_bindings(
     module: &Module,
     unresolved_mark: Mark,
 ) -> HashSet<BindingId> {
-    let uses = BindingUseIndex::collect(module);
-    let mut bindings = HashSet::new();
+    let uses = OnceCell::new();
+    let mut bindings = HashSet::default();
 
     for (item_idx, item) in module.body.iter().enumerate() {
         let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var_decl))) = item else {
@@ -4387,6 +5173,7 @@ fn collect_default_only_inline_interop_bindings(
             continue;
         };
 
+        let uses = uses.get_or_init(|| BindingUseIndex::collect(module));
         let wrapper_id = binding_id(&wrapper.id);
         let require_id = binding_id(&require_local);
         if wrapper_id != require_id
@@ -4547,7 +5334,10 @@ fn hoist_requires_from_seq(
     }
 
     let final_expr = if remaining.is_empty() {
-        Box::new(Expr::Ident(make_ident(Atom::from("undefined"))))
+        Box::new(Expr::Ident(make_unresolved_ident(
+            Atom::from("undefined"),
+            unresolved_mark,
+        )))
     } else if remaining.len() == 1 {
         remaining.into_iter().next().unwrap()
     } else {
@@ -4674,7 +5464,7 @@ fn import_local_for_assignment(
         return (target, None);
     }
 
-    let temp = make_ident(fresh_prefixed_name(&target.sym, used_names));
+    let temp = fresh_binding_ident(fresh_prefixed_name(&target.sym, used_names), DUMMY_SP);
     let assign = ModuleItem::Stmt(Stmt::Expr(ExprStmt {
         span: DUMMY_SP,
         expr: Box::new(Expr::Assign(AssignExpr {
@@ -4745,7 +5535,7 @@ fn collect_stable_require_bindings(
     uses: &BindingUseIndex,
     unresolved_mark: Mark,
 ) -> HashMap<BindingId, String> {
-    let mut bindings = HashMap::new();
+    let mut bindings = HashMap::default();
     for item in &module.body {
         let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
             continue;
@@ -4929,7 +5719,10 @@ fn split_called_module_exports_assignments(module: &mut Module, unresolved_mark:
         }
 
         let value = assign.right.clone();
-        let local = make_ident(fresh_prefixed_name(&Atom::from("default"), &mut used_names));
+        let local = fresh_binding_ident(
+            fresh_prefixed_name(&Atom::from("default"), &mut used_names),
+            DUMMY_SP,
+        );
         let capture = ModuleItem::Stmt(Stmt::Decl(Decl::Var(Box::new(VarDecl {
             span: expr_stmt.span,
             ctxt: Default::default(),
@@ -5087,7 +5880,10 @@ fn split_chained_local_module_exports_assignments(module: &mut Module, unresolve
             continue;
         };
 
-        let local = make_ident(fresh_prefixed_name(&Atom::from("default"), &mut used_names));
+        let local = fresh_binding_ident(
+            fresh_prefixed_name(&Atom::from("default"), &mut used_names),
+            DUMMY_SP,
+        );
         new_body.push(ModuleItem::Stmt(Stmt::Decl(Decl::Var(Box::new(VarDecl {
             span: expr_stmt.span,
             ctxt: Default::default(),
@@ -5136,6 +5932,952 @@ fn collect_mutable_module_var_bindings(module: &Module) -> HashSet<BindingId> {
         })
         .flat_map(|var| var.decls.iter().flat_map(|decl| find_pat_ids(&decl.name)))
         .collect()
+}
+
+enum ConditionalExportRecovery {
+    NotApplicable,
+    Recovered(Vec<ModuleItem>),
+    Unsupported,
+}
+
+#[derive(Default)]
+struct ConditionalExportFacts {
+    has_nested_write: bool,
+    has_deferred_write: bool,
+    has_read: bool,
+}
+
+/// Recover named CommonJS exports written in nested statements during module
+/// activation as live ESM bindings. Replacing the member target in place
+/// preserves RHS evaluation count and order; the module-scoped `var` also
+/// preserves CommonJS's pre-initialization `undefined` reads until
+/// VarDeclToLetConst selects `let`.
+///
+/// The proof requires the CommonJS receiver to stay private and stable. Bare
+/// `exports` / `module` uses, dynamic keys, slot replacement, unsupported write
+/// positions, pre-existing ESM exports, self-require, and dynamic scope keep the
+/// whole CommonJS boundary. This avoids a partial conversion that would leave
+/// nested `exports.name` writes inside ESM output. Property replacement relies
+/// on `commonjs_exports_data_properties`; rewriting member calls to direct calls
+/// relies on `call_receiver_independence`.
+fn recover_conditional_named_exports(
+    module: &mut Module,
+    unresolved_mark: Mark,
+    has_local_self_require: bool,
+) -> ConditionalExportRecovery {
+    struct Scanner {
+        unresolved_mark: Mark,
+        facts: HashMap<Atom, ConditionalExportFacts>,
+        order: Vec<Atom>,
+        statement_depth: usize,
+        function_depth: usize,
+        write_context_nested: Option<bool>,
+        receiver_is_unsafe: bool,
+        unsupported_write: bool,
+        has_nested_unsupported_write: bool,
+    }
+
+    impl Scanner {
+        fn record_write(&mut self, name: Atom, nested: bool) {
+            if matches!(name.as_ref(), "default" | "__esModule" | "exports")
+                || is_prototype_mutating_member_name(name.as_ref())
+                || is_reserved_binding_name(&name)
+                || !is_valid_identifier_name(&name)
+            {
+                self.unsupported_write = true;
+                self.has_nested_unsupported_write |= nested;
+                return;
+            }
+            if !self.facts.contains_key(&name) {
+                self.order.push(name.clone());
+            }
+            let facts = self.facts.entry(name).or_default();
+            facts.has_nested_write |= nested;
+            facts.has_deferred_write |= self.function_depth > 0;
+        }
+
+        fn record_read(&mut self, name: Atom) {
+            if !self.facts.contains_key(&name) {
+                self.order.push(name.clone());
+            }
+            self.facts.entry(name).or_default().has_read = true;
+        }
+
+        fn visit_write_target<T>(&mut self, target: &T, nested: bool)
+        where
+            T: VisitWith<Self> + ?Sized,
+        {
+            let previous = self.write_context_nested.replace(nested);
+            target.visit_with(self);
+            self.write_context_nested = previous;
+        }
+
+        fn mark_unsupported_write(&mut self, nested: bool) {
+            self.unsupported_write = true;
+            self.has_nested_unsupported_write |= nested;
+        }
+
+        fn visit_top_level_stmt(&mut self, statement: &Stmt) {
+            statement.visit_children_with(self);
+        }
+    }
+
+    impl Visit for Scanner {
+        fn visit_opt_chain_expr(&mut self, chain: &OptChainExpr) {
+            if matches!(chain.base.as_ref(),
+                OptChainBase::Member(member)
+                    if is_cjs_export_object_expr(&member.obj, self.unresolved_mark))
+            {
+                self.receiver_is_unsafe = true;
+                return;
+            }
+            chain.visit_children_with(self);
+        }
+
+        fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
+            let nested = self.statement_depth > 0 && self.function_depth == 0;
+            if let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assignment.left {
+                if is_cjs_export_object_expr(&member.obj, self.unresolved_mark) {
+                    if let Some(name) = is_ident_prop(&member.prop) {
+                        if assignment.op == AssignOp::Assign {
+                            self.record_write(name, nested);
+                        } else {
+                            self.mark_unsupported_write(nested);
+                        }
+                    } else {
+                        self.receiver_is_unsafe = true;
+                        self.has_nested_unsupported_write |= nested;
+                        if let MemberProp::Computed(computed) = &member.prop {
+                            computed.expr.visit_with(self);
+                        }
+                    }
+                    assignment.right.visit_with(self);
+                    return;
+                }
+                if is_module_exports_member(member, self.unresolved_mark) {
+                    self.receiver_is_unsafe = true;
+                    assignment.right.visit_with(self);
+                    return;
+                }
+            }
+            if matches!(&assignment.left,
+                AssignTarget::Simple(SimpleAssignTarget::Ident(binding))
+                    if is_unresolved_ident(&binding.id, "exports", self.unresolved_mark)
+                        || is_unresolved_ident(&binding.id, "module", self.unresolved_mark))
+            {
+                self.receiver_is_unsafe = true;
+                assignment.right.visit_with(self);
+                return;
+            }
+            self.visit_write_target(&assignment.left, nested);
+            assignment.right.visit_with(self);
+        }
+
+        fn visit_member_expr(&mut self, member: &MemberExpr) {
+            if is_cjs_export_object_expr(&member.obj, self.unresolved_mark) {
+                if let Some(name) = is_ident_prop(&member.prop) {
+                    if let Some(nested) = self.write_context_nested {
+                        self.mark_unsupported_write(nested);
+                    } else {
+                        self.record_read(name);
+                    }
+                } else {
+                    self.receiver_is_unsafe = true;
+                    if let Some(nested) = self.write_context_nested {
+                        self.has_nested_unsupported_write |= nested;
+                    }
+                    if let MemberProp::Computed(computed) = &member.prop {
+                        computed.expr.visit_with(self);
+                    }
+                }
+                return;
+            }
+            if is_module_exports_member(member, self.unresolved_mark) {
+                self.receiver_is_unsafe = true;
+                if let Some(nested) = self.write_context_nested {
+                    self.has_nested_unsupported_write |= nested;
+                }
+                return;
+            }
+            member.visit_children_with(self);
+        }
+
+        fn visit_ident(&mut self, ident: &Ident) {
+            if is_unresolved_ident(ident, "exports", self.unresolved_mark)
+                || is_unresolved_ident(ident, "module", self.unresolved_mark)
+            {
+                self.receiver_is_unsafe = true;
+            }
+        }
+
+        fn visit_update_expr(&mut self, update: &UpdateExpr) {
+            let nested = self.statement_depth > 0 && self.function_depth == 0;
+            self.visit_write_target(update.arg.as_ref(), nested);
+        }
+
+        fn visit_unary_expr(&mut self, unary: &UnaryExpr) {
+            if unary.op == UnaryOp::Delete {
+                let nested = self.statement_depth > 0 && self.function_depth == 0;
+                self.visit_write_target(unary.arg.as_ref(), nested);
+            } else {
+                unary.visit_children_with(self);
+            }
+        }
+
+        fn visit_stmt(&mut self, statement: &Stmt) {
+            self.statement_depth += 1;
+            statement.visit_children_with(self);
+            self.statement_depth -= 1;
+        }
+
+        fn visit_function(&mut self, function: &Function) {
+            self.function_depth += 1;
+            function.visit_children_with(self);
+            self.function_depth -= 1;
+        }
+
+        fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+            self.function_depth += 1;
+            arrow.visit_children_with(self);
+            self.function_depth -= 1;
+        }
+
+        fn visit_constructor(&mut self, constructor: &Constructor) {
+            self.function_depth += 1;
+            constructor.visit_children_with(self);
+            self.function_depth -= 1;
+        }
+
+        fn visit_class_prop(&mut self, property: &ClassProp) {
+            property.key.visit_with(self);
+            property.decorators.visit_with(self);
+            if let Some(value) = &property.value {
+                self.function_depth += usize::from(!property.is_static);
+                value.visit_with(self);
+                self.function_depth -= usize::from(!property.is_static);
+            }
+        }
+
+        fn visit_private_prop(&mut self, property: &PrivateProp) {
+            property.decorators.visit_with(self);
+            if let Some(value) = &property.value {
+                self.function_depth += usize::from(!property.is_static);
+                value.visit_with(self);
+                self.function_depth -= usize::from(!property.is_static);
+            }
+        }
+
+        fn visit_auto_accessor(&mut self, accessor: &AutoAccessor) {
+            accessor.key.visit_with(self);
+            accessor.decorators.visit_with(self);
+            if let Some(value) = &accessor.value {
+                self.function_depth += usize::from(!accessor.is_static);
+                value.visit_with(self);
+                self.function_depth -= usize::from(!accessor.is_static);
+            }
+        }
+
+        fn visit_for_in_stmt(&mut self, for_in: &ForInStmt) {
+            self.visit_write_target(&for_in.left, self.function_depth == 0);
+            for_in.right.visit_with(self);
+            for_in.body.visit_with(self);
+        }
+
+        fn visit_for_of_stmt(&mut self, for_of: &ForOfStmt) {
+            self.visit_write_target(&for_of.left, self.function_depth == 0);
+            for_of.right.visit_with(self);
+            for_of.body.visit_with(self);
+        }
+    }
+
+    let mut scanner = Scanner {
+        unresolved_mark,
+        facts: HashMap::default(),
+        order: Vec::new(),
+        statement_depth: 0,
+        function_depth: 0,
+        write_context_nested: None,
+        receiver_is_unsafe: false,
+        unsupported_write: false,
+        has_nested_unsupported_write: false,
+    };
+    for item in &module.body {
+        match item {
+            ModuleItem::Stmt(statement) => scanner.visit_top_level_stmt(statement),
+            ModuleItem::ModuleDecl(declaration) => declaration.visit_with(&mut scanner),
+        }
+    }
+
+    let candidates: Vec<Atom> = scanner
+        .order
+        .iter()
+        .filter(|name| {
+            scanner
+                .facts
+                .get(*name)
+                .is_some_and(|facts| facts.has_nested_write)
+        })
+        .cloned()
+        .collect();
+    if candidates.is_empty() && !scanner.has_nested_unsupported_write {
+        return ConditionalExportRecovery::NotApplicable;
+    }
+    let candidate_names: HashSet<Atom> = candidates.iter().cloned().collect();
+    let has_existing_exports = module.body.iter().any(|item| {
+        matches!(item, ModuleItem::ModuleDecl(decl) if !matches!(decl, ModuleDecl::Import(_)))
+    });
+    let has_surviving_commonjs_access = scanner.facts.iter().any(|(name, facts)| {
+        !candidate_names.contains(name) && (facts.has_deferred_write || facts.has_read)
+    });
+    let mut direct_eval = DirectEvalPresence::default();
+    module.visit_with(&mut direct_eval);
+    if candidates.is_empty()
+        || scanner.receiver_is_unsafe
+        || scanner.unsupported_write
+        || has_surviving_commonjs_access
+        || has_existing_exports
+        || has_local_self_require
+        || direct_eval.found
+        || super::eval_utils::module_has_with_stmt(module)
+    {
+        return ConditionalExportRecovery::Unsupported;
+    }
+
+    let mut used_names = collect_all_identifier_names(module);
+    let mut locals = HashMap::default();
+    for public in &candidates {
+        let local_name = if used_names.insert(public.clone()) {
+            public.clone()
+        } else {
+            fresh_prefixed_name(public, &mut used_names)
+        };
+        locals.insert(public.clone(), fresh_binding_ident(local_name, DUMMY_SP));
+    }
+    let leading_sentinels =
+        leading_conditional_export_sentinels(module, &candidate_names, unresolved_mark);
+
+    struct Rewriter<'a> {
+        unresolved_mark: Mark,
+        locals: &'a HashMap<Atom, Ident>,
+    }
+
+    impl Rewriter<'_> {
+        fn local_for(&self, member: &MemberExpr) -> Option<Ident> {
+            if !is_cjs_export_object_expr(&member.obj, self.unresolved_mark) {
+                return None;
+            }
+            let name = is_ident_prop(&member.prop)?;
+            let mut local = self.locals.get(&name)?.clone();
+            local.span = member.span;
+            Some(local)
+        }
+    }
+
+    impl VisitMut for Rewriter<'_> {
+        fn visit_mut_expr(&mut self, expression: &mut Expr) {
+            if let Expr::Member(member) = expression {
+                if let Some(local) = self.local_for(member) {
+                    *expression = Expr::Ident(local);
+                    return;
+                }
+            }
+            expression.visit_mut_children_with(self);
+        }
+
+        fn visit_mut_simple_assign_target(&mut self, target: &mut SimpleAssignTarget) {
+            if let SimpleAssignTarget::Member(member) = target {
+                if let Some(local) = self.local_for(member) {
+                    *target = SimpleAssignTarget::Ident(BindingIdent {
+                        id: local,
+                        type_ann: None,
+                    });
+                    return;
+                }
+            }
+            target.visit_mut_children_with(self);
+        }
+    }
+
+    let original_body = module.body.clone();
+    module.visit_mut_with(&mut Rewriter {
+        unresolved_mark,
+        locals: &locals,
+    });
+    if !leading_sentinels.is_empty() {
+        module.body = std::mem::take(&mut module.body)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, item)| (!leading_sentinels.contains(&index)).then_some(item))
+            .collect();
+    }
+
+    let mut declarations = Vec::with_capacity(candidates.len() * 2 + module.body.len());
+    for public in candidates {
+        let local = locals.remove(&public).expect("candidate has a binding");
+        let declaration = VarDecl {
+            span: DUMMY_SP,
+            ctxt: Default::default(),
+            kind: VarDeclKind::Var,
+            declare: false,
+            decls: vec![VarDeclarator {
+                span: DUMMY_SP,
+                name: Pat::Ident(BindingIdent {
+                    id: local.clone(),
+                    type_ann: None,
+                }),
+                init: None,
+                definite: false,
+            }],
+        };
+        if local.sym == public {
+            declarations.push(ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(ExportDecl {
+                span: DUMMY_SP,
+                decl: Decl::Var(Box::new(declaration)),
+            })));
+        } else {
+            declarations.push(ModuleItem::Stmt(Stmt::Decl(Decl::Var(Box::new(
+                declaration,
+            )))));
+            declarations.push(ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(
+                NamedExport {
+                    span: DUMMY_SP,
+                    specifiers: vec![ExportSpecifier::Named(ExportNamedSpecifier {
+                        span: DUMMY_SP,
+                        orig: ModuleExportName::Ident(local),
+                        exported: Some(ModuleExportName::Ident(make_name_ident(public))),
+                        is_type_only: false,
+                    })],
+                    src: None,
+                    type_only: false,
+                    with: None,
+                },
+            )));
+        }
+    }
+    declarations.append(&mut module.body);
+    module.body = declarations;
+    ConditionalExportRecovery::Recovered(original_body)
+}
+
+/// Find TypeScript-style `exports.name = void 0` declarations at the start of
+/// a module. Once conditional recovery creates an uninitialized module binding,
+/// these writes repeat its existing `undefined` value and can be omitted.
+///
+/// Stop at the first ordinary statement. Looking only through directives,
+/// imports, hoisted function declarations, statically classified require
+/// declarations, and other sentinels keeps this independent of control-flow
+/// and call analysis.
+fn leading_conditional_export_sentinels(
+    module: &Module,
+    candidate_names: &HashSet<Atom>,
+    unresolved_mark: Mark,
+) -> HashSet<usize> {
+    fn sentinel_name(item: &ModuleItem, unresolved_mark: Mark) -> Option<Atom> {
+        let ModuleItem::Stmt(Stmt::Expr(statement)) = item else {
+            return None;
+        };
+        let Expr::Assign(assign) = strip_parens(statement.expr.as_ref()) else {
+            return None;
+        };
+        if assign.op != AssignOp::Assign {
+            return None;
+        }
+        let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assign.left else {
+            return None;
+        };
+        if !is_cjs_export_object_expr(&member.obj, unresolved_mark) {
+            return None;
+        }
+        let name = is_ident_prop(&member.prop)?;
+        match strip_parens(assign.right.as_ref()) {
+            Expr::Unary(UnaryExpr {
+                op: UnaryOp::Void,
+                arg,
+                ..
+            }) if matches!(strip_parens(arg), Expr::Lit(Lit::Num(number)) if number.value == 0.0) => {
+                Some(name)
+            }
+            Expr::Ident(ident) if is_undefined_ident(ident, unresolved_mark) => Some(name),
+            _ => None,
+        }
+    }
+
+    fn is_directive(item: &ModuleItem) -> bool {
+        matches!(item,
+            ModuleItem::Stmt(Stmt::Expr(statement))
+                if matches!(strip_parens(statement.expr.as_ref()), Expr::Lit(Lit::Str(_))))
+    }
+
+    fn is_require_declaration(item: &ModuleItem, unresolved_mark: Mark) -> bool {
+        let ModuleItem::Stmt(statement @ Stmt::Decl(Decl::Var(_))) = item else {
+            return false;
+        };
+        try_classify_cjs_require(statement, unresolved_mark).is_some()
+    }
+
+    let mut removable = HashSet::default();
+    for (index, item) in module.body.iter().enumerate() {
+        if matches!(item, ModuleItem::ModuleDecl(ModuleDecl::Import(_)))
+            || matches!(item, ModuleItem::Stmt(Stmt::Decl(Decl::Fn(_))))
+            || is_directive(item)
+            || is_require_declaration(item, unresolved_mark)
+        {
+            continue;
+        }
+        let Some(name) = sentinel_name(item, unresolved_mark) else {
+            break;
+        };
+        if candidate_names.contains(&name) {
+            removable.insert(index);
+        }
+    }
+    removable
+}
+
+/// Recognize a remaining named-export assignment chain as one operation,
+/// including chains inside initializers or control flow. Known coupled default
+/// forms and a single static export followed only by resolved local writes
+/// retain their existing recovery (including enum and decorator assignments).
+/// Deferred function bodies are outside this top-level classification.
+fn has_unhandled_named_export_chain(module: &Module, unresolved_mark: Mark) -> bool {
+    struct Finder {
+        unresolved_mark: Mark,
+        found: bool,
+    }
+
+    impl Visit for Finder {
+        fn visit_assign_expr(&mut self, assign: &AssignExpr) {
+            if self.found {
+                return;
+            }
+            let mut current = assign;
+            let mut count = 0;
+            let mut named_export = false;
+            let mut local_tail = assign.op == AssignOp::Assign
+                && matches!(&assign.left,
+                    AssignTarget::Simple(SimpleAssignTarget::Member(member))
+                    if is_cjs_export_object_expr(&member.obj, self.unresolved_mark)
+                        && is_ident_prop(&member.prop).is_some());
+            loop {
+                count += 1;
+                if count > 1 {
+                    local_tail &= current.op == AssignOp::Assign
+                        && matches!(&current.left,
+                            AssignTarget::Simple(SimpleAssignTarget::Ident(binding))
+                            if binding.id.ctxt.outer() != self.unresolved_mark);
+                }
+                if let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &current.left {
+                    named_export |= is_cjs_export_object_expr(&member.obj, self.unresolved_mark);
+                }
+                let Expr::Assign(next) = strip_parens(&current.right) else {
+                    break;
+                };
+                current = next;
+            }
+            if count > 1 && named_export && !local_tail {
+                self.found = true;
+                return;
+            }
+            assign.visit_children_with(self);
+        }
+
+        fn visit_function(&mut self, _: &Function) {}
+        fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+    }
+
+    let mut finder = Finder {
+        unresolved_mark,
+        found: false,
+    };
+    module.visit_with(&mut finder);
+    finder.found
+}
+
+/// Recover a remaining top-level named-export assignment chain as one
+/// operation before classification. UnAssignmentMerging already splits chains
+/// whose value can be evaluated once per target; the chains that reach here
+/// carry a function value or a receiver mix it does not split, and
+/// classifying only the outer write would strand the RHS as a CommonJS
+/// residual inside ESM output.
+///
+/// Every target must be a static named-export member on `exports` or
+/// `module.exports`, excluding the `exports` key (with `module.exports ===
+/// module`, that store replaces the slot). The outermost target may instead be
+/// the `module.exports` slot or a resolved local binding. A repeatable value
+/// (identifier, primitive literal, `void <number>`) is stored per target,
+/// matching the UnAssignmentMerging split. A function or arrow expression, or
+/// a `require("literal")` call, is evaluated once into a fresh `var` named
+/// after the innermost free export name; every target then stores that
+/// binding, so the recovered exports stay snapshots even when a local head is
+/// reassigned later. Creating a function runs no code, so moving the receiver
+/// evaluations past it is invisible without any module-wide analysis. The
+/// require form accepts the provider-ordering deviation the single
+/// `exports.name = require(...)` recovery already takes. A call whose callee
+/// is rooted, through static keys, at a provider binding (a top-level
+/// `require("literal")` declarator, or a static member of one, declared once
+/// and never written) with repeatable arguments that are not the CommonJS
+/// wrapper bindings is also evaluated once into that binding, at the chain's
+/// own position: code reached only through another module's value cannot
+/// rebind this module's `exports` or replace its `module.exports` on its own
+/// (`chain_receiver_reference_order` in docs/rewrite-assumptions.md). Any
+/// other effectful value (a local or computed call, `new`, a sequence, a
+/// class with computed keys or static blocks) stays whole.
+/// `module.exports = exports.default = value` becomes the two-statement mirror
+/// that default-export recovery already removes; the `module.exports.default`
+/// read has no mirror recognizer and stays whole.
+///
+/// The recovered exports become module bindings, so the whole normalization
+/// skips a module with direct eval or `with` (dynamic-scope policy in
+/// docs/rewrite-assumptions.md). Chains in nested statements or initializers,
+/// or with other targets, are left for `has_unhandled_named_export_chain`.
+/// Returns the original body when anything changed so the caller can restore
+/// it if the module stays at the CommonJS boundary.
+fn normalize_named_export_chains(
+    module: &mut Module,
+    unresolved_mark: Mark,
+) -> Option<Vec<ModuleItem>> {
+    enum Head {
+        None,
+        ModuleExports,
+        Local(AssignTarget),
+    }
+
+    struct Chain {
+        span: Span,
+        head: Head,
+        /// Named-export targets, outermost first.
+        exports: Vec<(Span, AssignTarget, Atom)>,
+        value: Box<Expr>,
+    }
+
+    fn parse(item: &ModuleItem, unresolved_mark: Mark) -> Option<Chain> {
+        let ModuleItem::Stmt(Stmt::Expr(statement)) = item else {
+            return None;
+        };
+        let mut expr = strip_parens(&statement.expr);
+        let mut head = Head::None;
+        let mut exports = Vec::new();
+        let mut depth = 0usize;
+        while let Expr::Assign(assign) = expr {
+            if assign.op != AssignOp::Assign {
+                return None;
+            }
+            match &assign.left {
+                AssignTarget::Simple(SimpleAssignTarget::Member(member)) => {
+                    if is_module_exports_member(member, unresolved_mark) {
+                        if depth != 0 {
+                            return None;
+                        }
+                        head = Head::ModuleExports;
+                    } else if is_cjs_export_object_expr(&member.obj, unresolved_mark) {
+                        let name = is_ident_prop(&member.prop)?;
+                        if matches!(name.as_ref(), "__esModule" | "exports")
+                            || is_prototype_mutating_member_name(name.as_ref())
+                        {
+                            return None;
+                        }
+                        // A repeated name would classify as two writes of one
+                        // export and leave the dropped write as a residual.
+                        if exports.iter().any(|(_, _, seen)| *seen == name) {
+                            return None;
+                        }
+                        exports.push((assign.span, assign.left.clone(), name));
+                    } else {
+                        return None;
+                    }
+                }
+                AssignTarget::Simple(SimpleAssignTarget::Ident(binding)) => {
+                    if depth != 0 || binding.id.ctxt.outer() == unresolved_mark {
+                        return None;
+                    }
+                    head = Head::Local(assign.left.clone());
+                }
+                _ => return None,
+            }
+            depth += 1;
+            expr = strip_parens(&assign.right);
+        }
+        if depth < 2 || exports.is_empty() {
+            return None;
+        }
+        Some(Chain {
+            span: statement.span,
+            head,
+            exports,
+            value: Box::new(expr.clone()),
+        })
+    }
+
+    fn is_repeatable_value(expr: &Expr) -> bool {
+        match expr {
+            Expr::Ident(_) => true,
+            Expr::Lit(lit) => !matches!(lit, Lit::Regex(_)),
+            Expr::Unary(unary) if unary.op == UnaryOp::Void => {
+                matches!(strip_parens(&unary.arg), Expr::Lit(Lit::Num(_)))
+            }
+            _ => false,
+        }
+    }
+
+    /// Values that may be evaluated once into a binding. Creating a function
+    /// runs no code. A `require("literal")` runs the provider, which the
+    /// existing `exports.name = require(...)` recovery already moves ahead of
+    /// the module body (`import_hoisting_eagerness`); the recovered binding
+    /// then goes through the same require-to-import path. A provider call
+    /// (`is_provider_call`) runs another module's code at the chain's own
+    /// position; the only ordering change is that the target references are
+    /// evaluated after it (`chain_receiver_reference_order`).
+    fn is_stored_value(expr: &Expr, unresolved_mark: Mark, providers: &HashSet<BindingId>) -> bool {
+        match expr {
+            Expr::Fn(_) | Expr::Arrow(_) => true,
+            Expr::Call(call) => {
+                is_require_call(call, unresolved_mark).is_some()
+                    || is_provider_call(call, providers, unresolved_mark)
+            }
+            _ => false,
+        }
+    }
+
+    /// Bindings whose value came from another module: a top-level
+    /// `var P = require("literal")` declarator, or a static member chain
+    /// rooted at such a binding or at a literal require, declared exactly
+    /// once and never written afterwards. Code reached through them cannot
+    /// rebind this module's `exports` or replace `module.exports` on its own;
+    /// it can only do so by re-entering code that lexically lives in this
+    /// module, which the single-export recovery already accepts.
+    fn collect_provider_bindings(module: &Module, unresolved_mark: Mark) -> HashSet<BindingId> {
+        let mut providers: HashSet<BindingId> = HashSet::default();
+        // Qualify each candidate before it can seed an alias: an alias of a
+        // rewritten or redeclared root must not survive as a provider.
+        let mut uses: Option<BindingUseIndex> = None;
+        for item in &module.body {
+            let ModuleItem::Stmt(Stmt::Decl(Decl::Var(decl))) = item else {
+                continue;
+            };
+            for declarator in &decl.decls {
+                let Pat::Ident(binding) = &declarator.name else {
+                    continue;
+                };
+                let Some(init) = &declarator.init else {
+                    continue;
+                };
+                if !is_provider_root(strip_parens(init), &providers, unresolved_mark, true) {
+                    continue;
+                }
+                let id = binding_id(&binding.id);
+                let uses = uses.get_or_insert_with(|| BindingUseIndex::collect(module));
+                if uses.has_single_declaration(&id) && !uses.has_direct_write(&id) {
+                    providers.insert(id);
+                }
+            }
+        }
+        providers
+    }
+
+    /// `P` or `P.a.b` through static keys, rooted at a provider binding.
+    /// With `allow_require`, the root may also be a literal `require(...)`
+    /// call (a declarator initializer such as `require("lib").helper`).
+    fn is_provider_root(
+        expr: &Expr,
+        providers: &HashSet<BindingId>,
+        unresolved_mark: Mark,
+        allow_require: bool,
+    ) -> bool {
+        let mut current = strip_parens(expr);
+        loop {
+            match current {
+                Expr::Ident(id) => return providers.contains(&binding_id(id)),
+                Expr::Call(call) => {
+                    return allow_require && is_require_call(call, unresolved_mark).is_some();
+                }
+                Expr::Member(member) => {
+                    if is_ident_prop(&member.prop).is_none() {
+                        return false;
+                    }
+                    current = strip_parens(&member.obj);
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// A plain call (no optional chain, no spread) whose callee is rooted at a
+    /// provider binding and whose arguments are repeatable values other than
+    /// the CommonJS wrapper bindings, so the call receives nothing that could
+    /// reach this module's receivers.
+    fn is_provider_call(
+        call: &CallExpr,
+        providers: &HashSet<BindingId>,
+        unresolved_mark: Mark,
+    ) -> bool {
+        let Callee::Expr(callee) = &call.callee else {
+            return false;
+        };
+        if !is_provider_root(callee, providers, unresolved_mark, false) {
+            return false;
+        }
+        call.args.iter().all(|arg| {
+            arg.spread.is_none()
+                && is_repeatable_value(&arg.expr)
+                && !matches!(
+                    strip_parens(&arg.expr),
+                    Expr::Ident(id)
+                        if id.ctxt.outer() == unresolved_mark
+                            && matches!(id.sym.as_ref(), "module" | "exports" | "require")
+                )
+        })
+    }
+
+    fn assign_item(
+        span: Span,
+        assign_span: Span,
+        left: AssignTarget,
+        right: Box<Expr>,
+    ) -> ModuleItem {
+        ModuleItem::Stmt(Stmt::Expr(ExprStmt {
+            span,
+            expr: Box::new(Expr::Assign(AssignExpr {
+                span: assign_span,
+                op: AssignOp::Assign,
+                left,
+                right,
+            })),
+        }))
+    }
+
+    let parsed: Vec<Option<Chain>> = module
+        .body
+        .iter()
+        .map(|item| parse(item, unresolved_mark))
+        .collect();
+    if parsed.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut direct_eval = DirectEvalPresence::default();
+    module.visit_with(&mut direct_eval);
+    if direct_eval.found || super::eval_utils::module_has_with_stmt(module) {
+        return None;
+    }
+
+    // Provider bindings are only needed for a chain carrying a non-require
+    // call; skip the binding-use walk otherwise.
+    let needs_providers = parsed.iter().flatten().any(|chain| {
+        matches!(
+            chain.value.as_ref(),
+            Expr::Call(call) if is_require_call(call, unresolved_mark).is_none()
+        )
+    });
+    let providers = if needs_providers {
+        collect_provider_bindings(module, unresolved_mark)
+    } else {
+        HashSet::default()
+    };
+
+    let original_body = module.body.clone();
+    let mut used_names = collect_all_identifier_names(module);
+    let mut changed = false;
+    let mut body = Vec::with_capacity(module.body.len());
+    for (item, chain) in std::mem::take(&mut module.body).into_iter().zip(parsed) {
+        let Some(chain) = chain else {
+            body.push(item);
+            continue;
+        };
+        let repeatable = is_repeatable_value(&chain.value);
+        if !repeatable && !is_stored_value(&chain.value, unresolved_mark, &providers) {
+            body.push(item);
+            continue;
+        }
+
+        if matches!(chain.head, Head::ModuleExports)
+            && chain.exports.iter().any(|(_, _, name)| name == "default")
+        {
+            // `module.exports = exports.default = value`: emit the mirror pair.
+            let [(assign_span, target, _)] = chain.exports.as_slice() else {
+                body.push(item);
+                continue;
+            };
+            let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = target else {
+                body.push(item);
+                continue;
+            };
+            if !matches!(strip_parens(&member.obj), Expr::Ident(_)) {
+                body.push(item);
+                continue;
+            }
+            body.push(assign_item(
+                chain.span,
+                *assign_span,
+                target.clone(),
+                chain.value.clone(),
+            ));
+            body.push(make_module_exports_assign_expr_item(
+                chain.span,
+                Box::new(Expr::Member(member.clone())),
+                unresolved_mark,
+            ));
+            changed = true;
+            continue;
+        }
+
+        let stored: Box<Expr> = if repeatable {
+            chain.value.clone()
+        } else {
+            let innermost = &chain.exports.last().expect("chain has exports").2;
+            let name = chain
+                .exports
+                .iter()
+                .rev()
+                .map(|(_, _, name)| name)
+                .find(|name| {
+                    name.as_ref() != "default"
+                        && is_valid_identifier_name(name)
+                        && !is_reserved_binding_name(name)
+                        && !used_names.contains(*name)
+                })
+                .cloned()
+                .unwrap_or_else(|| fresh_prefixed_name(innermost, &mut used_names));
+            used_names.insert(name.clone());
+            let binding = fresh_binding_ident(name, DUMMY_SP);
+            body.push(ModuleItem::Stmt(Stmt::Decl(Decl::Var(Box::new(VarDecl {
+                span: chain.span,
+                ctxt: Default::default(),
+                kind: VarDeclKind::Var,
+                declare: false,
+                decls: vec![VarDeclarator {
+                    span: chain.span,
+                    name: Pat::Ident(BindingIdent {
+                        id: binding.clone(),
+                        type_ann: None,
+                    }),
+                    init: Some(chain.value.clone()),
+                    definite: false,
+                }],
+            })))));
+            Box::new(Expr::Ident(binding))
+        };
+
+        // Assignment chains write from the inside out.
+        for (assign_span, target, _) in chain.exports.iter().rev() {
+            body.push(assign_item(
+                chain.span,
+                *assign_span,
+                target.clone(),
+                stored.clone(),
+            ));
+        }
+        match chain.head {
+            Head::None => {}
+            Head::ModuleExports => body.push(make_module_exports_assign_expr_item(
+                chain.span,
+                stored,
+                unresolved_mark,
+            )),
+            Head::Local(target) => body.push(assign_item(chain.span, chain.span, target, stored)),
+        }
+        changed = true;
+    }
+    module.body = body;
+    changed.then_some(original_body)
 }
 
 /// Split compound export initializers so the normal export classification can
@@ -5351,6 +7093,15 @@ fn lower_exported_cjs_requires(module: &mut Module, unresolved_mark: Mark) {
 /// capture into an import. Object patterns use the same whole-value capture so
 /// the original destructuring binding remains local.
 fn preserve_written_cjs_require_bindings(module: &mut Module, unresolved_mark: Mark) {
+    if !module.body.iter().any(|item| {
+        let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
+            return false;
+        };
+        var.decls.len() == 1
+            && try_classify_cjs_require_declarator(&var.decls[0], unresolved_mark).is_some()
+    }) {
+        return;
+    }
     let uses = BindingUseIndex::collect(module);
     let mut used_names = collect_all_identifier_names(module);
     let mut new_body = Vec::with_capacity(module.body.len());
@@ -5391,7 +7142,8 @@ fn preserve_written_cjs_require_bindings(module: &mut Module, unresolved_mark: M
             continue;
         };
 
-        let import_local = make_ident(fresh_prefixed_name(base_name, &mut used_names));
+        let import_local =
+            fresh_binding_ident(fresh_prefixed_name(base_name, &mut used_names), DUMMY_SP);
         declarator.init = Some(Box::new(Expr::Ident(import_local.clone())));
 
         let capture = VarDecl {
@@ -5505,6 +7257,7 @@ fn try_classify_cjs_export(
                 name: prop,
                 expr: assign.right.clone(),
                 is_void,
+                is_live: false,
             });
         }
         // bracket notation on module.exports — skip
@@ -5558,6 +7311,7 @@ fn try_classify_define_property_export(
             name: export_name,
             expr: Box::new(Expr::Ident(ident)),
             is_void: false,
+            is_live: true,
         });
     }
 
@@ -5732,10 +7486,13 @@ fn is_ident_prop(prop: &MemberProp) -> Option<Atom> {
     }
 }
 
-/// Check if expr is `void N` or `undefined`
+/// Check if expr is `void <literal>` or `undefined`. `void f()` still calls
+/// `f`, so it is not a placeholder.
 fn is_void_or_undefined(expr: &Expr, unresolved_mark: Mark) -> bool {
     match expr {
-        Expr::Unary(unary) if unary.op == UnaryOp::Void => true,
+        Expr::Unary(unary) if unary.op == UnaryOp::Void => {
+            matches!(strip_parens(&unary.arg), Expr::Lit(_))
+        }
         Expr::Ident(id) if is_undefined_ident(id, unresolved_mark) => true,
         _ => false,
     }
@@ -5912,8 +7669,7 @@ fn is_unresolved_ident(id: &Ident, name: &str, unresolved_mark: Mark) -> bool {
 }
 
 fn is_undefined_ident(id: &Ident, unresolved_mark: Mark) -> bool {
-    id.sym.as_ref() == "undefined"
-        && (id.ctxt.outer() == unresolved_mark || id.ctxt == SyntaxContext::empty())
+    is_unresolved_ident(id, "undefined", unresolved_mark)
 }
 
 /// Check if a string is a valid JS identifier
@@ -5937,7 +7693,9 @@ fn make_str(value: &str) -> Str {
     }
 }
 
-fn make_ident(sym: Atom) -> Ident {
+/// An identifier that names something but binds nothing: the `imported` or
+/// `exported` half of a specifier. Not a reference, so it carries no context.
+fn make_name_ident(sym: Atom) -> Ident {
     Ident::new_no_ctxt(sym, DUMMY_SP)
 }
 
@@ -6018,7 +7776,7 @@ fn collect_all_declared_names(module: &Module) -> HashSet<Atom> {
     }
 
     let mut collector = Collector {
-        names: HashSet::new(),
+        names: collect_module_names(module),
     };
     module.visit_with(&mut collector);
     collector.names
@@ -6036,7 +7794,7 @@ fn collect_all_identifier_names(module: &Module) -> HashSet<Atom> {
     }
 
     let mut collector = Collector {
-        names: HashSet::new(),
+        names: HashSet::default(),
     };
     module.visit_with(&mut collector);
     collector.names
@@ -6142,7 +7900,7 @@ fn fresh_prefixed_name(name: &Atom, used_names: &mut HashSet<Atom>) -> Atom {
 
     let mut index = 2usize;
     loop {
-        let candidate = Atom::from(format!("_{name}{index}"));
+        let candidate = Atom::from(format!("_{name}_{index}"));
         if used_names.insert(candidate.clone()) {
             return candidate;
         }
@@ -6169,9 +7927,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unmatched_commonjs_prepasses_do_not_build_binding_use_indexes() {
+        let (_, spans) = crate::test_tracing::record_spans(|| {
+            swc_core::common::GLOBALS.set(&Default::default(), || {
+                let mut module = crate::unpacker::parse_es_module(
+                    "import { value } from 'source'; var copy = value; \
+                     function nested(require) { var local = require('other'); return local; } \
+                     var ordinary = makeValue(); use(copy, ordinary, nested);",
+                    "no-commonjs-candidate.js",
+                    Default::default(),
+                )
+                .unwrap();
+                let unresolved_mark = Mark::new();
+                module.visit_mut_with(&mut swc_core::ecma::transforms::base::resolver(
+                    unresolved_mark,
+                    Mark::new(),
+                    false,
+                ));
+                let original = module.clone();
+                rewrite_commonjs_export_star_loops(&mut module, unresolved_mark);
+                preserve_written_cjs_require_bindings(&mut module, unresolved_mark);
+                assert!(
+                    collect_default_only_inline_interop_bindings(&module, unresolved_mark)
+                        .is_empty()
+                );
+                assert_eq!(module, original);
+                module.visit_mut_with(&mut UnEsm::new(unresolved_mark, RewriteLevel::Standard));
+                assert_eq!(module, original);
+            });
+        });
+        assert!(
+            !spans.iter().any(|name| name == "binding_use_index"),
+            "a module without a candidate must not pay for full binding analysis: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn default_import_fallback_uses_delimited_suffixes() {
+        let mut used_names = HashSet::default();
+
+        assert_eq!(fresh_default_import_name(&mut used_names), "defaultExport");
+        assert_eq!(
+            fresh_default_import_name(&mut used_names),
+            "defaultExport_1"
+        );
+        assert_eq!(
+            fresh_default_import_name(&mut used_names),
+            "defaultExport_2"
+        );
+    }
+
+    #[test]
+    fn prefixed_name_uses_delimited_suffix() {
+        let mut used_names = HashSet::from_iter([Atom::from("_value")]);
+
+        assert_eq!(
+            fresh_prefixed_name(&Atom::from("value"), &mut used_names),
+            "_value_2"
+        );
+    }
+
+    #[test]
     fn get_or_insert_records_source_order_once() {
         let mut order = Vec::new();
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
 
         get_or_insert(&mut order, &mut map, "react".to_string());
         get_or_insert(&mut order, &mut map, "react".to_string());

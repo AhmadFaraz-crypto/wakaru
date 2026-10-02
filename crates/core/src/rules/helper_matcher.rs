@@ -1,11 +1,11 @@
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use swc_core::common::{Mark, DUMMY_SP};
 use swc_core::ecma::ast::{
     BindingIdent, Callee, Decl, Expr, Ident, ImportSpecifier, Lit, MemberProp, Module, ModuleItem,
     Pat, Stmt, VarDeclarator,
 };
-use swc_core::ecma::visit::{Visit, VisitWith};
+use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 pub(crate) use crate::analysis::{
     binding_id as binding_key, ident_matches_binding, BindingId as BindingKey,
@@ -74,7 +74,8 @@ pub(crate) fn remaining_refs_outside_var_declarators(
     let mut finder = VarDeclaratorSkippingRefFinder {
         targets,
         skipped_decls,
-        found: HashSet::new(),
+        skip_functions: false,
+        found: HashSet::default(),
     };
     module.visit_with(&mut finder);
     finder.found
@@ -82,28 +83,59 @@ pub(crate) fn remaining_refs_outside_var_declarators(
 
 /// Collect references to `targets`, skipping function declarations and
 /// individual var declarators whose bindings are in `skipped_decls`.
-pub(crate) fn remaining_refs_outside_declarations(
-    module: &Module,
+pub(crate) fn remaining_refs_outside_declarations<N>(
+    node: &N,
     targets: &HashSet<BindingKey>,
     skipped_decls: &HashSet<BindingKey>,
-) -> HashSet<BindingKey> {
+) -> HashSet<BindingKey>
+where
+    N: for<'a> VisitWith<VarDeclaratorSkippingRefFinder<'a>> + ?Sized,
+{
     let mut finder = VarDeclaratorSkippingRefFinder {
         targets,
         skipped_decls,
-        found: HashSet::new(),
+        skip_functions: true,
+        found: HashSet::default(),
     };
-
-    for item in &module.body {
-        if fn_decl_binding_key(item)
-            .as_ref()
-            .is_some_and(|key| skipped_decls.contains(key))
-        {
-            continue;
-        }
-        item.visit_with(&mut finder);
-    }
-
+    node.visit_with(&mut finder);
     finder.found
+}
+/// The candidates whose declarations can go: nothing outside the removable
+/// set references them. A candidate that stays referenced keeps its
+/// declaration, so the references inside it count for the others; the set
+/// shrinks until it is stable instead of skipping every candidate declaration
+/// once, which would remove a dependency of a kept candidate.
+pub(crate) fn removable_without_remaining_refs<N>(
+    module: &N,
+    candidates: &HashSet<BindingKey>,
+) -> HashSet<BindingKey>
+where
+    N: for<'a> VisitWith<VarDeclaratorSkippingRefFinder<'a>> + ?Sized,
+{
+    let mut removable = candidates.clone();
+    loop {
+        let remaining = remaining_refs_outside_declarations(module, &removable, &removable);
+        if remaining.is_empty() {
+            return removable;
+        }
+        removable.retain(|key| !remaining.contains(key));
+    }
+}
+
+/// [`removable_without_remaining_refs`] for candidates that are only var
+/// declarators: function declarations are not skipped.
+pub(crate) fn removable_without_remaining_var_declarator_refs(
+    module: &Module,
+    candidates: &HashSet<BindingKey>,
+) -> HashSet<BindingKey> {
+    let mut removable = candidates.clone();
+    loop {
+        let remaining = remaining_refs_outside_var_declarators(module, &removable, &removable);
+        if remaining.is_empty() {
+            return removable;
+        }
+        removable.retain(|key| !remaining.contains(key));
+    }
 }
 
 /// Collect which bindings from `targets` are referenced anywhere in `node`.
@@ -113,7 +145,7 @@ where
 {
     let mut finder = RemainingRefFinder {
         targets,
-        found: HashSet::new(),
+        found: HashSet::default(),
     };
     node.visit_with(&mut finder);
     finder.found
@@ -156,13 +188,36 @@ impl Visit for SingleBindingRefCounter<'_> {
     }
 }
 
-struct VarDeclaratorSkippingRefFinder<'a> {
+pub(crate) struct VarDeclaratorSkippingRefFinder<'a> {
     targets: &'a HashSet<BindingKey>,
     skipped_decls: &'a HashSet<BindingKey>,
+    skip_functions: bool,
     found: HashSet<BindingKey>,
 }
 
 impl Visit for VarDeclaratorSkippingRefFinder<'_> {
+    fn visit_fn_decl(&mut self, decl: &swc_core::ecma::ast::FnDecl) {
+        if self.skip_functions && self.skipped_decls.contains(&binding_key(&decl.ident)) {
+            return;
+        }
+        decl.visit_children_with(self);
+    }
+
+    fn visit_export_decl(&mut self, export: &swc_core::ecma::ast::ExportDecl) {
+        // Direct exports remain observable even without a local reference.
+        // Visit their binding patterns explicitly before skipping initializers.
+        match &export.decl {
+            Decl::Fn(decl) => decl.ident.visit_with(self),
+            Decl::Var(var) => {
+                for decl in &var.decls {
+                    decl.name.visit_with(self);
+                }
+            }
+            _ => {}
+        }
+        export.visit_children_with(self);
+    }
+
     fn visit_var_declarator(&mut self, decl: &VarDeclarator) {
         if var_declarator_binding_key(decl)
             .as_ref()
@@ -183,6 +238,67 @@ impl Visit for VarDeclaratorSkippingRefFinder<'_> {
         if self.targets.contains(&key) {
             self.found.insert(key);
         }
+    }
+}
+
+/// Remove unused, caller-proven helper declarations in any statement list.
+/// Candidates must name function/variable declarations in statement lists;
+/// their initializers must be safe to discard under the caller's helper proof.
+/// This does not discover helpers, remove imports, or prove initializer purity.
+/// Returns the removable set so callers can apply their own import policy.
+/// Pass the whole module whenever available so sibling scopes and exports count.
+pub(crate) fn remove_unused_helper_declarations<N>(
+    node: &mut N,
+    candidates: &HashSet<BindingKey>,
+) -> HashSet<BindingKey>
+where
+    N: for<'a> VisitWith<VarDeclaratorSkippingRefFinder<'a>>
+        + for<'a> VisitMutWith<HelperDeclarationRemover<'a>>,
+{
+    if candidates.is_empty() {
+        return HashSet::default();
+    }
+    let removable = removable_without_remaining_refs(node, candidates);
+    if !removable.is_empty() {
+        node.visit_mut_with(&mut HelperDeclarationRemover {
+            removable: &removable,
+        });
+    }
+    removable
+}
+
+pub(crate) struct HelperDeclarationRemover<'a> {
+    removable: &'a HashSet<BindingKey>,
+}
+
+impl HelperDeclarationRemover<'_> {
+    fn retain_stmt(&self, stmt: &mut Stmt) -> bool {
+        match stmt {
+            Stmt::Decl(Decl::Fn(decl)) => !self.removable.contains(&binding_key(&decl.ident)),
+            Stmt::Decl(Decl::Var(var)) => {
+                var.decls.retain(|decl| {
+                    var_declarator_binding_key(decl)
+                        .is_none_or(|key| !self.removable.contains(&key))
+                });
+                !var.decls.is_empty()
+            }
+            _ => true,
+        }
+    }
+}
+
+impl VisitMut for HelperDeclarationRemover<'_> {
+    fn visit_mut_module_items(&mut self, items: &mut Vec<ModuleItem>) {
+        items.retain_mut(|item| match item {
+            ModuleItem::Stmt(stmt) => self.retain_stmt(stmt),
+            _ => true,
+        });
+        items.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_stmts(&mut self, stmts: &mut Vec<Stmt>) {
+        stmts.retain_mut(|stmt| self.retain_stmt(stmt));
+        stmts.visit_mut_children_with(self);
     }
 }
 
@@ -221,24 +337,25 @@ pub(crate) fn remove_import_specifiers_by_binding(
     body: &mut Vec<ModuleItem>,
     removable: &HashSet<BindingKey>,
 ) {
-    for item in body.iter_mut() {
-        let ModuleItem::ModuleDecl(swc_core::ecma::ast::ModuleDecl::Import(import)) = item else {
-            continue;
-        };
-        import
-            .specifiers
-            .retain(|specifier| !removable.contains(&import_specifier_binding_key(specifier)));
-    }
-    body.retain(|item| {
+    // An import that loses its last specifier here goes with it. A bare
+    // `import "./side.js"` never had one and is a side effect the module
+    // depends on; it stays.
+    body.retain_mut(|item| {
         let ModuleItem::ModuleDecl(swc_core::ecma::ast::ModuleDecl::Import(import)) = item else {
             return true;
         };
+        if import.specifiers.is_empty() {
+            return true;
+        }
+        import
+            .specifiers
+            .retain(|specifier| !removable.contains(&import_specifier_binding_key(specifier)));
         !import.specifiers.is_empty()
     });
 }
 
 pub(crate) fn collect_import_binding_keys(module: &Module) -> HashSet<BindingKey> {
-    let mut keys = HashSet::new();
+    let mut keys = HashSet::default();
     for item in &module.body {
         let ModuleItem::ModuleDecl(swc_core::ecma::ast::ModuleDecl::Import(import)) = item else {
             continue;
@@ -274,11 +391,11 @@ impl NumericRequireNamespaces {
     pub(crate) fn collect(module: &Module, unresolved_mark: Option<Mark>) -> Self {
         let Some(unresolved_mark) = unresolved_mark else {
             return Self {
-                candidates: HashSet::new(),
-                referenced_at_entry: HashSet::new(),
+                candidates: HashSet::default(),
+                referenced_at_entry: HashSet::default(),
             };
         };
-        let mut candidates = HashSet::new();
+        let mut candidates = HashSet::default();
         for item in &module.body {
             let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
                 continue;
@@ -306,7 +423,7 @@ impl NumericRequireNamespaces {
 
     /// Remove candidate declarations orphaned by the calling rule's rewrites.
     pub(crate) fn sweep_orphaned(&self, body: &mut Vec<ModuleItem>) {
-        let mut unused = HashSet::new();
+        let mut unused = HashSet::default();
         for key in &self.referenced_at_entry {
             let ident = Ident::new(key.0.clone(), DUMMY_SP, key.1);
             if !ident_used_in_items(body, &ident) {
@@ -424,5 +541,131 @@ mod tests {
             });
             assert!(member_prop_name(&computed_prop, "default"));
         });
+    }
+
+    fn cleanup_helpers(source: &str) -> Vec<String> {
+        use swc_core::common::{sync::Lrc, FileName, SourceMap};
+        use swc_core::ecma::parser::{lexer::Lexer, EsSyntax, Parser, StringInput, Syntax};
+        use swc_core::ecma::transforms::base::resolver;
+        use swc_core::ecma::visit::VisitMutWith;
+
+        GLOBALS.set(&Default::default(), || {
+            let cm: Lrc<SourceMap> = Default::default();
+            let fm = cm.new_source_file(FileName::Anon.into(), source.to_owned());
+            let lexer = Lexer::new(
+                Syntax::Es(EsSyntax::default()),
+                Default::default(),
+                StringInput::from(&*fm),
+                None,
+            );
+            let mut module = Parser::new_from(lexer).parse_module().unwrap();
+            module.visit_mut_with(&mut resolver(Mark::new(), Mark::new(), false));
+            #[derive(Default)]
+            struct Declarations {
+                helpers: HashSet<BindingKey>,
+                names: Vec<String>,
+            }
+            impl Visit for Declarations {
+                fn visit_binding_ident(&mut self, ident: &BindingIdent) {
+                    self.names.push(ident.id.sym.to_string());
+                    if ident.id.sym.starts_with("helper") {
+                        self.helpers.insert(binding_key(&ident.id));
+                    }
+                }
+                fn visit_fn_decl(&mut self, decl: &swc_core::ecma::ast::FnDecl) {
+                    self.names.push(decl.ident.sym.to_string());
+                    if decl.ident.sym.starts_with("helper") {
+                        self.helpers.insert(binding_key(&decl.ident));
+                    }
+                    decl.function.visit_with(self);
+                }
+            }
+            let mut before = Declarations::default();
+            module.visit_with(&mut before);
+            remove_unused_helper_declarations(&mut module, &before.helpers);
+            let mut after = Declarations::default();
+            module.visit_with(&mut after);
+            after.names.sort();
+            after.names
+        })
+    }
+
+    #[test]
+    fn unused_helper_cycles_are_removed_from_nested_statement_lists() {
+        let names = cleanup_helpers(
+            r#"
+            function outer() {
+                function helperA() { helperB(); }
+                function helperB() { helperA(); }
+                var helperC = () => helperC(), keep = effect();
+                { function helperBlock() {} }
+                const arrow = () => { function helperArrow() {} };
+                class C {
+                    method() { function helperMethod() {} }
+                    static { function helperStatic() {} }
+                }
+            }
+        "#,
+        );
+        assert!(
+            !names.iter().any(|name| name.starts_with("helper")),
+            "{names:?}"
+        );
+        assert!(names.contains(&"keep".to_owned()));
+        assert!(names.contains(&"outer".to_owned()));
+    }
+
+    #[test]
+    fn surviving_helper_keeps_its_transitive_dependencies() {
+        let names = cleanup_helpers(
+            r#"
+            function helperA() { helperB(); }
+            function helperB() { helperC(); }
+            function helperC() {}
+            export { helperA };
+        "#,
+        );
+        assert_eq!(names, ["helperA", "helperB", "helperC"]);
+    }
+
+    #[test]
+    fn sibling_closures_and_computed_keys_keep_helpers_alive() {
+        let names = cleanup_helpers(
+            r#"
+            function helperClosure() {}
+            function helperKey() {}
+            function reader() { return helperClosure; }
+            export const value = { [helperKey()]: 1 };
+        "#,
+        );
+        assert!(names.contains(&"helperClosure".to_owned()));
+        assert!(names.contains(&"helperKey".to_owned()));
+    }
+
+    #[test]
+    fn exported_declarations_keep_their_dependencies() {
+        let names = cleanup_helpers(
+            r#"
+            export function helperExport() { helperDep(); }
+            function helperDep() {}
+            export const helperVar = () => helperVarDep();
+            function helperVarDep() {}
+        "#,
+        );
+        assert_eq!(
+            names,
+            ["helperDep", "helperExport", "helperVar", "helperVarDep"]
+        );
+    }
+
+    #[test]
+    fn same_spelling_in_a_different_scope_does_not_keep_a_helper_alive() {
+        let names = cleanup_helpers(
+            r#"
+            function helper() {}
+            function reader(helper) { return helper; }
+        "#,
+        );
+        assert_eq!(names, ["helper", "reader"]);
     }
 }

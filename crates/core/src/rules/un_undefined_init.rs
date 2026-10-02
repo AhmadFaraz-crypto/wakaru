@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 use swc_core::common::Mark;
 
 use swc_core::ecma::ast::{Module, Pat, VarDecl, VarDeclKind};
@@ -24,8 +24,8 @@ impl UnUndefinedInit {
     pub fn new(unresolved_mark: Mark) -> Self {
         Self {
             unresolved_mark,
-            binding_references: HashMap::new(),
-            converted_unused_bindings: HashSet::new(),
+            binding_references: HashMap::default(),
+            converted_unused_bindings: HashSet::default(),
         }
     }
 }

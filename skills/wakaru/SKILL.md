@@ -108,6 +108,10 @@ hints (resource paths, dependency-map requests, original input paths), which
 yield readable relative filenames; collisions are made unique. Raw output
 keeps provisional extraction names.
 
+When you need to check a recovered module against the input, add
+`--provenance` to the unpack command. Look up its emitted filename in
+`out/provenance.json` for the source input and `[start, end)` byte ranges.
+
 ### 3. Recover names / original source when a map exists
 
 ```bash
@@ -127,13 +131,14 @@ still writes JavaScript for every module, and recoverable Vue modules also get
 sibling `.vue` artifacts.
 
 ```bash
-wakaru input.js --vue-sfc
+wakaru input.js --vue-sfc -o output.js
 wakaru input.js --vue-sfc -o App.vue
 wakaru bundle.js --unpack --vue-sfc --json -o out/
 ```
 
-For batch analysis, prefer `--unpack --vue-sfc --json` and inspect the JSON
-output first. Each `modules` entry describes an output artifact. Its `kind` is
+For one file, use `-o` to write recovered Vue output; without it, stdout
+remains JavaScript. For batch analysis, prefer `--unpack --vue-sfc --json` and
+inspect the JSON output first. Each `modules` entry describes an output artifact. Its `kind` is
 `javascript` or `vue_sfc`; Vue-related `status` values are
 `recovered_vue_sfc`, `vue_sfc_source_js`, and `vue_sfc_fallback_js`. Open
 recovered `.vue` files for template inspection, but keep the paired JavaScript
@@ -178,6 +183,12 @@ reachability sweep is desired.
 - Inspect every JSON warning's `is_error` field. Entries with `is_error: false`
   are non-fatal; an error-class warning makes the command fail even though the
   JSON output and successfully recovered files may still be written.
+- Use `--diagnostics` to catch emitted declaration conflicts during decompile or
+  unpack, including `var` versus `let`/`const`. A `duplicate_declaration` warning
+  is an error even if `failed` is zero; legal repeated `var` declarations are allowed.
+- A `cross_module_class_call` warning (non-error) means that module may call a
+  recovered class without `new` at runtime. Rerun with `--level minimal` if the
+  output must execute.
 - `failed` in unpack JSON counts modules that errored during decompilation;
   `total` is the module count. Treat `failed > 0` as a failed run.
 - With `--vue-sfc`, `recovered_vue_sfc` means a `.vue` artifact was written;

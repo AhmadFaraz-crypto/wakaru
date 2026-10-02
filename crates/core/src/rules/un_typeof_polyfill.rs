@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use swc_core::common::util::take::Take;
 use swc_core::common::DUMMY_SP;
@@ -6,7 +6,7 @@ use swc_core::ecma::ast::{Callee, Expr, FnDecl, Module, UnaryExpr, UnaryOp};
 use swc_core::ecma::visit::{VisitMut, VisitMutWith};
 
 use super::helper_matcher::{
-    binding_key, remaining_refs_outside_declarations, remove_fn_decls_by_binding,
+    binding_key, removable_without_remaining_refs, remove_fn_decls_by_binding,
     remove_import_specifiers_by_binding, remove_var_declarators_by_binding, BindingKey,
 };
 use super::transpiler_helper_utils::{LocalHelperContext, TranspilerHelperKind};
@@ -53,8 +53,7 @@ fn run_un_typeof_polyfill(module: &mut Module, local_helpers: &LocalHelperContex
     module.visit_mut_with(&mut replacer);
 
     // Remove declarations if no remaining references
-    let remaining = remaining_refs_outside_declarations(module, &helpers, &helpers);
-    let safe_to_remove: HashSet<BindingKey> = helpers.difference(&remaining).cloned().collect();
+    let safe_to_remove = removable_without_remaining_refs(module, &helpers);
     if !safe_to_remove.is_empty() {
         remove_fn_decls_by_binding(module, &safe_to_remove);
         remove_var_declarators_by_binding(&mut module.body, &safe_to_remove);

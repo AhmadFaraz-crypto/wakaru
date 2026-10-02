@@ -6,6 +6,10 @@ import {
 } from "../lib/runner.mjs";
 import { mangleValidator } from "../lib/compare.mjs";
 
+function erasesNestedAwait(name) {
+  return name.startsWith("babel-7.8-") || name.startsWith("babel-7.13-");
+}
+
 const snippets = [
   {
     name: "async-simple-await",
@@ -105,6 +109,21 @@ const snippets = [
       ["async function resolve_deep(promise)", "return await await promise"],
       ["async function", "await await"],
     ],
+    transformerFilter: ({ name }) => !erasesNestedAwait(name),
+  },
+  {
+    // Babel 7.8 and 7.13 lower `await await x` to a single `yield x`, so the
+    // inner await is gone before Wakaru sees the code. The row records what
+    // Wakaru emits for that shape instead of expecting the erased await.
+    name: "async-double-await-erased",
+    source: "async function resolve_deep(promise) {\n  return await await promise;\n}\n",
+    expected: ["async function resolve_deep(promise)", "return await promise"],
+    expectedAny: [
+      ["async function resolve_deep(promise)", "return await promise"],
+      ["async function", "return await "],
+    ],
+    informational: true,
+    transformerFilter: ({ name }) => erasesNestedAwait(name),
   },
   {
     name: "async-simple-loop",
@@ -135,6 +154,82 @@ const snippets = [
         "await transform_item(",
         "return",
       ],
+    ],
+  },
+  {
+    name: "async-branch-guarded-try-catch",
+    // The try region starts at a label that is only reached through the
+    // conditional jump in the entry state. Recovery must keep the try/catch
+    // inside that branch; dropping it makes the catch body run unconditionally.
+    source:
+      "async function load_resource(loader, path, options) {\n  if (loader.lazy) {\n    try {\n      await loader.load(path, options);\n    } catch (error) {\n      report_error(error);\n    }\n  } else {\n    loader.load(path, options).catch(report_error);\n  }\n}\n",
+    // The lowered machine tests the negated guard first, so the recovered
+    // branches may come back in the opposite order.
+    acceptForms: [
+      "async function load_resource(loader, path, options) {\n  if (!loader.lazy) {\n    loader.load(path, options).catch(report_error);\n  } else {\n    try {\n      await loader.load(path, options);\n    } catch (error) {\n      report_error(error);\n    }\n  }\n}\n",
+    ],
+    expected: [
+      "async function load_resource(loader, path, options)",
+      "loader.lazy",
+      "try",
+      "await loader.load(path, options)",
+      "catch (error)",
+      "report_error(error)",
+      "loader.load(path, options).catch(report_error)",
+    ],
+  },
+  {
+    name: "async-guarded-try-catch",
+    // Same guarded try region without an else branch: the guard jumps
+    // straight to the end of the machine.
+    source:
+      "async function load_resource(loader, path, options) {\n  if (loader.lazy) {\n    try {\n      await loader.load(path, options);\n    } catch (error) {\n      report_error(error);\n    }\n  }\n}\n",
+    expected: [
+      "async function load_resource(loader, path, options)",
+      "if (loader.lazy)",
+      "try",
+      "await loader.load(path, options)",
+      "catch (error)",
+      "report_error(error)",
+    ],
+  },
+  {
+    name: "async-try-catch-after-statement",
+    // A synchronous statement before the try: regenerator numbers the try
+    // entry after it without starting a new case for it.
+    source:
+      "async function load_resource(loader, path) {\n  const started = start_timer();\n  try {\n    await loader.load(path);\n  } catch (error) {\n    report_error(error, started);\n  }\n}\n",
+    // Mangled shapes keep the hoisted temp split from its assignment.
+    acceptForms: [
+      "async function load_resource(loader, path) {\n  let started = start_timer();\n  try {\n    await loader.load(path);\n  } catch (error) {\n    report_error(error, started);\n  }\n}\n",
+      "async function load_resource(loader, path) {\n  let started;\n  started = start_timer();\n  try {\n    await loader.load(path);\n  } catch (error) {\n    report_error(error, started);\n  }\n}\n",
+    ],
+    expected: [
+      "async function load_resource(loader, path)",
+      "started = start_timer()",
+      "try",
+      "await loader.load(path)",
+      "catch (error)",
+      "report_error(error, started)",
+    ],
+  },
+  {
+    name: "async-try-if-else-await",
+    // Both branches of an if/else inside the try body leave the region through
+    // the same exit jump.
+    source:
+      "async function load_resource(loader, path) {\n  try {\n    if (loader.lazy) {\n      await loader.load_lazy(path);\n    } else {\n      await loader.load(path);\n    }\n  } catch (error) {\n    report_error(error);\n  }\n}\n",
+    acceptForms: [
+      "async function load_resource(loader, path) {\n  try {\n    if (!loader.lazy) {\n      await loader.load(path);\n    } else {\n      await loader.load_lazy(path);\n    }\n  } catch (error) {\n    report_error(error);\n  }\n}\n",
+    ],
+    expected: [
+      "async function load_resource(loader, path)",
+      "try",
+      "loader.lazy",
+      "await loader.load_lazy(path)",
+      "await loader.load(path)",
+      "catch (error)",
+      "report_error(error)",
     ],
   },
   {
@@ -352,6 +447,135 @@ const snippets = [
       "await close_stream(stream)",
       "return output",
     ],
+    rejected: ["asyncIterator"],
+  },
+  // `for await` variants. Every lowerer replaces the loop with an async
+  // iterator protocol (Babel `_asyncIterator`, swc `_async_iterator`, esbuild
+  // `__forAwait`, TypeScript `__asyncValues`) wrapped in try/catch/finally, so
+  // each row also rejects a leaked `asyncIterator` helper body.
+  {
+    name: "async-for-await-simple",
+    source:
+      "async function consume_stream(stream) {\n  for await (const item of stream) {\n    await handle_item(item);\n  }\n}\n",
+    expected: [
+      "async function consume_stream(stream)",
+      "for await (const item of stream)",
+      "await handle_item(item)",
+    ],
+    rejected: ["asyncIterator"],
+  },
+  {
+    name: "async-for-await-collect-return",
+    source:
+      "async function collect_chunks(source) {\n  const chunks = [];\n  for await (const chunk of read_chunks(source)) {\n    chunks.push(chunk);\n  }\n  return chunks;\n}\n",
+    expected: [
+      "async function collect_chunks(source)",
+      "for await (const chunk of read_chunks(source))",
+      "chunks.push(chunk)",
+      "return chunks",
+    ],
+    rejected: ["asyncIterator"],
+  },
+  {
+    name: "async-for-await-destructuring",
+    source:
+      "async function index_records(records) {\n  const index = new Map();\n  for await (const { id, value } of records) {\n    index.set(id, value);\n  }\n  return index;\n}\n",
+    expected: [
+      "async function index_records(records)",
+      "for await (const { id, value } of records)",
+      "index.set(id, value)",
+      "return index",
+    ],
+    rejected: ["asyncIterator"],
+  },
+  {
+    // Early `return` inside the loop is the abrupt completion that the
+    // protocol's `return()` guard exists for. (A `continue` before it is not
+    // used here: Terser folds `if (x) continue; rest` into `if (!x) rest`.)
+    name: "async-for-await-early-return",
+    source:
+      "async function find_match(stream, predicate) {\n  for await (const entry of stream) {\n    if (await predicate(entry)) return entry;\n  }\n  return null;\n}\n",
+    expected: [
+      "async function find_match(stream, predicate)",
+      "for await (const entry of stream)",
+      "await predicate(entry)",
+      "return entry",
+      "return null",
+    ],
+    rejected: ["asyncIterator"],
+  },
+  {
+    name: "async-for-await-arrow",
+    // Referenced twice so Terser keeps the arrow as a binding instead of
+    // inlining the single use into the call.
+    source:
+      "const total_size = async (files) => {\n  let size = 0;\n  for await (const file of files) {\n    size += file.size;\n  }\n  return size;\n};\nuse(total_size, total_size);\n",
+    expected: [
+      "const total_size = async (files)",
+      "for await (const file of files)",
+      "size += file.size",
+      "return size",
+    ],
+    // Terser inlines the single-use element (`size += _step.value.size`), so
+    // the recovered loop can only bind the protocol's step name.
+    expectedAny: [
+      [
+        "const total_size = async (files)",
+        "for await (const file of files)",
+        "size += file.size",
+        "return size",
+      ],
+      [
+        "const total_size = async (files)",
+        "for await (const ",
+        " of files)",
+        "size += ",
+        ".size",
+        "return size",
+      ],
+      // swc names the lowered arrow after its binding, so recovery keeps a
+      // named async function expression.
+      [
+        "const total_size = async function total_size(files)",
+        "for await (const file of files)",
+        "size += file.size",
+        "return size",
+      ],
+    ],
+    acceptForms: [
+      "const total_size = async function total_size(files) {\n  let size = 0;\n  for await (const file of files) {\n    size += file.size;\n  }\n  return size;\n};\nuse(total_size, total_size);\n",
+    ],
+    rejected: ["asyncIterator"],
+  },
+  {
+    name: "async-for-await-nested-for-of",
+    source:
+      "async function flatten_batches(batches) {\n  const items = [];\n  for await (const batch of batches) {\n    for (const item of batch) {\n      items.push(item);\n    }\n  }\n  return items;\n}\n",
+    expected: [
+      "async function flatten_batches(batches)",
+      "for await (const batch of batches)",
+      "for (const item of batch)",
+      "items.push(item)",
+      "return items",
+    ],
+    rejected: ["asyncIterator"],
+  },
+  {
+    name: "async-for-await-try-catch",
+    source:
+      "async function safe_consume(stream) {\n  try {\n    for await (const item of stream) {\n      await process_item(item);\n    }\n  } catch (error) {\n    report_error(error);\n  }\n}\n",
+    // esbuild renames the user's catch parameter (`error2`) when its own
+    // `error` temporary lands in the same function, so only the shape is
+    // checked here; the mangle comparison covers the structure.
+    expected: [
+      "async function safe_consume(stream)",
+      "try",
+      "for await (const item of stream)",
+      "await process_item(item)",
+      "catch (",
+      "report_error(",
+    ],
+    rejected: ["asyncIterator"],
   },
   {
     name: "async-arrow-object-rest",
@@ -553,32 +777,49 @@ const babelProfiles = [
     core: "7.8.7",
     asyncPlugin: ["@babel/plugin-transform-async-to-generator", "7.8.3"],
     regeneratorPlugin: ["@babel/plugin-transform-regenerator", "7.8.7"],
+    asyncGeneratorPlugin: ["@babel/plugin-proposal-async-generator-functions", "7.8.3"],
+    destructuringPlugin: ["@babel/plugin-transform-destructuring", "7.8.3"],
   },
   {
     name: "babel-7.13",
     core: "7.13.16",
     asyncPlugin: ["@babel/plugin-transform-async-to-generator", "7.13.0"],
     regeneratorPlugin: ["@babel/plugin-transform-regenerator", "7.13.15"],
+    asyncGeneratorPlugin: ["@babel/plugin-proposal-async-generator-functions", "7.13.15"],
+    destructuringPlugin: ["@babel/plugin-transform-destructuring", "7.13.17"],
   },
   {
     name: "babel-7.28",
     core: "7.28.5",
     asyncPlugin: ["@babel/plugin-transform-async-to-generator", "7.28.6"],
     regeneratorPlugin: ["@babel/plugin-transform-regenerator", "7.28.4"],
+    asyncGeneratorPlugin: ["@babel/plugin-transform-async-generator-functions", "7.28.6"],
+    destructuringPlugin: ["@babel/plugin-transform-destructuring", "7.28.5"],
   },
   {
-    name: "babel-8-rc",
-    core: "8.0.0-rc.5",
-    asyncPlugin: ["@babel/plugin-transform-async-to-generator", "8.0.0-rc.5"],
-    regeneratorPlugin: ["@babel/plugin-transform-regenerator", "8.0.0-rc.5"],
+    name: "babel-8",
+    core: "8.0.6",
+    asyncPlugin: ["@babel/plugin-transform-async-to-generator", "8.0.1"],
+    regeneratorPlugin: ["@babel/plugin-transform-regenerator", "8.0.6"],
+    asyncGeneratorPlugin: ["@babel/plugin-transform-async-generator-functions", "8.0.6"],
+    destructuringPlugin: ["@babel/plugin-transform-destructuring", "8.0.5"],
   },
 ];
 
 const allSources = snippets.map((s) => s.source);
 
+// Plugin order follows preset-env: `for await` is lowered by the
+// async-generator-functions plugin before async-to-generator turns the
+// enclosing `async function` into a generator (otherwise `for await` is
+// left inside a plain generator, which is not valid JavaScript), and
+// destructuring is lowered before regenerator hoists declarations (its
+// hoisting has no case for patterns with defaults or rest).
 function babelAsyncBatch(sources, profile, mode) {
-  const plugins = [profile.asyncPlugin];
-  if (mode === "regenerator") plugins.push(profile.regeneratorPlugin);
+  const plugins = [profile.asyncGeneratorPlugin, profile.asyncPlugin];
+  if (mode === "regenerator") {
+    plugins.unshift(profile.destructuringPlugin);
+    plugins.push(profile.regeneratorPlugin);
+  }
   return babelMultiPluginBatch(sources, profile, plugins);
 }
 

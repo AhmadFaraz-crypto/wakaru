@@ -45,6 +45,19 @@ only `.js`, `.mjs`, and `.cjs` candidates, and stdin remains text input. Use
 See [bun-standalone.md](bun-standalone.md) for the container format, safety
 properties, and current limits.
 
+## Module provenance
+
+```bash
+wakaru bundle.js --unpack --provenance -o out/
+```
+
+`--provenance` writes `provenance.json` alongside the recovered modules.
+Each entry maps an emitted filename to its `input`, extraction `ranges`, and
+`extraction` strategy. Ranges are zero-based byte offsets with an exclusive
+end, `[start, end)`. They identify the input regions used to recover a module,
+not a position-by-position mapping of the rewritten code. Use
+`--emit-source-map` for output position mappings.
+
 ## Extract every file from a Bun single-file executable
 
 ```bash
@@ -159,6 +172,11 @@ wakaru bundle.js --unpack --formatter -o out/
 
 `--formatter` runs a final formatting pass after decompilation. Off by default.
 
+With `--emit-source-map`, each map is rewritten to describe the formatted
+output. Mappings at code the formatter removed (such as dropped parentheses)
+are dropped. If a map cannot be carried across formatting, that file is
+written unformatted with its original map, and Wakaru prints a warning.
+
 ## Source maps
 
 ```bash
@@ -176,18 +194,27 @@ output file, mapping the output back to the input. Vue SFC sidecars from
 `--vue-sfc` do not get source maps. Unlike input `--source-map`, this option is
 supported with `--unpack`.
 
+With `--unpack`, each module's map points into the bundle it was extracted
+from. Code the unpacker or the rules synthesized (imports, exports, runtime
+glue) has no input position and stays unmapped. Unpack maps do not embed the
+bundle in `sourcesContent`, because every module's map would repeat it;
+single-file maps embed the input. Columns count UTF-16 code units, as the
+source map format requires. Each map names its input by a path relative to
+the map file, which is how source map consumers resolve `sources`; an input
+without a file on disk (stdin, a Bun executable member) keeps its name.
+
 ## Vue SFC recovery
 
 ```bash
-wakaru input.js --vue-sfc
+wakaru input.js --vue-sfc -o output.js
 wakaru input.js --vue-sfc -o App.vue
 wakaru custom/target.min.mjs --vue-sfc -o out/renamed.mjs
 wakaru bundle.js --unpack --vue-sfc -o out/
 ```
 
 `--vue-sfc` is an experimental, best-effort Vue 3 render recovery path. In
-single-file mode without `-o`, Wakaru prints a recovered `.vue` artifact when
-recovery succeeds and normal decompiled JavaScript otherwise.
+single-file mode without `-o`, stdout remains decompiled JavaScript. Use an
+output path to write recovered Vue files.
 
 With `-o`, `.vue` paths are Vue-only: `-o App.vue` writes the recovered SFC and
 errors if recovery fails. Other output paths are JavaScript-primary: Wakaru
@@ -256,35 +283,19 @@ wakaru input.js --profile trace.json           # Chrome trace (open with chrome:
 wakaru input.js --profile trace.json --profile-rules  # include per-rule spans
 ```
 
-For development and benchmark triage, validate a normal unpack output tree as
-one emitted-module graph:
+With `--diagnostics`, emitted declaration checks report `var` conflicts with
+`let`, `const`, classes, or imports, including `var` declarations hoisted through
+nested blocks. These are error-class `duplicate_declaration` warnings and make
+the command exit nonzero. Repeated `var` declarations and legal inner-scope
+shadowing do not count as conflicts.
 
-```bash
-wakaru debug validate out/
-wakaru debug validate out/ --json
-```
-
-The validator reports dangling relative references, imports or re-exports of
-missing or star-ambiguous names, local export clauses that name no declared
-binding, duplicate exports or conflicting declarations (including nested
-block, switch, loop, function-parameter/body, and catch-parameter scopes), and
-writes to imported or `const` bindings. It also reports unresolved `module` /
-`exports` runtime uses left in ESM; direct safe `typeof` probes are excluded.
-`.mjs` / `.mts` files and in-tree static or dynamic import targets use the
-module source goal even when they contain no import/export declaration
-themselves; explicit `.cjs` / `.cts` files retain the script/CommonJS source
-goal even when imported by ESM. Writes to undeclared identifiers (host
-globals) are not reported.
-Human-readable findings use `filename:line:column`; JSON findings carry
-one-based `line` and `column` fields. The recursive scan accepts `.js`, `.mjs`,
-`.cjs`, `.jsx`, `.ts`, `.tsx`, `.mts`, `.cts`, and extensionless emitted
-modules, including modules emitted beneath `node_modules`; hidden paths and
-unrelated extensions remain excluded.
-The command exits nonzero when it finds anything. Validate normal output only:
-raw output has no usable module-graph contract.
-Directory validation reads only the emitted files, so it also scans artifacts
-left behind by failed factory recovery. Unresolved numeric webpack runtime
-calls in those artifacts are not treated as relative module edges.
+Unpack also reports a non-error `cross_module_class_call` warning, with or
+without `--diagnostics`, when a module still invokes an imported constructor
+with `.call`/`.apply` after the providing module was allowed to become a
+class because that call was expected to become `super()`. The named module may
+throw `Class constructor … cannot be invoked without 'new'` at runtime. Rerun
+with `--level minimal`, which keeps every cross-module `.call`/`.apply` target
+a function.
 
 ## Overwrite protection
 

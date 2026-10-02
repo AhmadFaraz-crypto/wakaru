@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use swc_core::atoms::Atom;
 
@@ -161,13 +161,13 @@ impl TemplateLocalScopes {
     }
 
     fn collect_ident_refs(&self, source: &str, refs: &mut HashSet<Atom>) {
-        let mut scoped_refs = HashSet::new();
+        let mut scoped_refs = HashSet::default();
         collect_js_unshadowed_ident_refs(source, &mut scoped_refs);
         refs.extend(scoped_refs.into_iter().filter(|name| !self.is_local(name)));
     }
 
     fn collect_read_refs(&self, source: &str, refs: &mut HashSet<Atom>) {
-        let mut scoped_refs = HashSet::new();
+        let mut scoped_refs = HashSet::default();
         collect_js_unshadowed_read_refs(source, &mut scoped_refs);
         refs.extend(scoped_refs.into_iter().filter(|name| !self.is_local(name)));
     }

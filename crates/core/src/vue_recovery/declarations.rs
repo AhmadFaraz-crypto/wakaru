@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use swc_core::atoms::Atom;
 
@@ -59,7 +59,7 @@ pub(super) fn script_setup_declarations(
         if !is_valid_identifier_name(binding.binding.as_ref()) {
             continue;
         }
-        let mut refs = HashSet::new();
+        let mut refs = HashSet::default();
         collect_js_unshadowed_ident_refs(&binding.value, &mut refs);
         declarations.push(VueScriptSetupDeclaration {
             kind: VueScriptSetupDeclarationKind::Computed,
@@ -156,7 +156,7 @@ pub(super) fn script_setup_declared_bindings(
     ref_declarations: &[(String, String, String)],
     local_declarations: &[VueSetupLocalBinding],
 ) -> HashSet<Atom> {
-    let mut declared = HashSet::new();
+    let mut declared = HashSet::default();
     if let Some((binding, _)) = props_declaration {
         declared.insert(Atom::from(binding.clone()));
         declared.extend(

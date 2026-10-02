@@ -1,5 +1,5 @@
+use crate::collections::{HashMap, HashSet};
 use anyhow::{anyhow, Result};
-use std::collections::{HashMap, HashSet};
 use swc_core::atoms::Atom;
 use swc_core::common::{Globals, Mark, SyntaxContext, DUMMY_SP, GLOBALS};
 use swc_core::ecma::ast::{
@@ -239,7 +239,7 @@ fn unresolved_ident_ptrs<'a>(
 ) -> HashSet<*const Ident> {
     let mut collector = UnresolvedIdentPtrCollector {
         classifications: classifications.iter(),
-        unresolved: HashSet::new(),
+        unresolved: HashSet::default(),
     };
     node.visit_with(&mut collector);
     assert!(
@@ -558,7 +558,7 @@ fn replace_setup_value_bindings_once(input: &str, ctx: &VueRecoveryContext) -> (
 }
 
 fn setup_value_can_inline_in_expr(input: &str, value: &str, ctx: &VueRecoveryContext) -> bool {
-    let mut refs = HashSet::new();
+    let mut refs = HashSet::default();
     super::collect_js_unshadowed_read_refs(value, &mut refs);
     refs.is_empty() || !expr_binds_any_name(input, &refs, ctx)
 }

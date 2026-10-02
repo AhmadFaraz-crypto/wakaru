@@ -15,7 +15,7 @@
 //! binding escape, computed/meta access, and `__esModule` observation leave
 //! the original import unchanged.
 
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use swc_core::common::{Mark, DUMMY_SP};
 use swc_core::ecma::ast::{
@@ -40,7 +40,7 @@ pub(crate) fn run_provider_namespace_repair(
         return;
     };
 
-    let mut candidates = HashSet::new();
+    let mut candidates = HashSet::default();
     for item in &module.body {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
             continue;
@@ -134,7 +134,7 @@ pub(crate) fn run_provider_namespace_repair(
 /// known-invalid default import. A later unconditional replacement of the
 /// alias ends this lifetime without mutating the imported namespace.
 fn collect_transparent_aliases(module: &Module, root: &BindingId) -> HashSet<BindingId> {
-    let mut aliases = HashSet::from([root.clone()]);
+    let mut aliases = HashSet::from_iter([root.clone()]);
     loop {
         let mut changed = false;
         for item in &module.body {

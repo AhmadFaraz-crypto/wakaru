@@ -2,6 +2,7 @@ mod diagnostics;
 mod discovery;
 mod error;
 mod io;
+mod line_index;
 mod normalize;
 mod output;
 mod output_finalize;
@@ -9,7 +10,6 @@ mod single_file;
 mod trace;
 mod types;
 mod unpack;
-mod unpack_cleanup;
 mod unpack_cycles;
 
 pub use crate::unpacker::BundleFormat;

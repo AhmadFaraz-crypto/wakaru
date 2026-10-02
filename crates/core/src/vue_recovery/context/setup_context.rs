@@ -7,7 +7,7 @@ pub(in crate::vue_recovery) fn collect_render_context(
     let Some(stmts) = render_stmts(render) else {
         return;
     };
-    let mut slot_partition_bindings = HashSet::new();
+    let mut slot_partition_bindings = HashSet::default();
     for stmt in stmts {
         let Stmt::Decl(Decl::Var(var)) = stmt else {
             continue;
@@ -157,8 +157,8 @@ pub(in crate::vue_recovery) fn collect_setup_context(
         .as_ref()
         .map(|binding| compiled_setup_return_values(setup_stmts, binding))
         .unwrap_or_default();
-    let mut provider_ref_object_bindings = HashMap::new();
-    let mut composable_ref_object_bindings = HashMap::new();
+    let mut provider_ref_object_bindings = HashMap::default();
+    let mut composable_ref_object_bindings = HashMap::default();
     let mut local_candidates = Vec::new();
 
     for (setup_order, stmt) in setup_stmts.iter().enumerate() {
@@ -185,7 +185,7 @@ pub(in crate::vue_recovery) fn collect_setup_context(
             }
             Stmt::Decl(Decl::Var(var)) => {
                 let mut local_decls = Vec::new();
-                let mut local_bindings = HashSet::new();
+                let mut local_bindings = HashSet::default();
 
                 for original_decl in &var.decls {
                     let rewritten_decl = match (&original_decl.name, original_decl.init.as_deref())
@@ -386,7 +386,7 @@ pub(in crate::vue_recovery) fn collect_setup_context(
                     if consumed {
                         continue;
                     }
-                    let mut decl_bindings = HashSet::new();
+                    let mut decl_bindings = HashSet::default();
                     collect_pat_bindings(&decl.name, &mut decl_bindings);
                     if decl_bindings.is_empty() {
                         continue;
@@ -557,7 +557,7 @@ pub(in crate::vue_recovery) fn collect_setup_context(
 }
 
 fn setup_ref_object_alias_refs(stmts: &[Stmt]) -> HashSet<Atom> {
-    let mut refs = HashSet::new();
+    let mut refs = HashSet::default();
     for stmt in stmts {
         let Stmt::Decl(Decl::Var(var)) = stmt else {
             continue;
@@ -579,7 +579,7 @@ fn setup_ref_object_alias_refs(stmts: &[Stmt]) -> HashSet<Atom> {
 
 fn setup_non_value_member_refs(stmts: &[Stmt]) -> HashSet<(Atom, SyntaxContext)> {
     let mut collector = NonValueMemberRefCollector {
-        refs: HashSet::new(),
+        refs: HashSet::default(),
     };
     for stmt in stmts {
         stmt.visit_with(&mut collector);
@@ -592,7 +592,7 @@ fn setup_value_member_refs(
     setup_stmts: &[Stmt],
 ) -> HashSet<(Atom, SyntaxContext)> {
     let mut collector = ValueMemberIdentRefCollector {
-        refs: HashSet::new(),
+        refs: HashSet::default(),
     };
     for stmt in setup_stmts {
         stmt.visit_with(&mut collector);
@@ -690,20 +690,20 @@ impl Visit for TemplateRefAliasCollector {
 
 fn render_ident_refs(render: SetupRenderNode<'_>) -> HashSet<Atom> {
     let mut declared_collector = DeclaredBindingIdents {
-        idents: HashSet::new(),
+        idents: HashSet::default(),
     };
     visit_setup_render(render, &mut declared_collector);
     let declared = declared_collector.idents;
     let mut collector = IdentRefCollector {
         declared: &declared,
-        refs: HashSet::new(),
+        refs: HashSet::default(),
     };
     visit_setup_render(render, &mut collector);
     collector.refs
 }
 
 fn setup_tuple_value_candidates(setup_stmts: &[Stmt]) -> HashSet<(Atom, SyntaxContext)> {
-    let mut tuple_value_candidates = HashSet::new();
+    let mut tuple_value_candidates = HashSet::default();
     for stmt in setup_stmts {
         let Stmt::Decl(Decl::Var(var)) = stmt else {
             continue;
@@ -732,8 +732,8 @@ fn setup_render_template_ref_refs(
     ctx: &VueRecoveryContext,
     tuple_value_candidates: &HashSet<(Atom, SyntaxContext)>,
 ) -> HashSet<Atom> {
-    let mut object_value_candidates = HashSet::new();
-    let mut unref_candidates = HashSet::new();
+    let mut object_value_candidates = HashSet::default();
+    let mut unref_candidates = HashSet::default();
     for stmt in setup_stmts {
         let Stmt::Decl(Decl::Var(var)) = stmt else {
             continue;
@@ -751,7 +751,7 @@ fn setup_render_template_ref_refs(
     if tuple_value_candidates.is_empty()
         && (object_value_candidates.is_empty() || unref_candidates.is_empty())
     {
-        return HashSet::new();
+        return HashSet::default();
     }
 
     let mut collector = RenderTemplateRefCollector {
@@ -759,9 +759,9 @@ fn setup_render_template_ref_refs(
         object_value_candidates: &object_value_candidates,
         unref_candidates: &unref_candidates,
         ctx,
-        tuple_value_refs: HashSet::new(),
-        object_value_refs: HashSet::new(),
-        unref_refs: HashSet::new(),
+        tuple_value_refs: HashSet::default(),
+        object_value_refs: HashSet::default(),
+        unref_refs: HashSet::default(),
     };
     visit_setup_render(render, &mut collector);
     let mut refs = collector.tuple_value_refs;
@@ -794,7 +794,7 @@ fn collect_setup_value_template_tuple_refs(
 
 fn value_member_refs_in_expr(expr: &Expr) -> HashSet<(Atom, SyntaxContext)> {
     let mut collector = ValueMemberIdentRefCollector {
-        refs: HashSet::new(),
+        refs: HashSet::default(),
     };
     expr.visit_with(&mut collector);
     collector.refs
@@ -917,7 +917,7 @@ fn assign_setup_prop_bindings(
         return;
     }
 
-    let mut reserved = HashSet::new();
+    let mut reserved = HashSet::default();
     reserved.extend(ctx.bindings.aliases.keys().cloned());
     reserved.extend(
         local_candidates
@@ -1154,7 +1154,7 @@ fn is_slot_source_expr(expr: &Expr, ctx: &VueRecoveryContext) -> bool {
 }
 
 fn collect_slot_partition_child_list_bindings(object: &ObjectPat, ctx: &mut VueRecoveryContext) {
-    let mut bindings = HashSet::new();
+    let mut bindings = HashSet::default();
     collect_named_object_pat_bindings(object, "slides", &mut bindings);
     for binding in bindings {
         insert_render_child_list_binding(
@@ -1381,7 +1381,7 @@ fn provider_ref_props_from_return_expr(
     expr: &Expr,
     ctx: &VueRecoveryContext,
 ) -> Option<HashSet<Atom>> {
-    let refs = HashSet::new();
+    let refs = HashSet::default();
     provider_ref_props_from_return_expr_with_refs(expr, &refs, ctx)
 }
 
@@ -1393,7 +1393,7 @@ fn provider_ref_props_from_return_expr_with_refs(
     let Expr::Object(object) = unwrap_paren_expr(expr) else {
         return None;
     };
-    let mut ref_props = HashSet::new();
+    let mut ref_props = HashSet::default();
     for prop in &object.props {
         let PropOrSpread::Prop(prop) = prop else {
             continue;
@@ -1422,8 +1422,8 @@ fn provider_ref_props_from_return_expr_with_refs(
 }
 
 fn collect_provider_ref_bindings(stmts: &[Stmt], ctx: &VueRecoveryContext) -> HashSet<Atom> {
-    let mut ref_bindings = HashSet::new();
-    let mut ref_object_bindings = HashSet::new();
+    let mut ref_bindings = HashSet::default();
+    let mut ref_object_bindings = HashSet::default();
 
     for stmt in stmts {
         let Stmt::Decl(Decl::Var(var)) = stmt else {

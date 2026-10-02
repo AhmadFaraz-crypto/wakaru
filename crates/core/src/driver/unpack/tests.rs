@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use super::*;
 use crate::test_tracing::record_spans;
@@ -70,6 +70,12 @@ fn prepared_plain_input_reuses_detection_ast_in_phase1() {
             "unexpected prepared-input round trip {skipped:?} in {spans:?}"
         );
     }
+    assert!(
+        spans
+            .iter()
+            .any(|name| name == "phase1: reresolve prepared"),
+        "prepared ASTs get resolver-derived contexts at the handoff: {spans:?}"
+    );
     assert!(spans.iter().any(|name| name == "prepare_plain: resolver"));
 }
 
@@ -212,6 +218,7 @@ fn unprocessed_plain_input_skips_resolver_preparation() {
 #[test]
 fn prepared_raw_scope_split_keeps_runnable_normalization() {
     let input = PreparedUnpackInput {
+        origin: None,
         filename: "bundle.js".to_string(),
         source: None,
         detection: PreparedInputDetection::ScopeHoisted,
@@ -225,6 +232,8 @@ fn prepared_raw_scope_split_keeps_runnable_normalization() {
                 inspection_context_ranges: Vec::new(),
                 source_input: String::new(),
                 generated_source_map: Vec::new(),
+                verbatim_source_offset: None,
+                mapped_in_every_mode: false,
                 code: "if (ready) run();".to_string(),
             }],
             report_import_cycle_warnings: false,
@@ -249,6 +258,7 @@ fn prepared_raw_scope_split_keeps_runnable_normalization() {
 fn unprovable_public_boundary_falls_back_to_one_processed_module() {
     let source = "export const intact = 1;";
     let uncertain = PreparedUnpackInput {
+        origin: None,
         filename: "uncertain.js".to_string(),
         source: Some(source.to_string()),
         detection: PreparedInputDetection::ScopeHoisted,
@@ -333,6 +343,12 @@ fn prepared_webpack_input_does_not_reparse_for_chunk_metadata() {
             "unexpected prepared-input round trip {skipped:?} in {spans:?}"
         );
     }
+    assert!(
+        spans
+            .iter()
+            .any(|name| name == "phase1: reresolve prepared"),
+        "prepared ASTs get resolver-derived contexts at the handoff: {spans:?}"
+    );
 }
 
 #[test]

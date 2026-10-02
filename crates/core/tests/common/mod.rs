@@ -78,6 +78,52 @@ where
     })
 }
 
+/// Run a single rule like [`render_rule`], then hand the rewritten module
+/// and the input text to `inspect` instead of emitting. For assertions the
+/// printed code cannot express, such as which input span a node carries.
+#[allow(dead_code)]
+pub fn inspect_rule_output<R, F, T>(
+    source: &str,
+    build_rule: F,
+    inspect: impl FnOnce(&Module, &SpanText) -> T,
+) -> T
+where
+    R: VisitMut,
+    F: FnOnce(Mark) -> R,
+{
+    GLOBALS.set(&Default::default(), || {
+        let cm: Lrc<SourceMap> = Default::default();
+        let mut module = parse_module_with_filename(source, "fixture.js", cm.clone());
+
+        let unresolved_mark = Mark::new();
+        let top_level_mark = Mark::new();
+        module.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, false));
+        module.visit_mut_with(&mut build_rule(unresolved_mark));
+
+        inspect(&module, &SpanText { cm, source })
+    })
+}
+
+/// Resolves spans of a module parsed by [`inspect_rule_output`] to input text.
+#[allow(dead_code)]
+pub struct SpanText<'a> {
+    cm: Lrc<SourceMap>,
+    source: &'a str,
+}
+
+#[allow(dead_code)]
+impl SpanText<'_> {
+    /// Input text from `span.lo` to the end of the input; `None` for a
+    /// dummy span.
+    pub fn starting_at(&self, span: swc_core::common::Span) -> Option<&str> {
+        if span.lo.0 == 0 {
+            return None;
+        }
+        let offset = self.cm.lookup_byte_offset(span.lo).pos.0 as usize;
+        Some(&self.source[offset..])
+    }
+}
+
 /// Run the decompile pipeline up through `stop_after_rule`, then emit.
 /// Rule names match struct names (e.g. "SmartInline", "UnEsm").
 /// Second passes use suffixed names: "UnWebpackInterop2", "UnIife2".
@@ -231,7 +277,8 @@ pub fn assert_eq_normalized(actual: &str, expected: &str) {
     assert_eq!(normalize(actual), normalize(expected));
 }
 
-fn parse_module_with_filename(code: &str, filename: &str, cm: Lrc<SourceMap>) -> Module {
+#[allow(dead_code)]
+pub fn parse_module_with_filename(code: &str, filename: &str, cm: Lrc<SourceMap>) -> Module {
     let fm = cm.new_source_file(
         FileName::Custom(filename.to_string()).into(),
         code.to_string(),
@@ -259,7 +306,8 @@ fn parse_module_with_filename(code: &str, filename: &str, cm: Lrc<SourceMap>) ->
         .expect("failed to parse module for normalization")
 }
 
-fn emit_module(module: &Module, cm: Lrc<SourceMap>) -> String {
+#[allow(dead_code)]
+pub fn emit_module(module: &Module, cm: Lrc<SourceMap>) -> String {
     let mut output = Vec::new();
     {
         let mut emitter = Emitter {

@@ -28,7 +28,7 @@ fn apply(input: &str) -> String {
         let mut parser = Parser::new_from(lexer);
         let mut module = parser.parse_module().expect("parse failed");
 
-        module.visit_mut_with(&mut UnPrototypeClass);
+        module.visit_mut_with(&mut UnPrototypeClass::default());
 
         let mut output = Vec::new();
         {
@@ -45,12 +45,44 @@ fn apply(input: &str) -> String {
 }
 
 fn apply_resolved(input: &str) -> String {
-    render_rule(input, |_| UnPrototypeClass)
+    render_rule(input, |_| UnPrototypeClass::default())
 }
 
 // ============================================================
 // Basic: function + prototype methods → class
 // ============================================================
+
+#[test]
+fn enclosing_parameter_preserves_function_constructor() {
+    let constructor = "function C(x) { this.x = x; } C.prototype.read = function() { return this.x; }; return new C(1).read();";
+    for input in [
+        format!("function outer(C) {{ {constructor} }}"),
+        format!("const outer = function(C) {{ {constructor} }};"),
+        format!("const outer = (C) => {{ {constructor} }};"),
+        format!("const outer = ({{ value: C }}) => {{ {constructor} }};"),
+        format!("const outer = {{ run(C) {{ {constructor} }} }};"),
+        format!("class Outer {{ constructor(C) {{ {constructor} }} }}"),
+    ] {
+        assert_eq_normalized(&apply_resolved(&input), &input);
+    }
+}
+
+#[test]
+fn parameter_in_outer_scope_does_not_block_nested_class() {
+    let input = "function outer(C) { function inner() { function C(x) { this.x = x; } C.prototype.read = function() { return this.x; }; return new C(1); } return inner(); }";
+    let output = apply_resolved(input);
+    assert!(output.contains("class C"), "{output}");
+    let block = "function outer(C) { { function C(x) { this.x = x; } C.prototype.read = function() { return this.x; }; use(C); } return C; }";
+    let output = apply_resolved(block);
+    assert!(output.contains("class C"), "{output}");
+}
+
+#[test]
+fn parameter_collision_pipeline_preserves_parseable_output() {
+    let output = render("function outer(C) { function C(x) { this.x = x; } C.prototype.read = function() { return this.x; }; return new C(1).read(); } console.log(outer(null));");
+    assert!(!output.contains("class C"), "{output}");
+    assert!(output.contains("function C"), "{output}");
+}
 
 #[test]
 fn duplicate_constructor_params_preserve_prototype_shape() {
@@ -321,6 +353,54 @@ class Child extends Base {
 }
 "#;
     assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn residual_call_keeps_prototype_constructor_callable() {
+    let input = r#"
+function Foo() {}
+Foo.prototype.start = function() { this.onStart(); };
+function make() {
+    return Foo.call(this);
+}
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn residual_call_through_ident_alias_keeps_prototype_constructor_callable() {
+    let input = r#"
+function Foo() {}
+Foo.prototype.start = function() { this.onStart(); };
+var a = Foo;
+function make() {
+    return a.call(this);
+}
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+#[test]
+fn consumed_parent_call_allows_base_on_a_later_pass() {
+    let input = r#"
+function Base() {}
+Base.prototype.base = function() { return true; };
+function Child() {
+    Base.call(this);
+}
+util.inherits(Child, Base);
+Child.prototype.child = function() { return this.base(); };
+"#;
+    let expected = r#"
+class Base {
+    base() { return true; }
+}
+class Child extends Base {
+    constructor() { super(); }
+    child() { return this.base(); }
+}
+"#;
+    assert_eq_normalized(&apply_resolved(input), expected);
 }
 
 #[test]
@@ -1088,4 +1168,163 @@ class Foo extends Bar {
 mod1.exports = Foo;
 "#;
     assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn hoisted_constructor_preserves_unrecognized_interleaved_inheritance() {
+    // Terser moves the hoisted constructor before TypeScript's helper call.
+    // A native class has a non-writable prototype, so leaving this call after
+    // class recovery can throw instead of establishing the inheritance chain.
+    for setup in [
+        "__extends(Child, Parent);",
+        "ts.__extends(Child, Parent);",
+        "runtime.attachBase(Child, Parent);",
+    ] {
+        let input = format!(
+            r#"
+function Child() {{ return Parent.apply(this, arguments) || this; }}
+{setup}
+Child.prototype.run = function() {{ return this.value; }};
+"#
+        );
+        assert_eq_normalized(&apply_resolved(&input), &input);
+    }
+}
+
+#[test]
+fn alias_prototype_replacement_preserves_function_constructor() {
+    // Babel loose inheritance can route the whole-prototype replacement
+    // through a constructor alias. If the surrounding class-IIFE recognizer
+    // cannot consume the complete setup, this fallback must stay callable.
+    let input = r#"
+function Child() { return Base.apply(this, arguments) || this; }
+var constructorAlias, baseAlias;
+baseAlias = Base;
+constructorAlias = Child;
+constructorAlias.prototype = Object.create(baseAlias.prototype);
+constructorAlias.prototype.constructor = constructorAlias;
+runtimeLink(constructorAlias, baseAlias);
+Child.prototype.run = function() { return this.value; };
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+}
+
+// ============================================================
+// Named function expressions: the inner name binding
+// ============================================================
+
+#[test]
+fn self_referencing_named_method_expression_stays_on_the_prototype() {
+    // protobufjs shape: the method passes itself to a helper by its own
+    // function-expression name. A class method has no such binding, so
+    // converting it would leave `q` undeclared.
+    let input = r#"
+function Service(rpcImpl) {
+    this.rpcImpl = rpcImpl;
+}
+Service.prototype.rpcCall = function q(method, req, callback) {
+    var self = this;
+    if (!callback) return util.asPromise(q, self, method, req);
+    return self.rpcImpl(method, req, callback);
+};
+Service.prototype.end = function() {
+    this.rpcImpl = null;
+    return this;
+};
+"#;
+    let expected = r#"
+class Service {
+    constructor(rpcImpl){
+        this.rpcImpl = rpcImpl;
+    }
+    end() {
+        this.rpcImpl = null;
+        return this;
+    }
+}
+Service.prototype.rpcCall = function q(method, req, callback) {
+    var self = this;
+    if (!callback) return util.asPromise(q, self, method, req);
+    return self.rpcImpl(method, req, callback);
+};
+"#;
+    assert_eq_normalized(&apply_resolved(input), expected);
+}
+
+#[test]
+fn unreferenced_named_method_expression_converts_and_drops_the_name() {
+    let input = r#"
+function Foo() {}
+Foo.prototype.run = function run() { return 1; };
+Foo.create = function create() { return new Foo(); };
+"#;
+    let expected = r#"
+class Foo {
+    run() { return 1; }
+    static create() { return new Foo(); }
+}
+"#;
+    assert_eq_normalized(&apply_resolved(input), expected);
+}
+
+#[test]
+fn self_referencing_named_descriptor_value_stays_on_the_prototype() {
+    let input = r#"
+function Foo() {}
+Object.defineProperty(Foo.prototype, "again", {
+    value: function q() { return q; },
+    writable: true,
+    configurable: true
+});
+Foo.prototype.run = function() { return 1; };
+"#;
+    let expected = r#"
+class Foo {
+    run() { return 1; }
+}
+Object.defineProperty(Foo.prototype, "again", {
+    value: function q() { return q; },
+    writable: true,
+    configurable: true
+});
+"#;
+    assert_eq_normalized(&apply_resolved(input), expected);
+}
+
+#[test]
+fn self_referencing_named_accessor_callback_stays_on_the_prototype() {
+    let input = r#"
+function Foo() {}
+Object.defineProperty(Foo.prototype, "self", {
+    get: function q() { return q; },
+    configurable: true
+});
+Foo.prototype.run = function() { return 1; };
+"#;
+    let expected = r#"
+class Foo {
+    run() { return 1; }
+}
+Object.defineProperty(Foo.prototype, "self", {
+    get: function q() { return q; },
+    configurable: true
+});
+"#;
+    assert_eq_normalized(&apply_resolved(input), expected);
+}
+
+#[test]
+fn assigned_iife_result_keeps_returned_constructor_callable() {
+    let input = r#"
+var Constructor;
+Constructor = function() {
+    function Inner(value) { this.value = value; }
+    Inner.prototype.read = function() { return this.value; };
+    return Inner;
+}();
+(function(ctor) { return ctor.apply({}, [3]); })(Constructor);
+"#;
+    assert_eq_normalized(&apply_resolved(input), input);
+    let output = common::render_pipeline(input);
+    assert!(!output.contains("class Inner"), "{output}");
 }

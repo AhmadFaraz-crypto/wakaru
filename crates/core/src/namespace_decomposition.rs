@@ -10,10 +10,10 @@
 //! `fn.apply(undefined, args)`, which `UnArgumentSpread` (Stage 3) handles
 //! naturally as Pattern 1.
 
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
-use swc_core::common::{SyntaxContext, DUMMY_SP};
+use swc_core::common::{Mark, SyntaxContext, DUMMY_SP};
 use swc_core::ecma::ast::{
     AssignExpr, AssignTarget, CallExpr, Callee, CatchClause, Expr, Function, Ident, ImportDecl,
     ImportNamedSpecifier, ImportSpecifier, JSXElementName, JSXObject, MemberExpr, MemberProp,
@@ -24,7 +24,7 @@ use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use crate::facts::{ExportKind, ModuleFactsMap};
 use crate::js_names::is_reserved_binding_name;
-use crate::rules::rename_utils::starts_with_lowercase;
+use crate::rules::rename_utils::{collect_free_reference_names, starts_with_lowercase};
 use crate::utils::paren::strip_parens;
 
 const MAX_SYNTHETIC_NAME_ATTEMPTS: usize = 10_000;
@@ -74,8 +74,10 @@ pub fn run_namespace_decomposition(
     module: &mut Module,
     module_facts: &ModuleFactsMap,
     current_filename: Option<&str>,
+    unresolved_mark: Mark,
 ) {
-    let candidates = find_decomposition_candidates(module, module_facts, current_filename);
+    let candidates =
+        find_decomposition_candidates(module, module_facts, current_filename, unresolved_mark);
     if candidates.is_empty() {
         return;
     }
@@ -87,16 +89,21 @@ fn find_decomposition_candidates(
     module: &Module,
     module_facts: &ModuleFactsMap,
     current_filename: Option<&str>,
+    unresolved_mark: Mark,
 ) -> Vec<DecompCandidate> {
     // Collect ALL bindings at every scope level (including function params,
     // catch clauses, inner var/let/const, etc.) to detect naming collisions.
     // A property name that shadows an inner binding would produce wrong code
     // if we rewrote `r.foo` → `foo` where `foo` is already bound in that scope.
     let mut collector = AllBindingsCollector {
-        bindings: HashSet::new(),
+        bindings: HashSet::default(),
     };
     module.visit_with(&mut collector);
     let mut existing_bindings = collector.bindings;
+    // A free reference with the same spelling as an accessed export would be
+    // captured by the new named import (`ready.run()` reading a global
+    // `ready` while `r.ready` becomes `ready`), so free names are occupied too.
+    existing_bindings.extend(collect_free_reference_names(module, unresolved_mark));
 
     // Step 1: Find default and namespace imports and their source modules.
     // Both shapes expose a module-namespace-like binding that can be decomposed
@@ -145,7 +152,7 @@ fn find_decomposition_candidates(
         let mut analyzer = UsageAnalyzer {
             target_sym: &local_sym,
             target_ctxt: local_ctxt,
-            accessed_props: HashSet::new(),
+            accessed_props: HashSet::default(),
             safe: true,
             in_import_decl: false,
         };
@@ -190,8 +197,8 @@ fn find_decomposition_candidates(
         // `existing_import_locals` tracks locals that came from this import; we use
         // it to avoid removing pre-existing bindings during the readability-skip
         // undo below.
-        let mut exported_to_local: HashMap<Atom, (Atom, SyntaxContext)> = HashMap::new();
-        let mut existing_import_locals: HashSet<Atom> = HashSet::new();
+        let mut exported_to_local: HashMap<Atom, (Atom, SyntaxContext)> = HashMap::default();
+        let mut existing_import_locals: HashSet<Atom> = HashSet::default();
         if let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = &module.body[import_index] {
             for spec in &import.specifiers {
                 if let ImportSpecifier::Named(s) = spec {
@@ -218,7 +225,7 @@ fn find_decomposition_candidates(
         let mut props: Vec<DecompProp> = Vec::new();
         let mut alias_count = 0usize;
         let mut reused_existing = 0usize;
-        let mut inserted_locals: HashSet<Atom> = HashSet::new();
+        let mut inserted_locals: HashSet<Atom> = HashSet::default();
         let mut sorted_accessed: Vec<Atom> = analyzer.accessed_props.into_iter().collect();
         sorted_accessed.sort();
         for prop in &sorted_accessed {
@@ -587,7 +594,7 @@ fn apply_decompositions(module: &mut Module, candidates: &[DecompCandidate]) {
     // If a namespace specifier remains (`import * as ns`), named specifiers must
     // be emitted in a separate import declaration because `import * as ns, { x }`
     // is not valid JavaScript.
-    let mut extra_named_imports: HashMap<usize, Vec<ImportDecl>> = HashMap::new();
+    let mut extra_named_imports: HashMap<usize, Vec<ImportDecl>> = HashMap::default();
     for candidate in candidates {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) =
             &mut module.body[candidate.import_index]
@@ -729,8 +736,10 @@ impl VisitMut for UsageRewriter<'_> {
         let MemberProp::Ident(prop) = &member.prop else {
             return;
         };
+        // The property's span keeps the output map on the input name; the
+        // member's span would start at a wrapping `(0, r.x)` instead.
         if let Some((local_name, local_ctxt)) = prop_map.get(&prop.sym) {
-            *expr = Expr::Ident(Ident::new(local_name.clone(), DUMMY_SP, *local_ctxt));
+            *expr = Expr::Ident(Ident::new(local_name.clone(), prop.span, *local_ctxt));
         }
     }
 
@@ -746,7 +755,11 @@ impl VisitMut for UsageRewriter<'_> {
             return;
         };
         if let Some((local_name, local_ctxt)) = prop_map.get(&member.prop.sym) {
-            *name = JSXElementName::Ident(Ident::new(local_name.clone(), DUMMY_SP, *local_ctxt));
+            *name = JSXElementName::Ident(Ident::new(
+                local_name.clone(),
+                member.prop.span,
+                *local_ctxt,
+            ));
         }
     }
 
@@ -793,7 +806,7 @@ mod tests {
 
     #[test]
     fn synthesize_alias_uses_next_available_suffix() {
-        let existing = HashSet::from([Atom::from("value_1"), Atom::from("value_2")]);
+        let existing = HashSet::from_iter([Atom::from("value_1"), Atom::from("value_2")]);
 
         assert_eq!(synthesize_alias(&Atom::from("value"), &existing), "value_3");
     }

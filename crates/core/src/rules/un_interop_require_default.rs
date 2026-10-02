@@ -1,8 +1,8 @@
+use crate::collections::{HashMap, HashSet};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
-use swc_core::common::{SyntaxContext, DUMMY_SP};
+use swc_core::common::DUMMY_SP;
 use swc_core::ecma::ast::{
     ArrowExpr, AssignExpr, AssignOp, AssignTarget, CallExpr, Callee, Class, Decl, Expr, ForHead,
     ForInStmt, ForOfStmt, Function, Ident, ImportDecl, ImportSpecifier, ImportStarAsSpecifier, Lit,
@@ -11,6 +11,7 @@ use swc_core::ecma::ast::{
 };
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
+use super::decl_utils::fresh_binding_ident;
 use super::transpiler_helper_utils::{
     classify_inline_helper_call, detect_helper_from_path, helpers_with_remaining_refs,
     remove_helper_declarations, BindingKey, LocalHelperContext, TranspilerHelperKind,
@@ -37,7 +38,7 @@ impl VisitMut for UnInteropRequireDefault {
 }
 
 fn run_un_interop_require_default(module: &mut Module, local_helpers: &LocalHelperContext) {
-    let mut affected_bindings: HashSet<BindingKey> = HashSet::new();
+    let mut affected_bindings: HashSet<BindingKey> = HashSet::default();
     let mut preserve_named_helpers = false;
 
     // --- Named helper path ---
@@ -114,7 +115,7 @@ fn run_un_interop_require_default(module: &mut Module, local_helpers: &LocalHelp
     // Phase 2b: Rewrite `.default` member access on affected bindings,
     //           but only if the binding is never reassigned.
     if !affected_bindings.is_empty() {
-        let mut reassigned = HashSet::new();
+        let mut reassigned = HashSet::default();
         let mut checker = ReassignmentChecker {
             candidates: &affected_bindings,
             reassigned: &mut reassigned,
@@ -133,16 +134,17 @@ fn run_un_interop_require_default(module: &mut Module, local_helpers: &LocalHelp
 
     // Phase 3: Remove helper declarations.
     if !helpers.is_empty() && !preserve_named_helpers {
-        // Keep the historical direct-helper cleanup policy out of this merge
-        // unit. Namespace bindings are different because the object can have
-        // meaningful non-call uses after every recognized `._(...)` call is
-        // consumed; retain just those proven SWC namespace bindings when a
-        // reference remains.
-        let retained_swc_member_helpers =
-            helpers_with_remaining_refs(module, &swc_member_helper_namespaces);
+        // Only a helper with no reference left outside its own declaration is
+        // removable. A surviving reference is a use the unwrapper does not
+        // rewrite: the helper is the module's own export (Babel's runtime
+        // `interopRequireDefault` module is exactly this shape), it is
+        // re-exported or aliased, or an SWC namespace object keeps a non-call
+        // use after every recognized `._(...)` call is consumed. Removing the
+        // declaration in any of those cases leaves a dangling reference.
+        let retained_helpers = helpers_with_remaining_refs(module, &helpers);
         let removable_helpers: HashMap<BindingKey, TranspilerHelperKind> = helpers
             .into_iter()
-            .filter(|(key, _)| !retained_swc_member_helpers.contains(key))
+            .filter(|(key, _)| !retained_helpers.contains(key))
             .collect();
         remove_helper_declarations(&mut module.body, &removable_helpers);
     }
@@ -191,10 +193,9 @@ fn preserve_remaining_swc_member_helper_namespaces(
         // calls still reach SWC's helper. Keep those calls intact, but recover
         // the exact helper module as a namespace import behind a mutable alias
         // so neither helper identity nor assignment semantics are invented.
-        let import_local = Ident::new(
+        let import_local = fresh_binding_ident(
             fresh_namespace_import_name(&binding.sym, &mut used_names),
             DUMMY_SP,
-            SyntaxContext::empty(),
         );
         new_body.push(make_swc_namespace_import(import_local.clone(), source));
         var.decls[0].init = Some(Box::new(Expr::Ident(import_local)));
@@ -277,7 +278,7 @@ fn collect_all_identifier_names(module: &Module) -> HashSet<Atom> {
     }
 
     let mut collector = Collector {
-        names: HashSet::new(),
+        names: HashSet::default(),
     };
     module.visit_with(&mut collector);
     collector.names
@@ -289,7 +290,7 @@ fn fresh_namespace_import_name(name: &Atom, used_names: &mut HashSet<Atom>) -> A
         return base;
     }
     for suffix in 2usize.. {
-        let candidate: Atom = format!("_{name}{suffix}").into();
+        let candidate: Atom = format!("_{name}_{suffix}").into();
         if used_names.insert(candidate.clone()) {
             return candidate;
         }
@@ -337,7 +338,7 @@ fn collect_assignment_form_initializers(
 ) -> HashSet<usize> {
     let require_declarations = collect_top_level_require_declarations(module, local_helpers);
     let top_level_functions = collect_top_level_functions(module);
-    let mut matched_indices = HashSet::new();
+    let mut matched_indices = HashSet::default();
 
     for (index, item) in module.body.iter().enumerate() {
         let Some(binding) = assignment_form_initializer_binding(item, local_helpers) else {
@@ -405,7 +406,7 @@ fn collect_assignment_form_initializers(
 }
 
 fn collect_top_level_functions(module: &Module) -> HashMap<BindingKey, &Function> {
-    let mut functions = HashMap::new();
+    let mut functions = HashMap::default();
     for item in &module.body {
         let ModuleItem::Stmt(Stmt::Decl(Decl::Fn(fn_decl))) = item else {
             continue;
@@ -438,7 +439,7 @@ fn item_can_invoke_pre_initializer_read(
     local_helpers: &LocalHelperContext,
     top_level_functions: &HashMap<BindingKey, &Function>,
 ) -> bool {
-    let visiting = RefCell::new(HashSet::new());
+    let visiting = RefCell::new(HashSet::default());
     let mut scanner = ImmediateInvocationScanner {
         binding,
         local_helpers,
@@ -729,7 +730,7 @@ fn collect_top_level_require_declarations(
     module: &Module,
     local_helpers: &LocalHelperContext,
 ) -> HashMap<BindingKey, usize> {
-    let mut declarations = HashMap::new();
+    let mut declarations = HashMap::default();
 
     for (index, item) in module.body.iter().enumerate() {
         let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var_decl))) = item else {
@@ -1014,5 +1015,20 @@ fn is_default_prop(prop: &MemberProp) -> bool {
             matches!(c.expr.as_ref(), Expr::Lit(Lit::Str(s)) if s.value.as_str() == Some("default"))
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn namespace_import_name_uses_delimited_suffix() {
+        let mut used_names = HashSet::from_iter([Atom::from("_value")]);
+
+        assert_eq!(
+            fresh_namespace_import_name(&Atom::from("value"), &mut used_names),
+            "_value_2"
+        );
     }
 }

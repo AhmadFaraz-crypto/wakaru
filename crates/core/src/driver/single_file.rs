@@ -297,6 +297,37 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_var_const_conflicts_are_error_severity() {
+        for source in [
+            "export const value = 1; export var value = 2;",
+            "export var value = 1; export const value = 2;",
+        ] {
+            // Direct eval keeps the var declaration from being upgraded to
+            // const, so this exercises the mixed declaration conflict.
+            let source = format!("{source} function dynamic(code) {{ return eval(code); }}");
+            let output = decompile(
+                &source,
+                DecompileOptions {
+                    diagnostics: true,
+                    filename: "duplicate.js".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("diagnostics retain the emitted code");
+            assert!(
+                output
+                    .warnings
+                    .iter()
+                    .any(|warning| { warning.kind == UnpackWarningKind::DuplicateDeclaration }),
+                "{source}\n{:?}",
+                output.warnings
+            );
+            assert!(output.code.contains("export var value"), "{}", output.code);
+            assert!(output.has_errors(), "{source}");
+        }
+    }
+
+    #[test]
     fn diagnostics_duplicate_declarations_inside_block() {
         let output = decompile(
             "{ const x = 1; const x = 2; }",
@@ -503,5 +534,88 @@ mod tests {
         let has_line_1 = sm.tokens().any(|t| t.get_src_line() == 1);
         assert!(has_line_0, "should have tokens mapping to input line 0");
         assert!(has_line_1, "should have tokens mapping to input line 1");
+    }
+
+    #[test]
+    fn emit_source_map_keeps_the_innermost_mapping_per_output_position() {
+        // Flipping the comparison moves `a.length` ahead of `1`, while the
+        // binary expression keeps its span starting at `1`.
+        let input = "function f(a){if(1===a.length)return a}";
+        let output = decompile(
+            input,
+            DecompileOptions {
+                filename: "flip.js".to_string(),
+                emit_source_map: true,
+                ..Default::default()
+            },
+        )
+        .expect("decompile should succeed");
+        let map_json = output.source_map.expect("source map should be generated");
+        let sm = sourcemap::SourceMap::from_reader(map_json.as_bytes())
+            .expect("source map JSON should parse");
+
+        let mut positions: Vec<_> = sm
+            .tokens()
+            .map(|t| (t.get_dst_line(), t.get_dst_col()))
+            .collect();
+        let total = positions.len();
+        positions.dedup();
+        assert_eq!(positions.len(), total, "one mapping per output position");
+
+        let (line, text) = output
+            .code
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("a.length === 1"))
+            .expect("comparison should be flipped");
+        let col = text.find("a.length").expect("flipped operand") as u32;
+        let token = sm
+            .lookup_token(line as u32, col)
+            .expect("flipped operand should be mapped");
+        assert_eq!(
+            (token.get_dst_line(), token.get_dst_col()),
+            (line as u32, col)
+        );
+        assert_eq!(
+            (token.get_src_line(), token.get_src_col()),
+            (0, input.find("a.length").unwrap() as u32),
+            "the operand should map to itself, not to the constant it was swapped with"
+        );
+    }
+
+    #[test]
+    fn emit_source_map_counts_input_columns_in_utf16_units() {
+        // "中文字" is 9 UTF-8 bytes, 3 UTF-16 units, and 6 display columns.
+        let input = "var s = \"中文字\", t = foo(s);";
+        let output = decompile(
+            input,
+            DecompileOptions {
+                filename: "wide.js".to_string(),
+                emit_source_map: true,
+                ..Default::default()
+            },
+        )
+        .expect("decompile should succeed");
+        let map_json = output.source_map.expect("source map should be generated");
+        let sm = sourcemap::SourceMap::from_reader(map_json.as_bytes())
+            .expect("source map JSON should parse");
+
+        let foo_line = output
+            .code
+            .lines()
+            .position(|line| line.contains("foo(s)"))
+            .expect("output should keep the call") as u32;
+        let foo_col = output
+            .code
+            .lines()
+            .nth(foo_line as usize)
+            .unwrap()
+            .find("foo")
+            .unwrap() as u32;
+        let token = sm
+            .lookup_token(foo_line, foo_col)
+            .expect("the call should be mapped");
+        let utf16_col = input[..input.find("foo").unwrap()].encode_utf16().count() as u32;
+        assert_eq!((token.get_src_line(), token.get_src_col()), (0, utf16_col));
     }
 }

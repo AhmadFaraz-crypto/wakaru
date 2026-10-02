@@ -614,6 +614,23 @@ test("missingToolPackageSpecs checks package resolution instead of directory pre
   }
 });
 
+test("missingToolPackageSpecs reinstalls a resolvable package at another version", () => {
+  const root = mkdtempSync(join(tmpdir(), "wakaru-tools-unit-"));
+  try {
+    const packageDir = join(root, "node_modules", "terser");
+    mkdirSync(packageDir, { recursive: true });
+    writeFileSync(join(root, "package.json"), JSON.stringify({ private: true, type: "module" }));
+    writeFileSync(join(packageDir, "package.json"), JSON.stringify({ name: "terser", version: "5.31.0", main: "index.js" }));
+    writeFileSync(join(packageDir, "index.js"), "");
+
+    const pinned = { name: "terser", spec: "terser@5.31.6" };
+    assert.deepEqual(missingToolPackageSpecs(root, [pinned]), [pinned]);
+    assert.deepEqual(missingToolPackageSpecs(root, [{ name: "terser", spec: "terser@5.31.0" }]), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("isSloppyOnlyWakaruParseUnsupported detects sloppy-only strict parser rejects", () => {
   const error = new Error('failed to parse input.js: InvalidIdentInStrict("yield")');
 
@@ -866,14 +883,16 @@ test("knownWakaruParseUnsupportedReason classifies SWC parser gaps", () => {
   );
 });
 
-test("knownSwcFidelityIssueReason classifies array binding elision printer gaps", () => {
+test("knownSwcFidelityIssueReason classifies arrow parameter elision gaps only", () => {
+  // Assignment-pattern elisions round-trip since swc_ecma_parser 45.1.2, so
+  // those shapes must not be reclassified as a known swc gap.
   assert.equal(
     knownSwcFidelityIssueReason({
       path: "test/language/statements/for-of/dstr/array-iteration.js",
       error: new Error("Test262Error"),
       decompiled: "for ([] of [g()]) {}",
     }),
-    "swc-array-binding-elision",
+    null,
   );
   assert.equal(
     knownSwcFidelityIssueReason({
@@ -881,7 +900,7 @@ test("knownSwcFidelityIssueReason classifies array binding elision printer gaps"
       error: new Error("Test262Error"),
       decompiled: "for await ([] of [iterable]) {}",
     }),
-    "swc-array-binding-elision",
+    null,
   );
   assert.equal(
     knownSwcFidelityIssueReason({
@@ -889,7 +908,7 @@ test("knownSwcFidelityIssueReason classifies array binding elision printer gaps"
       error: new Error("Test262Error"),
       decompiled: "[x] = iterable;",
     }),
-    "swc-array-binding-elision",
+    null,
   );
   assert.equal(
     knownSwcFidelityIssueReason({
@@ -897,7 +916,7 @@ test("knownSwcFidelityIssueReason classifies array binding elision printer gaps"
       error: new Error("Test262Error"),
       decompiled: "result = vals;\n[] = vals;",
     }),
-    "swc-array-binding-elision",
+    null,
   );
   assert.equal(
     knownSwcFidelityIssueReason({

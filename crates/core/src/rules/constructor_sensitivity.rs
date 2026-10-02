@@ -1,14 +1,22 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
+use swc_core::common::Mark;
 use swc_core::ecma::ast::{
-    AssignExpr, AssignOp, AssignTarget, AssignTargetPat, BinExpr, BinaryOp, CallExpr, Callee,
-    Class, Expr, Ident, Lit, MemberProp, Module, NewExpr, ObjectPat, ObjectPatProp, Pat, PropName,
-    SimpleAssignTarget, VarDeclarator,
+    ArrowExpr, ArrowFunctionBody, AssignExpr, AssignOp, AssignTarget, AssignTargetPat, BinExpr,
+    BinaryOp, CallExpr, Callee, Class, Decl, ExportNamedSpecifier, ExportSpecifier, Expr, Function,
+    Id, Ident, Lit, MemberProp, Module, ModuleDecl, ModuleExportName, ModuleItem, NewExpr,
+    ObjectPat, ObjectPatProp, Pat, PropName, ReturnStmt, SimpleAssignTarget, Stmt, VarDeclarator,
 };
+use swc_core::ecma::utils::find_pat_ids;
 use swc_core::ecma::visit::{Visit, VisitWith};
 
+use super::expr_utils::is_unresolved_ident;
+use super::helper_matcher::BindingKey;
+use super::transpiler_helper_utils::LocalHelperContext;
+use super::un_es6_class::collect_create_class_helper_bindings;
 use crate::analysis::binding_uses::BindingId;
+use crate::utils::paren::strip_parens;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ValueKey {
@@ -17,11 +25,15 @@ pub(crate) struct ValueKey {
 }
 
 impl ValueKey {
-    fn binding(ident: &Ident) -> Self {
+    fn from_binding_id(root: BindingId) -> Self {
         Self {
-            root: (ident.sym.clone(), ident.ctxt),
+            root,
             properties: Vec::new(),
         }
+    }
+
+    fn binding(ident: &Ident) -> Self {
+        Self::from_binding_id((ident.sym.clone(), ident.ctxt))
     }
 
     pub(crate) fn with_property(&self, property: Atom) -> Self {
@@ -82,6 +94,40 @@ pub(crate) fn assign_target_value_key(target: &AssignTarget) -> Option<ValueKey>
         SimpleAssignTarget::Ident(binding) => Some(ValueKey::binding(&binding.id)),
         SimpleAssignTarget::Member(member) => expr_value_key(&Expr::Member(member.clone())),
         _ => None,
+    }
+}
+
+/// Callees proven to be a Babel/SWC `createClass` helper: a runtime-path
+/// import, a same-module function whose body matches the helper, or an
+/// unresolved `_createClass`. The helper writes `Constructor.prototype` and
+/// its result is constructed later, so its first argument is a constructor use
+/// like the target of `Reflect.construct`.
+pub(crate) struct CreateClassHelpers {
+    bindings: HashSet<BindingKey>,
+    unresolved_mark: Mark,
+}
+
+impl CreateClassHelpers {
+    pub(crate) fn collect(
+        module: &Module,
+        unresolved_mark: Mark,
+        local_helpers: &LocalHelperContext,
+    ) -> Self {
+        Self {
+            bindings: collect_create_class_helper_bindings(module, unresolved_mark, local_helpers),
+            unresolved_mark,
+        }
+    }
+
+    pub(crate) fn is_call(&self, call: &CallExpr) -> bool {
+        let Callee::Expr(callee) = &call.callee else {
+            return false;
+        };
+        let Expr::Ident(id) = strip_parens(callee) else {
+            return false;
+        };
+        self.bindings.contains(&(id.sym.clone(), id.ctxt))
+            || is_unresolved_ident(id, "_createClass", self.unresolved_mark)
     }
 }
 
@@ -331,6 +377,11 @@ fn collect_value_sources(expr: &Expr, sources: &mut Vec<ValueKey>) {
             };
             collect_value_sources(&member.obj, sources);
         }
+        // An immediately invoked function evaluates to what it returns.
+        // `Name = (function () { return ctor; })()` makes `new Name()` construct
+        // `ctor`, so `ctor` must stay an ordinary function when `Name` is
+        // constructor-sensitive.
+        Expr::Call(call) => collect_iife_return_sources(call, sources),
         _ => {
             if let Some(key) = expr_value_key(expr) {
                 sources.push(key);
@@ -339,19 +390,111 @@ fn collect_value_sources(expr: &Expr, sources: &mut Vec<ValueKey>) {
     }
 }
 
+/// Collect every value an IIFE call can return, as the conditional and
+/// logical branches above collect every value they can evaluate to. A source
+/// only keeps a function constructible, so an extra one is harmless and a
+/// missing one is not. Async and generator callees evaluate to a Promise or
+/// an iterator rather than to their returned value.
+/// A call whose callee resolves to a synchronous function or arrow
+/// expression, the IIFE shapes whose returns are the call's result.
+pub(crate) fn is_sync_iife_call(call: &CallExpr) -> bool {
+    let Callee::Expr(callee) = &call.callee else {
+        return false;
+    };
+    match iife_callee_function(callee) {
+        Expr::Fn(function) => !function.function.is_async && !function.function.is_generator,
+        Expr::Arrow(arrow) => !arrow.is_async && !arrow.is_generator,
+        _ => false,
+    }
+}
+
+fn collect_iife_return_sources(call: &CallExpr, sources: &mut Vec<ValueKey>) {
+    let Callee::Expr(callee) = &call.callee else {
+        return;
+    };
+    match iife_callee_function(callee) {
+        Expr::Fn(function) => {
+            if function.function.is_async || function.function.is_generator {
+                return;
+            }
+            if let Some(body) = &function.function.body {
+                collect_body_return_sources(&body.stmts, sources);
+            }
+        }
+        Expr::Arrow(arrow) => {
+            if arrow.is_async || arrow.is_generator {
+                return;
+            }
+            match arrow.body.as_ref() {
+                ArrowFunctionBody::Expr(expr) => collect_value_sources(expr, sources),
+                ArrowFunctionBody::FunctionBody(body) => {
+                    collect_body_return_sources(&body.stmts, sources)
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The function an IIFE callee invokes: `(0, function () {})()` calls the
+/// sequence's last expression, and `(function () {}).call(this)` or
+/// `.apply(this, args)` calls the receiver.
+fn iife_callee_function(callee: &Expr) -> &Expr {
+    match strip_parens(callee) {
+        Expr::Seq(sequence) => match sequence.exprs.last() {
+            Some(last) => iife_callee_function(last),
+            None => strip_parens(callee),
+        },
+        Expr::Member(member)
+            if static_member_name(&member.prop)
+                .is_some_and(|name| name == "call" || name == "apply") =>
+        {
+            iife_callee_function(&member.obj)
+        }
+        callee => callee,
+    }
+}
+
+fn collect_body_return_sources(stmts: &[Stmt], sources: &mut Vec<ValueKey>) {
+    let mut walker = ReturnSourceWalker { sources };
+    for stmt in stmts {
+        stmt.visit_with(&mut walker);
+    }
+}
+
+/// Visits the returns of one function body. Nested functions, arrows, and
+/// classes return from their own calls, not this one.
+struct ReturnSourceWalker<'a> {
+    sources: &'a mut Vec<ValueKey>,
+}
+
+impl Visit for ReturnSourceWalker<'_> {
+    fn visit_return_stmt(&mut self, statement: &ReturnStmt) {
+        if let Some(argument) = statement.arg.as_deref() {
+            collect_value_sources(argument, self.sources);
+        }
+    }
+
+    fn visit_function(&mut self, _: &Function) {}
+
+    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+
+    fn visit_class(&mut self, _: &Class) {}
+}
+
 fn value_sources(expr: &Expr) -> Vec<ValueKey> {
     let mut sources = Vec::new();
     collect_value_sources(expr, &mut sources);
     sources
 }
 
-#[derive(Default)]
-struct ConstructorSensitiveUseCollector {
+struct ConstructorSensitiveUseCollector<'a> {
     sensitive: HashSet<ValueKey>,
     aliases: Vec<(ValueKey, ValueKey)>,
+    create_class: &'a CreateClassHelpers,
 }
 
-impl ConstructorSensitiveUseCollector {
+impl ConstructorSensitiveUseCollector<'_> {
     fn mark_expr(&mut self, expr: &Expr) {
         for key in value_sources(expr) {
             self.sensitive.insert(key);
@@ -426,7 +569,7 @@ impl ConstructorSensitiveUseCollector {
     }
 }
 
-impl Visit for ConstructorSensitiveUseCollector {
+impl Visit for ConstructorSensitiveUseCollector<'_> {
     fn visit_var_declarator(&mut self, decl: &VarDeclarator) {
         if let Some(init) = decl.init.as_deref() {
             let sources = value_sources(init);
@@ -492,15 +635,43 @@ impl Visit for ConstructorSensitiveUseCollector {
                 self.mark_expr(&new_target.expr);
             }
         }
+        if self.create_class.is_call(call) {
+            if let Some(target) = call.args.first() {
+                self.mark_expr(&target.expr);
+            }
+        }
         call.visit_children_with(self);
     }
 }
 
-pub(crate) fn collect_constructor_sensitive_values(module: &Module) -> HashSet<ValueKey> {
-    let mut collector = ConstructorSensitiveUseCollector::default();
-    module.visit_with(&mut collector);
+pub(crate) fn collect_constructor_sensitive_values(
+    module: &Module,
+    create_class: &CreateClassHelpers,
+) -> HashSet<ValueKey> {
+    // Named exports can be constructed by another module. Seed their local
+    // bindings before alias propagation because intra-module `new` /
+    // `.prototype` analysis cannot see those consumers.
+    collect_constructor_sensitive_values_with_roots(
+        module,
+        create_class,
+        collect_named_exported_locals(module),
+    )
+}
 
-    let mut sources_by_target: HashMap<ValueKey, Vec<ValueKey>> = HashMap::new();
+fn collect_constructor_sensitive_values_with_roots(
+    module: &Module,
+    create_class: &CreateClassHelpers,
+    roots: impl IntoIterator<Item = ValueKey>,
+) -> HashSet<ValueKey> {
+    let mut collector = ConstructorSensitiveUseCollector {
+        sensitive: HashSet::default(),
+        aliases: Vec::new(),
+        create_class,
+    };
+    module.visit_with(&mut collector);
+    collector.sensitive.extend(roots);
+
+    let mut sources_by_target: HashMap<ValueKey, Vec<ValueKey>> = HashMap::default();
     for (target, source) in collector.aliases {
         sources_by_target.entry(target).or_default().push(source);
     }
@@ -556,5 +727,62 @@ pub(crate) fn collect_constructor_sensitive_values(module: &Module) -> HashSet<V
         }
     }
 
+    // `new d.init` plus `d = c` and `c = ns.Word` reaches `ns.Word.init` only
+    // after the binding-to-binding fixpoint. Copy each sensitive suffix onto
+    // every member alias of its root, once. Do not enqueue those keys:
+    // `a = b.x; b = a.y` would otherwise grow without bound.
+    let member_snapshot = collector.sensitive.iter().cloned().collect::<Vec<_>>();
+    for key in member_snapshot {
+        if key.properties.is_empty() {
+            continue;
+        }
+        let binding = ValueKey {
+            root: key.root.clone(),
+            properties: Vec::new(),
+        };
+        let Some(sources) = sources_by_target.get(&binding) else {
+            continue;
+        };
+        for source in sources {
+            if source.properties.is_empty() {
+                continue;
+            }
+            let mut propagated = source.clone();
+            propagated.properties.extend(key.properties.iter().cloned());
+            collector.sensitive.insert(propagated);
+        }
+    }
+
     collector.sensitive
+}
+
+fn collect_named_exported_locals(module: &Module) -> HashSet<ValueKey> {
+    let mut exported = HashSet::default();
+    for item in &module.body {
+        match item {
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => {
+                let Decl::Var(var) = &export.decl else {
+                    continue;
+                };
+                for declarator in &var.decls {
+                    let ids: Vec<Id> = find_pat_ids(&declarator.name);
+                    exported.extend(ids.into_iter().map(ValueKey::from_binding_id));
+                }
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(named)) if named.src.is_none() => {
+                for specifier in &named.specifiers {
+                    let ExportSpecifier::Named(ExportNamedSpecifier {
+                        orig: ModuleExportName::Ident(ident),
+                        ..
+                    }) = specifier
+                    else {
+                        continue;
+                    };
+                    exported.insert(ValueKey::binding(ident));
+                }
+            }
+            _ => {}
+        }
+    }
+    exported
 }

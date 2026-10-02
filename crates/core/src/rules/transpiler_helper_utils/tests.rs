@@ -226,7 +226,7 @@ fn local_helper_context_collects_helper_dependencies() {
                 "#,
         );
         let context = LocalHelperContext::collect(&module);
-        let roots = HashMap::from([(
+        let roots = HashMap::from_iter([(
             (Atom::from("root"), SyntaxContext::empty()),
             TranspilerHelperKind::SlicedToArray,
         )]);
@@ -257,7 +257,7 @@ fn removes_helpers_without_remaining_refs_only_when_unused() {
                 const value = 1;
                 "#,
         );
-        let helpers = HashMap::from([(
+        let helpers = HashMap::from_iter([(
             (Atom::from("helper"), SyntaxContext::empty()),
             TranspilerHelperKind::ClassCallCheck,
         )]);
@@ -274,7 +274,7 @@ fn removes_helpers_without_remaining_refs_only_when_unused() {
                 helper(1);
                 "#,
         );
-        let helpers = HashMap::from([(
+        let helpers = HashMap::from_iter([(
             (Atom::from("helper"), SyntaxContext::empty()),
             TranspilerHelperKind::ClassCallCheck,
         )]);
@@ -302,7 +302,7 @@ fn removes_helper_dependencies_with_consumed_root() {
                 "#,
         );
         let context = LocalHelperContext::collect(&module);
-        let roots = HashMap::from([(
+        let roots = HashMap::from_iter([(
             (Atom::from("root"), SyntaxContext::empty()),
             TranspilerHelperKind::SlicedToArray,
         )]);
@@ -312,6 +312,75 @@ fn removes_helper_dependencies_with_consumed_root() {
         assert!(!module_has_function(&module, "root"));
         assert!(!module_has_function(&module, "dep"));
         assert!(module_has_function(&module, "unrelated"));
+    });
+}
+
+#[test]
+fn keeps_dependency_of_a_helper_that_stays_referenced() {
+    GLOBALS.set(&Globals::new(), || {
+        let mut module = parse_module(
+            r#"
+                function root(value) {
+                    return shared(value);
+                }
+                function shared(value) {
+                    return leaf(value);
+                }
+                function leaf(value) {
+                    return value;
+                }
+                function survivor(value) {
+                    return shared(value);
+                }
+                survivor(1);
+                "#,
+        );
+        let context = LocalHelperContext::collect(&module);
+        let roots = HashMap::from_iter([(
+            (Atom::from("root"), SyntaxContext::empty()),
+            TranspilerHelperKind::SlicedToArray,
+        )]);
+
+        context.remove_helpers_with_dependencies(&mut module, roots);
+
+        assert!(!module_has_function(&module, "root"));
+        // `shared` is still called by `survivor`, so `leaf`, which only
+        // `shared` calls, must stay with it.
+        assert!(module_has_function(&module, "shared"));
+        assert!(module_has_function(&module, "leaf"));
+        assert!(module_has_function(&module, "survivor"));
+    });
+}
+
+#[test]
+fn removing_helper_imports_keeps_side_effect_imports() {
+    GLOBALS.set(&Globals::new(), || {
+        let mut module = parse_module(
+            r#"
+                import "./side.js";
+                import helper from "@babel/runtime/helpers/defineProperty";
+                import "./other.css";
+                "#,
+        );
+        let helpers = HashMap::from_iter([(
+            (Atom::from("helper"), SyntaxContext::empty()),
+            TranspilerHelperKind::DefineProperty,
+        )]);
+
+        remove_helpers_without_remaining_refs(&mut module, helpers);
+
+        assert!(!module_has_import_local(&module, "helper"));
+        let bare_imports = module
+            .body
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    ModuleItem::ModuleDecl(ModuleDecl::Import(import)) if import.specifiers.is_empty()
+                )
+            })
+            .count();
+        assert_eq!(bare_imports, 2);
     });
 }
 
@@ -578,6 +647,19 @@ fn class_call_check_with_parens() {
                     if (!(a instanceof b)) {
                         throw new TypeError("Cannot call a class as a function");
                     }
+                }"#,
+        );
+        assert!(is_class_call_check_fn(&f));
+    });
+}
+
+#[test]
+fn class_call_check_accepts_type_error_call_without_new() {
+    // Minifiers drop `new` from builtin error constructors.
+    GLOBALS.set(&Globals::new(), || {
+        let f = parse_first_function(
+            r#"function _c(a, b) {
+                    if (!(a instanceof b)) throw TypeError("Cannot call a class as a function");
                 }"#,
         );
         assert!(is_class_call_check_fn(&f));
@@ -955,5 +1037,153 @@ fn arrow_decl_non_helper_is_none() {
     GLOBALS.set(&Globals::new(), || {
         let arrow = parse_first_arrow(r#"var f = (e) => { var a = e + 1; return a * 2; };"#);
         assert_eq!(detect_helper_from_arrow(&arrow, false), None);
+    });
+}
+
+#[test]
+fn swc_async_namespace_identity_is_separate_from_the_callable_export() {
+    GLOBALS.set(&Globals::new(), || {
+        for declaration in [
+            r#"var helper = require("@swc/helpers/_/_async_to_generator");"#,
+            r#"import * as helper from "@swc/helpers/_/_async_to_generator";"#,
+        ] {
+            let module = parse_module(declaration);
+            let context = LocalHelperContext::collect(&module);
+            let direct = parse_first_call("var result = helper(fn);");
+            let member = parse_first_call("var result = helper._(fn);");
+            assert_eq!(
+                context.helper_callee_kind(direct.callee.as_expr().unwrap()),
+                None
+            );
+            assert_eq!(
+                context.helper_callee_kind(member.callee.as_expr().unwrap()),
+                Some(TranspilerHelperKind::AsyncToGenerator)
+            );
+        }
+    });
+}
+
+#[test]
+fn lifted_extends_factory_requires_private_local_and_matching_callable() {
+    use crate::rules::SimplifySequence;
+    use swc_core::ecma::transforms::base::resolver;
+    use swc_core::ecma::visit::VisitMutWith;
+
+    let source =
+        include_str!("../../../tests/fixtures/tslib-inheritance/commonjs-inline-compressed.js");
+    let has_helper = |source: &str| {
+        GLOBALS.set(&Globals::new(), || {
+            let mut module = parse_module(source);
+            let unresolved = Mark::new();
+            let top = Mark::new();
+            module.visit_mut_with(&mut resolver(unresolved, top, false));
+            module.visit_mut_with(&mut SimplifySequence::new(unresolved));
+            !LocalHelperContext::collect_with_mark(&module, unresolved)
+                .ts_helpers_of_kind(TsHelperKind::Extends)
+                .is_empty()
+        })
+    };
+    assert!(has_helper(source));
+    for source in [
+        format!("{source}\nconsume(extendStatics);"),
+        format!("{source}\nextendStatics = custom;"),
+        format!("{source}\nfunction observe() {{ return extendStatics; }}"),
+        format!("{source}\nvar extendStatics;"),
+        format!("{source}\nif (flag) {{ var extendStatics = custom; }}"),
+        format!("{source}\nif (flag) {{ var __extends = custom; }}"),
+        format!("{source}\neval(code);"),
+        format!("{source}\nwith(scope) {{ observe(); }}"),
+        source.replace(",extendStatics;", ",extendStatics = custom;"),
+        source.replace(",extendStatics;", "; let extendStatics;"),
+        source.replace(
+            "extendStatics=function(d,b)",
+            "extendStatics=async function(d,b)",
+        ),
+        source.replace(
+            "extendStatics(d,b),d.prototype",
+            "extendStatics(b,d),d.prototype",
+        ),
+        source.replace("extendStatics(d,b),d.prototype", "custom(d,b),d.prototype"),
+        source.replace(
+            "extendStatics(d,b),d.prototype",
+            "extendStatics(d,...b),d.prototype",
+        ),
+        source.replace("||(", "||(observe(),"),
+    ] {
+        assert!(
+            !has_helper(&source),
+            "must retain unproven factory: {source}"
+        );
+    }
+}
+
+#[test]
+fn inline_ts_helper_referenced_only_by_a_kept_helper_stays() {
+    GLOBALS.set(&Globals::new(), || {
+        let mut module = parse_module(
+            r#"
+            var __values = (this && this.__values) || function (o) {
+                var s = typeof Symbol === "function" && Symbol.iterator, m = s && o[s], i = 0;
+                if (m) return m.call(o);
+                throw new TypeError(s ? "Object is not iterable." : "Symbol.iterator is not defined.");
+            };
+            var __generator = (this && this.__generator) || function (thisArg, body) {
+                __values(body);
+                return body.call(thisArg, { label: 0, sent: function() {}, trys: [], ops: [] });
+            };
+            __generator(this, function () {});
+            "#,
+        );
+        let context = LocalHelperContext::collect(&module);
+
+        context.remove_unused_inline_ts_helpers(
+            &mut module,
+            &[TsHelperKind::Generator, TsHelperKind::Values],
+        );
+
+        // `__generator` is still called, so the reference to `__values` inside
+        // its initializer counts and `__values` must stay with it.
+        assert!(module_has_var(&module, "__generator"));
+        assert!(module_has_var(&module, "__values"));
+    });
+}
+
+#[test]
+fn async_iterator_adapters_are_classified_by_producer() {
+    GLOBALS.set(&Globals::new(), || {
+        // Babel `_asyncIterator` through Terser mangle: a single-letter name,
+        // `Symbol.asyncIterator`, `TypeError`, `.call(iterable)`, no Promise.
+        // It is the Babel/SWC kind and must not double as tslib `__asyncValues`
+        // (that would let the tslib inline cleanup delete it before the
+        // dependency-aware cleanup sees its `AsyncFromSyncIterator` edge).
+        let module = parse_module(
+            r#"function t(n){var r,t,o,i=2;for("undefined"!=typeof Symbol&&(t=Symbol.asyncIterator,o=Symbol.iterator);i--;){if(t&&null!=(r=n[t]))return r.call(n);if(o&&null!=(r=n[o]))return new e(r.call(n));t="@@asyncIterator",o="@@iterator"}throw new TypeError("Object is not async iterable")}"#,
+        );
+        let context = LocalHelperContext::collect(&module);
+        assert_eq!(
+            context.helpers().values().copied().collect::<Vec<_>>(),
+            vec![TranspilerHelperKind::AsyncIterator]
+        );
+        assert!(context.ts_helpers_of_kind(TsHelperKind::AsyncValues).is_empty());
+        assert!(context.ts_helpers_of_kind(TsHelperKind::Values).is_empty());
+
+        // tslib `__asyncValues`: the async kind, not the sync `__values` whose
+        // `Symbol.iterator` signal its fallback also carries, and not a Babel
+        // adapter (its own body builds the Promise-settling wrapper).
+        let module = parse_module(
+            r#"
+            var __asyncValues = (this && this.__asyncValues) || function (o) {
+                if (!Symbol.asyncIterator) throw new TypeError("Symbol.asyncIterator is not defined.");
+                var m = o[Symbol.asyncIterator], i;
+                return m ? m.call(o) : (o = typeof __values === "function" ? __values(o) : o[Symbol.iterator](), i = {}, verb("next"), verb("throw"), verb("return"), i[Symbol.asyncIterator] = function () { return this; }, i);
+                function verb(n) { i[n] = o[n] && function (v) { return new Promise(function (resolve, reject) { v = o[n](v), settle(resolve, reject, v.done, v.value); }); }; }
+                function settle(resolve, reject, d, v) { Promise.resolve(v).then(function(v) { resolve({ value: v, done: d }); }, reject); }
+            };
+            "#,
+        );
+        let context = LocalHelperContext::collect(&module);
+        assert_eq!(context.ts_helpers_of_kind(TsHelperKind::AsyncValues).len(), 1);
+        assert!(context.ts_helpers_of_kind(TsHelperKind::Values).is_empty());
+        assert!(context.helpers().is_empty(), "{:?}", context.helpers());
     });
 }

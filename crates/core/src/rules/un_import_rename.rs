@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use swc_core::atoms::Atom;
 use swc_core::common::Mark;
@@ -32,7 +32,7 @@ impl VisitMut for UnImportRename {
 
         let jsx_tags = collect_jsx_tag_bindings(module);
         let mut candidates: Vec<(BindingId, Atom)> = Vec::new();
-        let mut candidate_bindings = HashSet::new();
+        let mut candidate_bindings = HashSet::default();
         for item in &module.body {
             let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
                 continue;

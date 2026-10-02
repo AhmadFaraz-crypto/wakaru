@@ -12,6 +12,64 @@ pub struct JsonUnpackOutput {
 }
 
 #[derive(Serialize)]
+pub struct JsonChunkEnumerationOutput {
+    pub input: String,
+    pub detected_format: Option<String>,
+    pub enumeration: Option<JsonChunkEnumeration>,
+}
+
+#[derive(Serialize)]
+pub struct JsonChunkEnumeration {
+    pub public_path: JsonPublicPath,
+    /// webpack runtime chunk-filename table enumeration.
+    pub assets: Vec<JsonChunkAsset>,
+    /// Literal relative ESM specifiers (native code-splitting). Omitted when
+    /// empty. Each is a relative sibling-chunk URL; resolve against the entry.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub relative_imports: Vec<JsonRelativeImport>,
+}
+
+#[derive(Serialize)]
+pub struct JsonRelativeImport {
+    pub specifier: String,
+    /// `import` | `export_from` | `dynamic_import`.
+    pub kind: String,
+}
+
+#[derive(Serialize)]
+pub struct JsonPublicPath {
+    /// `static` | `script_relative` | `runtime_computed` | `not_found`.
+    pub status: String,
+    /// The literal value for `static`, or the script-relative suffix for
+    /// `script_relative`. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct JsonChunkAsset {
+    /// `js` | `css`.
+    pub kind: String,
+    /// `enumerated` | `no_static_chunk_ids` | `dynamic_template`.
+    pub status: String,
+    /// Debug-oriented placeholder rendering of the filename template.
+    /// Absent when the template is dynamic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// Relative URLs exactly as the runtime template renders them;
+    /// `public_path` is not prepended.
+    pub urls: Vec<JsonChunkUrl>,
+}
+
+#[derive(Serialize)]
+pub struct JsonChunkUrl {
+    pub chunk_id: String,
+    pub url: String,
+    /// `filename_map` | `ensure_call`.
+    pub source: String,
+}
+
+#[derive(Serialize)]
 pub struct JsonDecompileOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,

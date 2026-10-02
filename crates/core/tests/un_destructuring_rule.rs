@@ -913,7 +913,208 @@ use(primary, backup);
 }
 
 #[test]
-fn preserves_assignment_temp_decl_when_used_before_group() {
+fn reconstructs_nested_rest_default_through_imported_to_array() {
+    // swc `externalHelpers: true` keeps the helper as an import, so the
+    // nested materialization is `_to_array(value)` rather than the `[...value]`
+    // spread an inline helper leaves. The outer call stays for `UnToArray`.
+    let input = r#"
+import { _ as _to_array } from "@swc/helpers/_/_to_array";
+var _items = _to_array(items);
+var first = _items[0];
+var tmp = _items[1];
+var _ref = _to_array(tmp === undefined ? [] : tmp);
+var nested = _ref[0];
+var inner_rest = _ref.slice(1);
+var outer_rest = _items.slice(2);
+use(first, nested, inner_rest, outer_rest);
+"#;
+    let expected = r#"
+import { _ as _to_array } from "@swc/helpers/_/_to_array";
+var [first, [nested, ...inner_rest] = [], ...outer_rest] = _to_array(items);
+use(first, nested, inner_rest, outer_rest);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn reconstructs_nested_rest_default_through_babel_runtime_to_array() {
+    let input = r#"
+import _toArray from "@babel/runtime/helpers/toArray";
+var _items = _toArray(items);
+var first = _items[0];
+var _items$ = _items[1];
+var _items$2 = _toArray(_items$ === undefined ? [] : _items$);
+var nested = _items$2[0];
+var inner_rest = _items$2.slice(1);
+var outer_rest = _items.slice(2);
+use(first, nested, inner_rest, outer_rest);
+"#;
+    let expected = r#"
+import _toArray from "@babel/runtime/helpers/toArray";
+var [first, [nested, ...inner_rest] = [], ...outer_rest] = _toArray(items);
+use(first, nested, inner_rest, outer_rest);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn preserves_nested_default_behind_unproven_materializer() {
+    // A call that is not a proven `toArray` helper may not iterate the value,
+    // so it cannot stand in for the nested rest pattern's materialization.
+    let input = r#"
+import { _ as _to_array } from "@swc/helpers/_/_to_array";
+var _items = _to_array(items);
+var first = _items[0];
+var tmp = _items[1];
+var _ref = normalize(tmp === undefined ? [] : tmp);
+var nested = _ref[0];
+var inner_rest = _ref.slice(1);
+var outer_rest = _items.slice(2);
+use(first, nested, inner_rest, outer_rest);
+"#;
+    let expected = r#"
+import { _ as _to_array } from "@swc/helpers/_/_to_array";
+var _items = _to_array(items);
+var first = _items[0];
+var tmp = _items[1];
+var [nested, ...inner_rest] = normalize(tmp === undefined ? [] : tmp);
+var outer_rest = _items.slice(2);
+use(first, nested, inner_rest, outer_rest);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn pipeline_recovers_nested_rest_default_from_swc_external_helpers() {
+    let input = r#"
+import { _ as _to_array } from "@swc/helpers/_/_to_array";
+var _items = _to_array(items), first = _items[0], tmp = _items[1], _ref = _to_array(tmp === void 0 ? [] : tmp), nested = _ref[0], inner_rest = _ref.slice(1), outer_rest = _items.slice(2);
+use(first, nested, inner_rest, outer_rest);
+"#;
+    let expected = r#"
+const [first, [nested, ...inner_rest] = [], ...outer_rest] = items;
+use(first, nested, inner_rest, outer_rest);
+"#;
+    assert_eq_normalized(&common::render_pipeline(input), expected);
+}
+
+#[test]
+fn skips_dead_undefined_sentinel_between_temp_and_nested_materialization() {
+    // Terser with `unused: false` inlines the compiler temp for the nested
+    // default but keeps its declaration as `void 0` (already `undefined` here)
+    // between the two statements the matcher pairs.
+    let input = r#"
+const _items2 = [...items];
+const first = _items2[0];
+const _items2$ = _items2[1];
+const _items2$2 = undefined;
+const _items2$3 = [..._items2$ === undefined ? [] : _items2$];
+const nested = _items2$3[0];
+const inner_rest = _items2$3.slice(1);
+const outer_rest = _items2.slice(2);
+use(first, nested, inner_rest, outer_rest);
+"#;
+    let expected = r#"
+const [first, [nested, ...inner_rest] = [], ...outer_rest] = items;
+use(first, nested, inner_rest, outer_rest);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn keeps_undefined_declarator_that_is_read_later() {
+    // The declarator is not a dead sentinel when anything reads it, so the
+    // outer group still stops at it; only the inner group recovers.
+    let input = r#"
+const _items2 = [...items];
+const first = _items2[0];
+const _items2$ = _items2[1];
+const _items2$2 = undefined;
+const _items2$3 = [..._items2$ === undefined ? [] : _items2$];
+const nested = _items2$3[0];
+const inner_rest = _items2$3.slice(1);
+const outer_rest = _items2.slice(2);
+use(first, nested, inner_rest, outer_rest, _items2$2);
+"#;
+    let expected = r#"
+const _items2 = [...items];
+const first = _items2[0];
+const _items2$ = _items2[1];
+const _items2$2 = undefined;
+const [nested, ...inner_rest] = _items2$ === undefined ? [] : _items2$;
+const outer_rest = _items2.slice(2);
+use(first, nested, inner_rest, outer_rest, _items2$2);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn drops_dead_undefined_sentinel_directly_before_a_recovered_group() {
+    let input = r#"
+const _items = undefined;
+const _items2 = [...items];
+const first = _items2[0];
+const rest = _items2.slice(1);
+use(first, rest);
+"#;
+    let expected = r#"
+const [first, ...rest] = items;
+use(first, rest);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn keeps_dead_undefined_declarator_without_a_following_group() {
+    let input = r#"
+const _items = undefined;
+const first = items[0];
+use(first);
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn skips_dead_undefined_sentinel_between_temp_and_default() {
+    let input = r#"
+var _ref = options;
+var _ref$limit = _ref.limit;
+var _dead = undefined;
+var limit = _ref$limit === undefined ? 10 : _ref$limit;
+var name = _ref.name;
+use(limit, name);
+"#;
+    let expected = r#"
+var { limit = 10, name } = options;
+use(limit, name);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn pipeline_recovers_nested_rest_default_through_terser_kept_sentinels() {
+    let input = r#"
+function _toArray(r){return _arrayWithHoles(r)||_iterableToArray(r)||_unsupportedIterableToArray(r)||_nonIterableRest()}
+function _nonIterableRest(){throw new TypeError("Invalid attempt to destructure non-iterable instance.")}
+function _unsupportedIterableToArray(r,a){if(r){if("string"==typeof r)return _arrayLikeToArray(r,a);var t={}.toString.call(r).slice(8,-1);return"Object"===t&&r.constructor&&(t=r.constructor.name),"Map"===t||"Set"===t?Array.from(r):"Arguments"===t||/^(?:Ui|I)nt(?:8|16|32)(?:Clamped)?Array$/.test(t)?_arrayLikeToArray(r,a):void 0}}
+function _arrayLikeToArray(r,a){(null==a||a>r.length)&&(a=r.length);for(var e=0,n=Array(a);e<a;e++)n[e]=r[e];return n}
+function _iterableToArray(r){if("undefined"!=typeof Symbol&&null!=r[Symbol.iterator]||null!=r["@@iterator"])return Array.from(r)}
+function _arrayWithHoles(r){if(Array.isArray(r))return r}
+const _items=void 0,_items2=_toArray(items),first=_items2[0],_items2$=_items2[1],_items2$2=void 0,_items2$3=_toArray(void 0===_items2$?[]:_items2$),nested=_items2$3[0],inner_rest=_items2$3.slice(1),outer_rest=_items2.slice(2);
+use(first,nested,inner_rest,outer_rest);
+"#;
+    let expected = r#"
+const [first, [nested, ...inner_rest] = [], ...outer_rest] = items;
+use(first, nested, inner_rest, outer_rest);
+"#;
+    assert_eq_normalized(&common::render_pipeline(input), expected);
+}
+
+#[test]
+fn keeps_assignment_temp_read_before_the_group() {
+    // A read of the temp anywhere outside the matched statements means the
+    // temp escapes the pattern (docs/rewrite-assumptions.md, "Generated
+    // Temporaries"), even when the read precedes the group in this list.
     let input = r#"
 let source;
 let tmp;
@@ -924,16 +1125,7 @@ tmp = source.profile;
 name = (tmp === undefined ? {} : tmp).name;
 use(name);
 "#;
-    let expected = r#"
-let source;
-let tmp;
-let name;
-use(tmp);
-source = input;
-({ profile: { name } = {} } = source);
-use(name);
-"#;
-    assert_eq_normalized(&apply(input), expected);
+    assert_eq_normalized(&apply(input), input);
 }
 
 #[test]
@@ -1043,9 +1235,14 @@ _source$tags3 = n(_source$tags2, 3);
 primary = _source$tags3[0];
 backup = _source$tags3[2];
 "#;
+    // The rule alone leaves the consumed sliced helper in place; the pipeline
+    // removes it together with the sub-helpers its body calls (next test).
     let expected = r#"
 function c(e) {
     if (Array.isArray(e)) return e;
+}
+function n(e, t) {
+    return c(e) || o(e, t) || s(e, t) || l();
 }
 source = _t;
 ({
@@ -1055,6 +1252,36 @@ source = _t;
 } = source);
 "#;
     assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn pipeline_removes_minified_sliced_to_array_helper_and_dependency_consumed_at_module_level() {
+    let input = r#"
+function c(e) {
+    if (Array.isArray(e)) return e;
+}
+function n(e, t) {
+    return c(e) || o(e, t) || s(e, t) || l();
+}
+let tmp;
+let ref;
+let primary;
+let backup;
+tmp = source.tags;
+ref = n(tmp === undefined ? [] : tmp, 3);
+primary = ref[0];
+backup = ref[2];
+use(primary, backup);
+"#;
+    let output = render_pipeline_until_with_level(input, "UnDestructuring", RewriteLevel::Standard);
+    assert!(
+        output.contains("tags: [primary, , backup] = []"),
+        "should recover array holes from minified sliced helper:\n{output}"
+    );
+    assert!(
+        !output.contains("function n(") && !output.contains("function c("),
+        "consumed sliced helper and its dependency should be removed:\n{output}"
+    );
 }
 
 #[test]
@@ -1105,6 +1332,487 @@ source = _t;
 _source$tags3 = _slicedToArray(_source$tags2, 3);
 primary = _source$tags3[0];
 backup = _source$tags3[2];
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn does_not_hoist_right_operand_assignment_behind_an_effectful_left_operand() {
+    // `check()` evaluates before `source.p` in the input; hoisting the
+    // assignment would read the member first. The hoist runs before any group
+    // is proven, so it may not reorder evaluation on its own.
+    let input = r#"
+let backup;
+const out = check() !== (backup = source.p) ? 0 : 1;
+use(out, backup);
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn does_not_hoist_right_operand_assignment_behind_an_identifier_left_operand() {
+    // An identifier read has no effects, but a getter on the hoisted member
+    // could write it, so it is not literal-like either. That includes the
+    // unresolved `undefined`: inside a `with` body the getter can install an
+    // `undefined` property on the with-object that the read then resolves to.
+    let input = r#"
+let backup;
+const out = flag !== (backup = source.p) ? 0 : 1;
+const out2 = undefined !== (backup = source.q) ? undefined : backup;
+use(out, out2, backup);
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn reconstructs_array_when_fused_assignment_follows_a_literal_left_operand() {
+    // With a literal on the left (`null != (backup = _e[2])`), evaluating the
+    // member first changes nothing, so the hoist still fires and the array
+    // pattern completes.
+    let input = r#"
+let source;
+let _d;
+let _e;
+let primary;
+let backup;
+let _f;
+source = input;
+_d = source.tags;
+primary = (_e = _d === undefined ? [] : _d)[0];
+_f = null != (backup = _e[2]) ? backup : fallback();
+use(primary, backup, _f);
+"#;
+    let expected = r#"
+let source;
+let primary;
+let backup;
+let _f;
+source = input;
+({ tags: [primary, , backup] = [] } = source);
+_f = null != backup ? backup : fallback();
+use(primary, backup, _f);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn complete_default_pattern_drops_proven_sliced_to_array_call() {
+    // UnSlicedToArray leaves default elements alone, so the ref still holds
+    // the helper result. This complete two-element pattern is recovered under
+    // `iterator_materialization_independence`; equal counts do not prove that
+    // defaults and iterator operations have the same evaluation order.
+    let input = r#"
+import _slicedToArray from "@babel/runtime/helpers/slicedToArray";
+var _ref2 = _slicedToArray(_ref, 2);
+var head = _ref2[0];
+var _ref2$ = _ref2[1];
+var second = _ref2$ === undefined ? fallback : _ref2$;
+use(head, second);
+"#;
+    let expected = r#"
+import _slicedToArray from "@babel/runtime/helpers/slicedToArray";
+var [head, second = fallback] = _ref;
+use(head, second);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn default_pattern_keeps_sliced_to_array_call_when_length_or_identity_differs() {
+    // Fewer elements than the helper materializes: `_slicedToArray(_ref, 3)`
+    // also consumes a third iterator step that `[head, second]` would not.
+    let mismatched = r#"
+import _slicedToArray from "@babel/runtime/helpers/slicedToArray";
+var _ref2 = _slicedToArray(_ref, 3);
+var head = _ref2[0];
+var _ref2$ = _ref2[1];
+var second = _ref2$ === undefined ? fallback : _ref2$;
+use(head, second);
+"#;
+    let expected_mismatched = r#"
+import _slicedToArray from "@babel/runtime/helpers/slicedToArray";
+var [head, second = fallback] = _slicedToArray(_ref, 3);
+use(head, second);
+"#;
+    assert_eq_normalized(&apply(mismatched), expected_mismatched);
+
+    // A callee without helper identity is an ordinary call.
+    let unproven = r#"
+var _ref2 = customSlice(_ref, 2);
+var head = _ref2[0];
+var _ref2$ = _ref2[1];
+var second = _ref2$ === undefined ? fallback : _ref2$;
+use(head, second);
+"#;
+    let expected_unproven = r#"
+var [head, second = fallback] = customSlice(_ref, 2);
+use(head, second);
+"#;
+    assert_eq_normalized(&apply(unproven), expected_unproven);
+}
+
+#[test]
+fn complete_default_pattern_keeps_reassigned_helper_binding() {
+    for write in [
+        "h = custom;",
+        "[h] = replacements;",
+        "function replace() { h = custom; }",
+    ] {
+        let input = format!(
+            r#"
+var h = require("@babel/runtime/helpers/slicedToArray");
+{write}
+var _ref2 = h(items, 2);
+var head = _ref2[0];
+var _ref2$ = _ref2[1];
+var second = _ref2$ === undefined ? fallback : _ref2$;
+use(head, second);
+"#
+        );
+        let output = apply(&input);
+        assert!(
+            output.contains("= h(items, 2)"),
+            "reassigned helper must still be called: {output}"
+        );
+    }
+}
+
+#[test]
+fn complete_default_pattern_ignores_writes_to_shadowed_helper_name() {
+    let input = r#"
+var h = require("@babel/runtime/helpers/slicedToArray");
+function replace(h) { h = custom; }
+var _ref2 = h(items, 2);
+var head = _ref2[0];
+var _ref2$ = _ref2[1];
+var second = _ref2$ === undefined ? fallback : _ref2$;
+use(head, second);
+"#;
+    let output = apply(input);
+    assert!(
+        output.contains("[head, second = fallback] = items"),
+        "{output}"
+    );
+}
+
+#[test]
+fn pipeline_keeps_reassigned_inline_sliced_helper_with_default_pattern() {
+    let input = include_str!("fixtures/reassigned-sliced-default/input.js");
+    let output = render_pipeline_until_with_level(input, "UnDestructuring", RewriteLevel::Standard);
+    assert!(output.contains("= _slicedToArray(items, 2)"), "{output}");
+}
+
+#[test]
+fn rejects_default_whose_temp_is_read_in_a_later_computed_key() {
+    let input = r#"
+var _ref = opts;
+var _tmp = _ref.foo;
+var foo = _tmp === void 0 ? 1 : _tmp;
+var keys = { [_tmp]: foo };
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn uninitialized_decl_still_written_outside_the_group_is_kept() {
+    // `n` is the temp of the folded `wait` read, but `i = (n = e).transport`
+    // also writes it. A write is a use: removing `let n` leaves an assignment
+    // to an undeclared name.
+    let input = r#"
+function Ur(e) {
+  let n;
+  let t;
+  let i, u, a, c;
+  i = (n = e).transport;
+  u = e.endpoint;
+  t = e.size;
+  a = t === undefined ? 10 : t;
+  c = (n = e.wait) === undefined ? 1000 : n;
+  return [i, u, a, c];
+}
+"#;
+    let output = apply(input);
+    assert!(output.contains("wait: c = 1000"), "{output}");
+    assert!(output.contains("(n = e).transport"), "{output}");
+    assert!(output.contains("let n;"), "{output}");
+    assert!(!output.contains("let t;"), "{output}");
+}
+
+#[test]
+fn keeps_nested_default_temp_that_an_export_specifier_reads() {
+    // The export specifier sits outside the statement list the group matcher
+    // sees. Removing `tmp` with the group would leave a dangling export.
+    let input = r#"
+import { _ as _to_array } from "@swc/helpers/_/_to_array";
+var _items = _to_array(items);
+var first = _items[0];
+var tmp = _items[1];
+var _ref = _to_array(tmp === undefined ? [] : tmp);
+var nested = _ref[0];
+var inner_rest = _ref.slice(1);
+var outer_rest = _items.slice(2);
+console.log(first, nested, inner_rest, outer_rest);
+export { tmp };
+"#;
+    let expected = r#"
+import { _ as _to_array } from "@swc/helpers/_/_to_array";
+var _items = _to_array(items);
+var first = _items[0];
+var tmp = _items[1];
+var [nested, ...inner_rest] = _to_array(tmp === undefined ? [] : tmp);
+var outer_rest = _items.slice(2);
+console.log(first, nested, inner_rest, outer_rest);
+export { tmp };
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn keeps_spread_group_temp_that_an_export_declaration_reads() {
+    // `export function` is a module item, so the driver splits the statement
+    // list before it; the reader is invisible to a scan of that list.
+    let input = r#"
+var _items = [...items];
+var first = _items[0];
+var tmp = _items[1];
+var _ref = [...(tmp === undefined ? [] : tmp)];
+var nested = _ref[0];
+var inner_rest = _ref.slice(1);
+var outer_rest = _items.slice(2);
+export function read() { return tmp; }
+"#;
+    let expected = r#"
+var _items = [...items];
+var first = _items[0];
+var tmp = _items[1];
+var [nested, ...inner_rest] = tmp === undefined ? [] : tmp;
+var outer_rest = _items.slice(2);
+export function read() { return tmp; }
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn keeps_group_temp_read_by_a_closure_declared_earlier() {
+    // The closure precedes the group; a scan of the statements after the
+    // group never sees it.
+    let input = r#"
+function demo(items) {
+  function read() { return tmp; }
+  var _items = [...items];
+  var first = _items[0];
+  var tmp = _items[1];
+  var _ref = [...(tmp === undefined ? [] : tmp)];
+  var nested = _ref[0];
+  var inner_rest = _ref.slice(1);
+  var outer_rest = _items.slice(2);
+  return [first, nested, inner_rest, outer_rest, read()];
+}
+"#;
+    let expected = r#"
+function demo(items) {
+  function read() { return tmp; }
+  var _items = [...items];
+  var first = _items[0];
+  var tmp = _items[1];
+  var [nested, ...inner_rest] = tmp === undefined ? [] : tmp;
+  var outer_rest = _items.slice(2);
+  return [first, nested, inner_rest, outer_rest, read()];
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn keeps_assigned_temp_that_an_export_specifier_reads() {
+    let input = r#"
+var a, t, b;
+a = obj.a;
+t = obj.b;
+b = t === undefined ? 1 : t;
+export { t };
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn keeps_undefined_declarator_read_by_an_earlier_closure() {
+    let input = r#"
+function demo(items) {
+  function read() { return _dead; }
+  const _dead = undefined;
+  const _ref = [...items];
+  const first = _ref[0];
+  const rest = _ref.slice(1);
+  return [first, rest, read()];
+}
+"#;
+    let expected = r#"
+function demo(items) {
+  function read() { return _dead; }
+  const _dead = undefined;
+  const [first, ...rest] = items;
+  return [first, rest, read()];
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn keeps_undefined_declarator_that_an_export_specifier_reads() {
+    let input = r#"
+const _dead = undefined;
+const _ref = [...items];
+const first = _ref[0];
+const rest = _ref.slice(1);
+console.log(first, rest);
+export { _dead };
+"#;
+    let expected = r#"
+const _dead = undefined;
+const [first, ...rest] = items;
+console.log(first, rest);
+export { _dead };
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn leaves_a_long_unmatched_undefined_run_in_place() {
+    // Each declarator is a candidate sentinel with no group after it. The
+    // run is long enough that re-scanning the list per declarator per start
+    // position would take minutes in a debug build; the output must be
+    // unchanged and the test must finish promptly.
+    let input: String = (0..1500)
+        .map(|index| format!("const _tmp{index} = undefined;\n"))
+        .collect();
+    assert_eq_normalized(&apply(&input), &input);
+}
+
+#[test]
+fn pipeline_keeps_exported_temp_through_nested_rest_recovery() {
+    let input = r#"
+import { _ as _to_array } from "@swc/helpers/_/_to_array";
+var _items = _to_array(items);
+var first = _items[0];
+var tmp = _items[1];
+var _ref = _to_array(tmp === undefined ? [] : tmp);
+var nested = _ref[0];
+var inner_rest = _ref.slice(1);
+var outer_rest = _items.slice(2);
+console.log(first, nested, inner_rest, outer_rest);
+export { tmp };
+"#;
+    let output = common::render_pipeline(input);
+    assert!(output.contains("tmp"), "{output}");
+    assert!(
+        output.contains("const tmp = _items[1]") || output.contains("export const tmp"),
+        "{output}"
+    );
+}
+
+#[test]
+fn keeps_consumed_helper_still_called_past_an_export() {
+    // The group consumes the helper's only call in this statement list, but
+    // the module still calls it after the `export`, which splits the list.
+    let input = r#"
+function _arrayLikeToArray(arr, len) {
+  if (len == null || len > arr.length) len = arr.length;
+  for (var i = 0, arr2 = new Array(len); i < len; i++) arr2[i] = arr[i];
+  return arr2;
+}
+var _ref = [...items];
+var head = _ref[0];
+var tail = _arrayLikeToArray(_ref).slice(1);
+export { head, tail };
+var copy = _arrayLikeToArray(other, 3);
+console.log(copy);
+"#;
+    let expected = r#"
+function _arrayLikeToArray(arr, len) {
+  if (len == null || len > arr.length) len = arr.length;
+  for (var i = 0, arr2 = new Array(len); i < len; i++) arr2[i] = arr[i];
+  return arr2;
+}
+var [head, ...tail] = items;
+export { head, tail };
+var copy = _arrayLikeToArray(other, 3);
+console.log(copy);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn removes_helper_whose_last_calls_were_consumed_inside_functions() {
+    let input = r#"
+function _arrayLikeToArray(arr, len) {
+  if (len == null || len > arr.length) len = arr.length;
+  for (var i = 0, arr2 = new Array(len); i < len; i++) arr2[i] = arr[i];
+  return arr2;
+}
+function a(items) {
+  var _ref = [...items];
+  var head = _ref[0];
+  var tail = _arrayLikeToArray(_ref).slice(1);
+  return [head, tail];
+}
+function b(items) {
+  var _ref = [...items];
+  var head = _ref[0];
+  var tail = _arrayLikeToArray(_ref).slice(1);
+  return [head, tail];
+}
+"#;
+    let expected = r#"
+function a(items) {
+  var [head, ...tail] = items;
+  return [head, tail];
+}
+function b(items) {
+  var [head, ...tail] = items;
+  return [head, tail];
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn pipeline_keeps_helper_called_past_an_export() {
+    let input = r#"
+function _arrayLikeToArray(arr, len) {
+  if (len == null || len > arr.length) len = arr.length;
+  for (var i = 0, arr2 = new Array(len); i < len; i++) arr2[i] = arr[i];
+  return arr2;
+}
+var _ref = [...items];
+var head = _ref[0];
+var tail = _arrayLikeToArray(_ref).slice(1);
+export { head, tail };
+var copy = _arrayLikeToArray(other, 3);
+console.log(copy);
+"#;
+    let output = common::render_pipeline(input);
+    assert!(output.contains("function _arrayLikeToArray"), "{output}");
+    assert!(output.contains("_arrayLikeToArray(other, 3)"), "{output}");
+}
+
+#[test]
+fn preserves_unproven_helper_initialization_after_consuming_its_call() {
+    let input = r#"
+const _arrayLikeToArray = createHelper();
+function demo(items) {
+  var _ref = [...items];
+  var head = _ref[0];
+  var tail = _arrayLikeToArray(_ref).slice(1);
+  return [head, tail];
+}
+"#;
+    let expected = r#"
+const _arrayLikeToArray = createHelper();
+function demo(items) {
+  var [head, ...tail] = items;
+  return [head, tail];
+}
 "#;
     assert_eq_normalized(&apply(input), expected);
 }

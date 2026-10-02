@@ -1,13 +1,12 @@
 #!/usr/bin/env node
 
+import { runNodeBatchSync } from "../lib/tool-process.mjs";
+
 import {
   runMatrix, batchRunner, terserBatch, withTerserVariants,
-  ensureNodeTool, standardLowerers,
+  ensureNodeTool, ensureTerserTool, standardLowerers,
 } from "../lib/runner.mjs";
 import { mangleValidator } from "../lib/compare.mjs";
-import { join } from "node:path";
-import { writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 
 // A recovered output should never still contain a helper *import path*: if it
 // does, an imported helper (`@swc/helpers`, `@babel/runtime`) was not folded and
@@ -175,11 +174,11 @@ const babelProfiles = [
     modes: ["spec", "loose", "iterableIsArray", "arrayLikeIsIterable"],
   },
   {
-    name: "babel-8-rc",
-    core: "8.0.0-rc.5",
-    spreadPlugin: ["@babel/plugin-transform-spread", "8.0.0-rc.5"],
-    destructuringPlugin: ["@babel/plugin-transform-destructuring", "8.0.0-rc.5"],
-    parametersPlugin: ["@babel/plugin-transform-parameters", "8.0.0-rc.5"],
+    name: "babel-8",
+    core: "8.0.6",
+    spreadPlugin: ["@babel/plugin-transform-spread", "8.0.5"],
+    destructuringPlugin: ["@babel/plugin-transform-destructuring", "8.0.5"],
+    parametersPlugin: ["@babel/plugin-transform-parameters", "8.0.5"],
     modes: ["spec", "loose", "iterableIsArray", "arrayLikeIsIterable"],
   },
 ];
@@ -211,10 +210,7 @@ function babelSpreadRestBatch(sources, profile, options) {
   ];
   const toolKey = `babel-${profile.core}-spread-destructuring-parameters`;
   const toolDir = ensureNodeTool(toolKey, packages);
-  const helper = join(toolDir, "babel-spread-rest-batch.mjs");
-  writeFileSync(
-    helper,
-    `
+  const helperSource = `
 import fs from "node:fs";
 const babelModule = await import("@babel/core");
 const spreadModule = await import(${JSON.stringify(spreadName)});
@@ -243,34 +239,20 @@ const results = sources.map(source => {
   } catch (e) { return { error: e.message }; }
 });
 process.stdout.write(JSON.stringify(results));
-`,
-  );
-  const result = spawnSync("node", [helper], {
+`;
+  return runNodeBatchSync(helperSource, sources, {
+    label: "babel-spread-rest-batch.mjs",
     cwd: toolDir,
-    input: JSON.stringify(sources),
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024 * 50,
-    env: { ...process.env, MATRIX_BABEL_OPTIONS: JSON.stringify(options) },
+    env: { MATRIX_BABEL_OPTIONS: JSON.stringify(options) },
   });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`babel batch exited ${result.status}: ${result.stderr}`);
-  const outputs = JSON.parse(result.stdout);
-  const map = new Map();
-  for (let i = 0; i < sources.length; i++) {
-    map.set(sources[i], outputs[i].error ? new Error(outputs[i].error) : outputs[i].code);
-  }
-  return map;
 }
 
 const allSources = snippets.map((s) => s.source);
 
 // Custom terser-inline transformer for array-destructure-tuple snippet
 function terserInlineBatch(sources) {
-  const toolDir = ensureNodeTool("terser", ["terser@5"]);
-  const helper = join(toolDir, "terser-inline-batch.mjs");
-  writeFileSync(
-    helper,
-    `
+  const toolDir = ensureTerserTool();
+  const helperSource = `
 import fs from "node:fs";
 import { minify } from "terser";
 const sources = JSON.parse(fs.readFileSync(0, "utf8"));
@@ -294,22 +276,11 @@ for (const source of sources) {
   } catch (e) { results.push({ error: e.message }); }
 }
 process.stdout.write(JSON.stringify(results));
-`,
-  );
-  const result = spawnSync("node", [helper], {
+`;
+  return runNodeBatchSync(helperSource, sources, {
+    label: "terser-inline-batch.mjs",
     cwd: toolDir,
-    input: JSON.stringify(sources),
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024 * 50,
   });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`terser batch exited ${result.status}: ${result.stderr}`);
-  const outputs = JSON.parse(result.stdout);
-  const map = new Map();
-  for (let i = 0; i < sources.length; i++) {
-    map.set(sources[i], outputs[i].error ? new Error(outputs[i].error) : outputs[i].code);
-  }
-  return map;
 }
 
 const babelSpecRunner = batchRunner(() => babelSpreadRestBatch(allSources, babelProfiles[2], babelModeOptions("spec")));

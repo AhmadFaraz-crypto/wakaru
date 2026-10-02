@@ -1,7 +1,14 @@
 ---
 source: crates/core/tests/un_sliced_to_array_rule.rs
-assertion_line: 518
 expression: output
 ---
-const _ref = pair;
+function c(e) {
+    if (Array.isArray(e)) {
+        return e;
+    }
+}
+function r(pair, t) {
+    return c(pair) || o(pair, t) || s(pair, t) || l();
+}
+const _ref = r(pair, 2);
 const key = _ref[0];

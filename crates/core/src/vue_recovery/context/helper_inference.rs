@@ -13,7 +13,7 @@ pub(in crate::vue_recovery) fn infer_render_helpers(
         known_helpers: &ctx.vue_helpers,
         import_ctxts: &ctx.top_level_binding_ctxts,
         unresolved_ctxt: ctx.unresolved_ctxt,
-        inferred: HashMap::new(),
+        inferred: HashMap::default(),
         prop_value_depth: 0,
         vnode_child_depth: 0,
     };
@@ -32,7 +32,7 @@ pub(in crate::vue_recovery) fn infer_render_helpers(
 }
 
 struct HelperInference<'a> {
-    candidates: &'a std::collections::HashSet<Atom>,
+    candidates: &'a crate::collections::HashSet<Atom>,
     known_helpers: &'a HashMap<Atom, VueHelper>,
     import_ctxts: &'a HashMap<Atom, SyntaxContext>,
     unresolved_ctxt: SyntaxContext,

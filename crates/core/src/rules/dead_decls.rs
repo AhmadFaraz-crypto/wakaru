@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::collections::{HashMap, HashSet};
+use std::collections::VecDeque;
 
 use swc_core::common::{BytePos, Span, DUMMY_SP};
 use swc_core::ecma::ast::{
@@ -9,7 +10,10 @@ use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use super::binding_facts::collect_binding_facts;
 use super::decl_utils::{binding_id, BindingId};
-use super::eval_utils::{direct_eval_call_source, js_source_mentions_binding, EvalCallSource};
+use super::eval_utils::{
+    direct_eval_call_source, js_source_mentions_binding, module_has_with_stmt, DirectEvalAnalyzer,
+    EvalCallSource,
+};
 use super::helper_matcher::BindingKey;
 use crate::utils::paren::strip_parens;
 
@@ -44,33 +48,52 @@ impl VisitMut for DeadDecls {
             return;
         }
 
-        let candidates: HashSet<BindingKey> = candidates_with_spans.keys().cloned().collect();
-        let alive = compute_alive(module, &candidates);
+        // A `with` statement or a direct eval with an unknown source can
+        // reach any of these declarations by name at runtime, so the module
+        // keeps them all; a known eval source protects the names it mentions
+        // (docs/rewrite-assumptions.md, dynamic-scope skip).
+        if module_has_with_stmt(module) {
+            return;
+        }
+        let mut eval = DirectEvalAnalyzer::default();
+        module.visit_with(&mut eval);
+        if eval.unknown_direct_eval {
+            return;
+        }
 
-        let mut dead: HashSet<BindingKey> = candidates
-            .into_iter()
-            .filter(|key| !alive.contains(key))
+        let mut candidates: HashSet<BindingKey> = candidates_with_spans
+            .keys()
+            .filter(|key| {
+                !eval
+                    .known_direct_eval_sources
+                    .iter()
+                    .any(|source| js_source_mentions_binding(source, &key.0))
+            })
+            .cloned()
             .collect();
 
         if let Some(pre_dead_spans) = &self.pre_dead_spans {
-            dead.retain(|key| {
-                let info = candidates_with_spans
-                    .get(key)
-                    .copied()
-                    .unwrap_or(RemovableBinding {
-                        span: DUMMY_SP,
-                        preserve_in_delta: false,
-                    });
+            // Delta mode keeps a declaration that was already dead in the
+            // input. That declaration stays in the output, so everything it
+            // references must stay reachable: drop it from the candidates so
+            // `compute_alive` treats its references as roots instead of as
+            // edges from a removable node. Otherwise a helper whose live uses
+            // a rewrite consumed, and whose only remaining calls sit inside
+            // the preserved code, is removed while those calls survive.
+            candidates.retain(|key| {
+                let info = candidates_with_spans[key];
                 if info.preserve_in_delta {
                     return false;
                 }
-                let span = info.span;
-                if span == DUMMY_SP {
-                    return true;
-                }
-                !pre_dead_spans.contains(&(span.lo, span.hi))
+                info.span == DUMMY_SP || !pre_dead_spans.contains(&(info.span.lo, info.span.hi))
             });
         }
+
+        let alive = compute_alive(module, &candidates);
+        let dead: HashSet<BindingKey> = candidates
+            .into_iter()
+            .filter(|key| !alive.contains(key))
+            .collect();
 
         if dead.is_empty() {
             return;
@@ -84,6 +107,9 @@ pub struct DeadUninitializedDecls;
 
 impl VisitMut for DeadUninitializedDecls {
     fn visit_mut_module(&mut self, module: &mut Module) {
+        if module_has_with_stmt(module) {
+            return;
+        }
         let facts = collect_binding_facts(module);
         let eval_protected = collect_eval_protected_uninitialized(module);
         let mut candidates = facts.uninitialized;
@@ -107,7 +133,7 @@ pub(crate) fn remove_consumed_uninitialized_decls(
     module: &mut Module,
     consumed: &HashSet<BindingId>,
 ) {
-    if consumed.is_empty() {
+    if consumed.is_empty() || module_has_with_stmt(module) {
         return;
     }
 
@@ -122,75 +148,6 @@ pub(crate) fn remove_consumed_uninitialized_decls(
     }
 
     module.visit_mut_with(&mut UninitializedDeclStripper { dead: &removable });
-}
-
-pub(crate) fn extend_consumed_uninitialized_expr(
-    consumed: &mut HashSet<BindingId>,
-    before: &Expr,
-    after: &Expr,
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
-) {
-    let before_refs = collect_uninitialized_refs(before, uninitialized_bindings);
-    let after_refs = collect_uninitialized_refs(after, uninitialized_bindings);
-    extend_consumed_uninitialized_refs(consumed, before_refs, after_refs, binding_references);
-}
-
-pub(crate) fn extend_consumed_uninitialized_stmt(
-    consumed: &mut HashSet<BindingId>,
-    before: &Stmt,
-    after: &Stmt,
-    uninitialized_bindings: &HashSet<BindingId>,
-    binding_references: &HashMap<BindingId, usize>,
-) {
-    let before_refs = collect_uninitialized_refs(before, uninitialized_bindings);
-    let after_refs = collect_uninitialized_refs(after, uninitialized_bindings);
-    extend_consumed_uninitialized_refs(consumed, before_refs, after_refs, binding_references);
-}
-
-fn extend_consumed_uninitialized_refs(
-    consumed: &mut HashSet<BindingId>,
-    before_refs: HashMap<BindingId, usize>,
-    after_refs: HashMap<BindingId, usize>,
-    binding_references: &HashMap<BindingId, usize>,
-) {
-    for (binding, before_count) in before_refs {
-        if after_refs.get(&binding).copied().unwrap_or(0) != 0 {
-            continue;
-        }
-        if binding_references.get(&binding).copied() == Some(before_count + 1) {
-            consumed.insert(binding);
-        }
-    }
-}
-
-fn collect_uninitialized_refs<'a, N>(
-    node: &N,
-    uninitialized_bindings: &'a HashSet<BindingId>,
-) -> HashMap<BindingId, usize>
-where
-    N: VisitWith<UninitializedRefCollector<'a>>,
-{
-    let mut collector = UninitializedRefCollector {
-        uninitialized_bindings,
-        references: HashMap::new(),
-    };
-    node.visit_with(&mut collector);
-    collector.references
-}
-
-struct UninitializedRefCollector<'a> {
-    uninitialized_bindings: &'a HashSet<BindingId>,
-    references: HashMap<BindingId, usize>,
-}
-
-impl Visit for UninitializedRefCollector<'_> {
-    fn visit_ident(&mut self, ident: &Ident) {
-        let binding = binding_id(ident);
-        if self.uninitialized_bindings.contains(&binding) {
-            *self.references.entry(binding).or_insert(0) += 1;
-        }
-    }
 }
 
 fn collect_local_undefined_initialized(module: &Module) -> HashSet<BindingId> {
@@ -245,7 +202,7 @@ fn collect_eval_protected_uninitialized(module: &Module) -> HashSet<BindingId> {
 fn collect_global_enumerated_uninitialized(module: &Module) -> HashSet<BindingId> {
     let uninitialized = collect_current_scope_uninitialized_from_module(module);
     if uninitialized.is_empty() {
-        return HashSet::new();
+        return HashSet::default();
     }
 
     let mut observer = GlobalForInObserver::default();
@@ -253,7 +210,7 @@ fn collect_global_enumerated_uninitialized(module: &Module) -> HashSet<BindingId
     if observer.found {
         uninitialized
     } else {
-        HashSet::new()
+        HashSet::default()
     }
 }
 
@@ -440,8 +397,8 @@ fn collect_current_scope_uninitialized_from_block(
 }
 
 fn compute_alive(module: &Module, candidates: &HashSet<BindingKey>) -> HashSet<BindingKey> {
-    let mut edges: HashMap<BindingKey, HashSet<BindingKey>> = HashMap::new();
-    let mut roots: HashSet<BindingKey> = HashSet::new();
+    let mut edges: HashMap<BindingKey, HashSet<BindingKey>> = HashMap::default();
+    let mut roots: HashSet<BindingKey> = HashSet::default();
 
     for item in &module.body {
         match item {
@@ -475,7 +432,7 @@ fn compute_alive(module: &Module, candidates: &HashSet<BindingKey>) -> HashSet<B
 
         let mut collector = RootRefCollector {
             candidates,
-            found: HashSet::new(),
+            found: HashSet::default(),
         };
         item.visit_with(&mut collector);
         roots.extend(collector.found);
@@ -504,7 +461,7 @@ fn collect_refs_in_node<'a, N: VisitWith<RootRefCollector<'a>>>(
 ) -> HashSet<BindingKey> {
     let mut collector = RootRefCollector {
         candidates,
-        found: HashSet::new(),
+        found: HashSet::default(),
     };
     node.visit_with(&mut collector);
     collector.found.remove(self_key);
@@ -546,7 +503,7 @@ fn is_helper_init(expr: &Expr) -> bool {
 pub(crate) fn compute_pre_dead_decl_spans(module: &Module) -> HashSet<(BytePos, BytePos)> {
     let candidates_with_spans = collect_removable_bindings_with_spans(module);
     if candidates_with_spans.is_empty() {
-        return HashSet::new();
+        return HashSet::default();
     }
     let candidates: HashSet<BindingKey> = candidates_with_spans.keys().cloned().collect();
     let alive = compute_alive(module, &candidates);
@@ -558,8 +515,8 @@ pub(crate) fn compute_pre_dead_decl_spans(module: &Module) -> HashSet<(BytePos, 
 }
 
 fn collect_removable_bindings_with_spans(module: &Module) -> HashMap<BindingKey, RemovableBinding> {
-    let mut bindings = HashMap::new();
-    let mut poisoned = HashSet::new();
+    let mut bindings = HashMap::default();
+    let mut poisoned = HashSet::default();
     for item in &module.body {
         match item {
             ModuleItem::Stmt(Stmt::Decl(Decl::Fn(fn_decl))) => {

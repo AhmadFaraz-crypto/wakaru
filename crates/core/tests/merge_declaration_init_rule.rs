@@ -18,7 +18,10 @@ fn apply_with_level(src: &str, level: RewriteLevel) -> String {
         let cm: Lrc<SourceMap> = Default::default();
         let fm = cm.new_source_file(swc_core::common::FileName::Anon.into(), src.to_string());
         let lexer = Lexer::new(
-            Syntax::Es(EsSyntax::default()),
+            Syntax::Es(EsSyntax {
+                decorators: true,
+                ..Default::default()
+            }),
             Default::default(),
             StringInput::from(&*fm),
             None,
@@ -352,4 +355,106 @@ fn inner_scope_binding_does_not_block_outer_merge() {
         "outer declaration should stay hoisted: {out}"
     );
     assert!(out.contains("x = top();"), "assignment should stay: {out}");
+}
+
+#[test]
+fn class_temporary_merges_inert_top_level_initialization() {
+    let input = "let temp; temp = class { #x = 1; getX() { return this.#x; } setX(value) { this.#x = value; } }; export const Foo = temp;";
+    let out = apply_with_level(input, RewriteLevel::Standard);
+    assert!(out.contains("const temp = class"), "got: {out}");
+    assert!(out.contains("export const Foo = temp;"), "got: {out}");
+    assert!(!out.contains("let temp;"), "got: {out}");
+}
+
+#[test]
+fn class_temporary_merges_exported_initialization() {
+    let out = apply_with_level(
+        "export let Foo; Foo = class { #x = 1; getX() { return this.#x; } };",
+        RewriteLevel::Standard,
+    );
+    assert!(out.contains("export const Foo = class"), "got: {out}");
+}
+
+#[test]
+fn class_temporary_allows_deferred_instance_work() {
+    let out = apply_with_level(
+        "let temp; temp = class { value = createValue(); #x = makeX(); constructor(value = initial()) { use(value); } method(arg = fallback()) { return use(arg); } #read() { return this.#x; } static ready() { return true; } }; use(temp);",
+        RewriteLevel::Standard,
+    );
+    assert!(out.contains("const temp = class"), "got: {out}");
+}
+
+#[test]
+fn class_temporary_preserves_definition_time_work_and_self_references() {
+    for class in [
+        "class extends Base {}",
+        "class extends getBase() {}",
+        "class { [key()]() {} }",
+        "class { [key()] = 1; }",
+        "class { static value = observe(); }",
+        "class { static #value = observe(); }",
+        "class { static { observe(); } }",
+        "class { @decorate value = 1; }",
+        "class { @decorate method() {} }",
+        "class { method() { return temp; } }",
+        "class { #value = temp; }",
+        "class Named { method() { return Named; } }",
+    ] {
+        let input = format!("let temp; temp = {class}; export const Foo = temp;");
+        let out = apply_with_level(&input, RewriteLevel::Standard);
+        assert!(
+            out.contains("let temp;"),
+            "must retain split initialization: {out}"
+        );
+    }
+}
+
+#[test]
+fn class_temporary_keeps_adjacency_boundary() {
+    for between in ["observe();", "let other;", "function observe() {}"] {
+        let input = format!("let temp; {between} temp = class {{}}; export const Foo = temp;");
+        let out = apply_with_level(&input, RewriteLevel::Standard);
+        assert!(
+            out.contains("let temp;"),
+            "must retain separated initialization: {out}"
+        );
+    }
+    let out = apply_with_level(
+        "let temp; if (flag) { temp = class {}; } else { temp = class {}; } export const Foo = temp;",
+        RewriteLevel::Standard,
+    );
+    assert!(
+        out.contains("let temp;"),
+        "must retain branch initialization: {out}"
+    );
+}
+
+#[test]
+fn class_temporary_keeps_mutability_for_later_writes_and_eval() {
+    for later in [
+        "temp = other;",
+        "function replace() { temp = other; }",
+        "eval('temp = other');",
+        "eval(source);",
+    ] {
+        let input = format!("let temp; temp = class {{}}; export const Foo = temp; {later}");
+        let out = apply_with_level(&input, RewriteLevel::Standard);
+        assert!(
+            out.contains("let temp = class"),
+            "must retain mutable binding: {out}"
+        );
+        assert!(
+            out.contains("export const Foo = temp;"),
+            "must retain snapshot: {out}"
+        );
+    }
+}
+
+#[test]
+fn class_temporary_distinguishes_shadowed_references() {
+    let out = apply_with_level(
+        "let temp; temp = class { method(temp) { return temp; } }; function f() { let temp; temp = other; } export const Foo = temp;",
+        RewriteLevel::Standard,
+    );
+    assert!(out.contains("const temp = class"), "got: {out}");
 }

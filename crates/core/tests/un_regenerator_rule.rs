@@ -1144,6 +1144,58 @@ use(load_user);
 }
 
 #[test]
+fn esbuild_async_helper_with_deconflicted_name() {
+    // A bundle holding several `__async` copies renames all but one:
+    // esbuild to `__async2`, rollup to `__async$1`.
+    let input = r#"
+var __async$1 = (__this, __arguments, generator) => new Promise((resolve) => {
+  step((generator = generator.apply(__this, __arguments)).next());
+});
+function load_user(app_id) {
+  return __async$1(this, arguments, function* () {
+    var response = yield fetch_user(app_id);
+    return response;
+  });
+}
+var __async2 = (__this, __arguments, generator) => new Promise((resolve) => {
+  step((generator = generator.apply(__this, __arguments)).next());
+});
+function load_team(team_id) {
+  return __async2(this, arguments, function* () {
+    return yield fetch_team(team_id);
+  });
+}
+var __asyncX = (__this, __arguments, generator) => new Promise((resolve) => {
+  step((generator = generator.apply(__this, __arguments)).next());
+});
+function other(app_id) {
+  return __asyncX(this, arguments, function* () {
+    return yield fetch_user(app_id);
+  });
+}
+"#;
+    let expected = r#"
+async function load_user(app_id) {
+  var response = await fetch_user(app_id);
+  return response;
+}
+async function load_team(team_id) {
+  return await fetch_team(team_id);
+}
+var __asyncX = (__this, __arguments, generator) => new Promise((resolve) => {
+  step((generator = generator.apply(__this, __arguments)).next());
+});
+function other(app_id) {
+  return __asyncX(this, arguments, function* () {
+    return yield fetch_user(app_id);
+  });
+}
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
 fn esbuild_async_function_helper() {
     let input = r#"
 var __async = (__this, __arguments, generator) => new Promise((resolve) => {
@@ -2527,6 +2579,81 @@ function myGen(cond) {
 }
 
 #[test]
+fn nested_callback_param_sharing_the_state_name_is_not_state_control_flow() {
+    // The callback's `e` is a different binding from the state parameter `e`.
+    // Its `.next` assignment inside the `if` block is ordinary code, not a
+    // state jump, so the generator must still be recovered.
+    let input = r#"
+var _marked = regeneratorRuntime.mark(myGen);
+function myGen(items) {
+  return regeneratorRuntime.wrap(function(e) {
+    while (true) {
+      switch (e.prev = e.next) {
+        case 0:
+          if (items) {
+            items.forEach(function(e) {
+              e.next = null;
+            });
+          }
+          e.next = 3;
+          return first;
+        case 3:
+        case "end":
+          return e.stop();
+      }
+    }
+  }, _marked, this);
+}
+"#;
+    let expected = r#"
+function* myGen(items) {
+  if (items) {
+    items.forEach(function(e) {
+      e.next = null;
+    });
+  }
+  yield first;
+}
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn nested_callback_param_sharing_the_state_name_is_not_a_catch_call() {
+    // `e.catch(noop)` belongs to the callback's own `e`, so the missing
+    // try-region table does not block recovery.
+    let input = r#"
+var _marked = regeneratorRuntime.mark(myGen);
+function myGen(promise) {
+  return regeneratorRuntime.wrap(function(e) {
+    while (true) {
+      switch (e.prev = e.next) {
+        case 0:
+          e.next = 2;
+          return promise.then(function(e) {
+            return e.catch(noop);
+          });
+        case 2:
+        case "end":
+          return e.stop();
+      }
+    }
+  }, _marked, this);
+}
+"#;
+    let expected = r#"
+function* myGen(promise) {
+  yield promise.then(function(e) {
+    return e.catch(noop);
+  });
+}
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
 fn bail_on_async_to_gen_with_inner_params() {
     // _asyncToGenerator wrapping a function with params is not real Babel output.
     // Transforming it would drop the params and leave unbound references.
@@ -3042,4 +3169,565 @@ function gen() {
         output.contains(".wrap"),
         "out-of-range region slot must preserve the wrapper:\n{output}"
     );
+}
+
+#[test]
+fn swc_then_typescript_namespace_generator_restores_async() {
+    let input = include_str!("fixtures/mixed-async/generated.js");
+    let output = apply(input);
+    assert!(output.contains("async function load"), "{output}");
+    assert!(output.contains("await Promise.resolve(value)"), "{output}");
+    assert!(!output.contains("_async_to_generator"), "{output}");
+    assert!(!output.contains("tslib_1.__generator"), "{output}");
+}
+
+#[test]
+fn mixed_generator_namespace_requires_unchanged_binding() {
+    let input = include_str!("fixtures/mixed-async/generated.js");
+    for changed in [
+        input.replace("function load(value)", "function load(value, tslib_1)"),
+        format!("{input}\ntslib_1 = custom;"),
+    ] {
+        let output = apply(&changed);
+        assert!(output.contains("tslib_1.__generator"), "{output}");
+        assert!(!output.contains("async function load"), "{output}");
+    }
+}
+
+#[test]
+fn swc_namespace_async_helpers_recover_without_calling_the_namespace() {
+    for declaration in [
+        "var helper = require(\"@swc/helpers/_/_async_to_generator\");",
+        "const helper = require(\"@swc/helpers/_/_async_to_generator\");",
+        "import * as helper from \"@swc/helpers/_/_async_to_generator\";",
+    ] {
+        let input = format!("{declaration} function load(value) {{ return helper._(function*() {{ return yield value; }})(); }}");
+        assert_eq_normalized(
+            &apply(&input),
+            "async function load(value) { return await value; }",
+        );
+        let invalid = format!("{declaration} function load(value) {{ return helper(function*() {{ return yield value; }})(); }}");
+        let output = apply(&invalid);
+        assert!(!output.contains("async function load"), "{output}");
+        assert!(output.contains("helper(function*"), "{output}");
+    }
+}
+
+#[test]
+fn swc_namespace_async_recovery_preserves_unproven_or_mutated_callees() {
+    for prefix in [
+        "var helper = require(\"other-package\");",
+        "var helper = require(\"@swc/helpers/_/_extends\");",
+        "var helper = require(\"@swc/helpers/_/_async_to_generator\"); helper = custom;",
+        "var helper = require(\"@swc/helpers/_/_async_to_generator\"); var helper = custom;",
+        "var helper = require(\"@swc/helpers/_/_async_to_generator\"); function replace() { helper = custom; }",
+        "var helper = require(\"@swc/helpers/_/_async_to_generator\"); helper._ = custom;",
+        "var helper = require(\"@swc/helpers/_/_async_to_generator\"); delete helper._;",
+        "var helper = require(\"@swc/helpers/_/_async_to_generator\"); Object.defineProperty(helper, \"_\", { value: custom });",
+        "var helper = require(\"@swc/helpers/_/_async_to_generator\"); with (scope) { observe(); }",
+        "var helper = require(\"@swc/helpers/_/_async_to_generator\"); eval(code);",
+        "function require(path) { return custom; } var helper = require(\"@swc/helpers/_/_async_to_generator\");",
+    ] {
+        let input = format!("{prefix} function load(value) {{ return helper._(function*() {{ return yield value; }})(); }}");
+        let output = apply(&input);
+        assert!(!output.contains("async function load"), "{output}");
+        assert!(output.contains("helper._(function*"), "{output}");
+    }
+}
+
+#[test]
+fn swc_namespace_async_recovery_respects_shadowing_and_remaining_calls() {
+    let prefix = "var helper = require(\"@swc/helpers/_/_async_to_generator\");";
+    let input = format!("{prefix} function load(helper, value) {{ return helper._(function*() {{ return yield value; }})(); }}");
+    assert!(!apply(&input).contains("async function load"));
+    let input = format!("{prefix} function other(helper) {{ helper._ = custom; }} function load(value) {{ return helper._(function*() {{ return yield value; }})(); }}");
+    assert!(apply(&input).contains("async function load"));
+    let input = format!("{prefix} function load(value) {{ return helper._(function*() {{ return yield value; }})(); }} consume(helper._(unknown));");
+    let output = apply(&input);
+    assert!(output.contains("async function load"), "{output}");
+    assert!(output.contains("helper._(unknown)"), "{output}");
+    assert!(
+        output.contains("require(\"@swc/helpers/_/_async_to_generator\")"),
+        "{output}"
+    );
+}
+
+#[test]
+fn swc_external_then_typescript_namespace_generator_restores_async() {
+    for input in [
+        include_str!("fixtures/mixed-async/external-generated.js"),
+        include_str!("fixtures/mixed-async/external-es2015.js"),
+    ] {
+        let output = render(input);
+        assert!(output.contains("async function load"), "{output}");
+        assert!(output.contains("await Promise.resolve(value)"), "{output}");
+        assert!(!output.contains("_async_to_generator"), "{output}");
+        assert!(!output.contains("__generator"), "{output}");
+    }
+}
+
+#[test]
+fn swc_async_namespace_pipeline_retains_mutations_and_unsupported_calls() {
+    let prefix = r#"var helper = require("@swc/helpers/_/_async_to_generator");"#;
+    for effect in [
+        "helper = custom;",
+        "helper._ = custom;",
+        "delete helper._;",
+        "eval(code);",
+    ] {
+        let input = format!("{prefix} {effect} exports.load = function(value) {{ return helper._(function*() {{ return yield value; }})(); }};");
+        let output = render(&input);
+        assert!(!output.contains("async function"), "{output}");
+        assert!(
+            output.contains("require(\"@swc/helpers/_/_async_to_generator\")"),
+            "{output}"
+        );
+        assert!(output.contains("helper._(function*"), "{output}");
+    }
+    let input = format!("{prefix} function load(value) {{ return helper._(function*() {{ return yield value; }})(); }} consume(helper._(unknown));");
+    let output = render(&input);
+    assert!(output.contains("async function load"), "{output}");
+    assert!(output.contains("import * as helper"), "{output}");
+    assert!(output.contains("helper._(unknown)"), "{output}");
+    let input = format!("{prefix} exports.load = function(value) {{ return helper(function*() {{ return yield value; }})(); }};");
+    let output = render(&input);
+    assert!(!output.contains("async function"), "{output}");
+    assert!(output.contains("helper(function*"), "{output}");
+}
+
+#[test]
+fn catch_binding_avoids_names_the_machine_already_spells() {
+    // `error` is a parameter the catch body reads; the synthesized catch
+    // parameter must not reuse its spelling.
+    let input = r#"
+var _marked = regeneratorRuntime.mark(g);
+function g(error) {
+  return regeneratorRuntime.wrap(function(_ctx) {
+    while (true) {
+      switch (_ctx.prev = _ctx.next) {
+        case 0:
+          _ctx.prev = 0;
+          _ctx.next = 3;
+          return doThing();
+        case 3:
+          _ctx.next = 8;
+          break;
+        case 5:
+          _ctx.prev = 5;
+          _ctx.t0 = _ctx.catch(0);
+          handle(_ctx.t0, error);
+        case 8:
+        case "end":
+          return _ctx.stop();
+      }
+    }
+  }, _marked, null, [[0, 5]]);
+}
+"#;
+    let output = apply(input);
+    assert!(
+        output.contains("catch (error_1)"),
+        "catch binding should avoid the spelled `error`, got:\n{output}"
+    );
+    assert!(
+        output.contains("handle(error_1, error)"),
+        "caught value should use the fresh name, got:\n{output}"
+    );
+}
+
+// ── try regions entered through a conditional jump ──────────────────────────
+
+#[test]
+fn guarded_try_catch_stays_inside_its_branch() {
+    // regenerator output for `if (loader.lazy) { try { yield ... } catch
+    // (error) { ... } } else { ... }`. The try entry `_context.prev = 1` sits
+    // in the middle of case 0 because nothing jumps to label 1; the region
+    // must still be rebuilt inside the guarded branch instead of being
+    // dropped, which would run the catch body after every yield.
+    let input = r#"
+var _marked = regeneratorRuntime.mark(load_resource);
+function load_resource(loader, path, options) {
+  return regeneratorRuntime.wrap(function load_resource$(_context) {
+    while (1) switch (_context.prev = _context.next) {
+      case 0:
+        if (!loader.lazy) {
+          _context.next = 11;
+          break;
+        }
+        _context.prev = 1;
+        _context.next = 4;
+        return loader.load(path, options);
+      case 4:
+        _context.next = 9;
+        break;
+      case 6:
+        _context.prev = 6;
+        _context.t0 = _context["catch"](1);
+        report_error(_context.t0);
+      case 9:
+        _context.next = 12;
+        break;
+      case 11:
+        loader.load(path, options).catch(report_error);
+      case 12:
+      case "end":
+        return _context.stop();
+    }
+  }, _marked, null, [[1, 6]]);
+}
+"#;
+    let expected = r#"
+function* load_resource(loader, path, options) {
+  if (loader.lazy) {
+    try {
+      yield loader.load(path, options);
+    } catch (error) {
+      report_error(error);
+    }
+  } else {
+    loader.load(path, options).catch(report_error);
+  }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn guarded_try_catch_without_else_is_recovered() {
+    let input = r#"
+var _marked = regeneratorRuntime.mark(load_resource);
+function load_resource(loader, path, options) {
+  return regeneratorRuntime.wrap(function load_resource$(_context) {
+    while (1) switch (_context.prev = _context.next) {
+      case 0:
+        if (!loader.lazy) {
+          _context.next = 9;
+          break;
+        }
+        _context.prev = 1;
+        _context.next = 4;
+        return loader.load(path, options);
+      case 4:
+        _context.next = 9;
+        break;
+      case 6:
+        _context.prev = 6;
+        _context.t0 = _context["catch"](1);
+        report_error(_context.t0);
+      case 9:
+      case "end":
+        return _context.stop();
+    }
+  }, _marked, null, [[1, 6]]);
+}
+"#;
+    let expected = r#"
+function* load_resource(loader, path, options) {
+  if (loader.lazy) {
+    try {
+      yield loader.load(path, options);
+    } catch (error) {
+      report_error(error);
+    }
+  }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn guarded_try_catch_stays_inside_its_branch_in_new_runtime() {
+    // Babel 7.28+ `_regenerator().w` shape of the same source: `_context.p = 1`
+    // marks the try entry mid-case, the caught value arrives in `_context.v`.
+    let input = r#"
+var _marked = _regenerator().m(load_resource);
+function load_resource(loader, path, options) {
+  var _t;
+  return _regenerator().w(function (_context) {
+    while (1) switch (_context.p = _context.n) {
+      case 0:
+        if (!loader.lazy) {
+          _context.n = 5;
+          break;
+        }
+        _context.p = 1;
+        _context.n = 2;
+        return loader.load(path, options);
+      case 2:
+        _context.n = 4;
+        break;
+      case 3:
+        _context.p = 3;
+        _t = _context.v;
+        report_error(_t);
+      case 4:
+        _context.n = 6;
+        break;
+      case 5:
+        loader.load(path, options).catch(report_error);
+      case 6:
+        return _context.a(2);
+    }
+  }, _marked, null, [[1, 3]]);
+}
+"#;
+    let expected = r#"
+function* load_resource(loader, path, options) {
+  var _t;
+  if (loader.lazy) {
+    try {
+      yield loader.load(path, options);
+    } catch (error) {
+      report_error(error);
+    }
+  } else {
+    loader.load(path, options).catch(report_error);
+  }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn guarded_try_catch_without_else_is_recovered_in_new_runtime() {
+    let input = r#"
+var _marked = _regenerator().m(load_resource);
+function load_resource(loader, path, options) {
+  var _t;
+  return _regenerator().w(function (_context) {
+    while (1) switch (_context.p = _context.n) {
+      case 0:
+        if (!loader.lazy) {
+          _context.n = 4;
+          break;
+        }
+        _context.p = 1;
+        _context.n = 2;
+        return loader.load(path, options);
+      case 2:
+        _context.n = 4;
+        break;
+      case 3:
+        _context.p = 3;
+        _t = _context.v;
+        report_error(_t);
+      case 4:
+        return _context.a(2);
+    }
+  }, _marked, null, [[1, 3]]);
+}
+"#;
+    let expected = r#"
+function* load_resource(loader, path, options) {
+  var _t;
+  if (loader.lazy) {
+    try {
+      yield loader.load(path, options);
+    } catch (error) {
+      report_error(error);
+    }
+  }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn try_entry_after_statement_keeps_yield_inside_try() {
+    // `started = start_timer(); try { yield ... } catch ...`: regenerator
+    // numbers the try entry (`_context.prev = 1`) after the first statement
+    // without starting a new case, so the yield belongs to label 1, inside
+    // the region, not to case 0.
+    let input = r#"
+var _marked = regeneratorRuntime.mark(load_resource);
+function load_resource(loader, path) {
+  var started;
+  return regeneratorRuntime.wrap(function load_resource$(_context) {
+    while (1) switch (_context.prev = _context.next) {
+      case 0:
+        started = start_timer();
+        _context.prev = 1;
+        _context.next = 4;
+        return loader.load(path);
+      case 4:
+        _context.next = 9;
+        break;
+      case 6:
+        _context.prev = 6;
+        _context.t0 = _context["catch"](1);
+        report_error(_context.t0, started);
+      case 9:
+      case "end":
+        return _context.stop();
+    }
+  }, _marked, null, [[1, 6]]);
+}
+"#;
+    let expected = r#"
+function* load_resource(loader, path) {
+  var started;
+  started = start_timer();
+  try {
+    yield loader.load(path);
+  } catch (error) {
+    report_error(error, started);
+  }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn try_entry_after_statement_keeps_yield_inside_try_in_new_runtime() {
+    let input = r#"
+var _marked = _regenerator().m(load_resource);
+function load_resource(loader, path) {
+  var started, _t;
+  return _regenerator().w(function (_context) {
+    while (1) switch (_context.p = _context.n) {
+      case 0:
+        started = start_timer();
+        _context.p = 1;
+        _context.n = 2;
+        return loader.load(path);
+      case 2:
+        _context.n = 4;
+        break;
+      case 3:
+        _context.p = 3;
+        _t = _context.v;
+        report_error(_t, started);
+      case 4:
+        return _context.a(2);
+    }
+  }, _marked, null, [[1, 3]]);
+}
+"#;
+    let expected = r#"
+function* load_resource(loader, path) {
+  var started, _t;
+  started = start_timer();
+  try {
+    yield loader.load(path);
+  } catch (error) {
+    report_error(error, started);
+  }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn context_temp_slots_become_locals() {
+    // Babel parks a value that must survive a yield in `_context.tN`. Once the
+    // state callback is gone those slots have no object to live on; each one
+    // becomes a local of the recovered function.
+    let input = r#"
+function fetch_json() {
+  return _fetch_json.apply(this, arguments);
+}
+function _fetch_json() {
+  _fetch_json = _asyncToGenerator(regeneratorRuntime.mark(function _callee(url) {
+    var response, payload;
+    return regeneratorRuntime.wrap(function _callee$(_context) {
+      while (1) switch (_context.prev = _context.next) {
+        case 0:
+          _context.next = 2;
+          return fetch(url);
+        case 2:
+          response = _context.sent;
+          if (!is_json(response)) {
+            _context.next = 9;
+            break;
+          }
+          _context.next = 6;
+          return response.json();
+        case 6:
+          _context.t0 = _context.sent;
+          _context.next = 12;
+          break;
+        case 9:
+          _context.next = 11;
+          return response.text();
+        case 11:
+          _context.t0 = _context.sent;
+        case 12:
+          payload = _context.t0;
+          return _context.abrupt("return", { data: payload });
+        case 14:
+        case "end":
+          return _context.stop();
+      }
+    }, _callee);
+  }));
+  return _fetch_json.apply(this, arguments);
+}
+"#;
+    let output = render(input);
+    assert!(!output.contains("_context"), "{output}");
+    assert!(output.contains("let t0;"), "{output}");
+    assert!(output.contains("t0 = yield response.json();"), "{output}");
+    assert!(output.contains("t0 = yield response.text();"), "{output}");
+    assert!(output.contains("payload = t0;"), "{output}");
+}
+
+#[test]
+fn recovered_async_function_keeps_an_exported_helper() {
+    let input = r#"
+var __async = (__this, __arguments, generator) => new Promise((resolve) => {
+  step((generator = generator.apply(__this, __arguments)).next());
+});
+function load_user(app_id) {
+  return __async(this, arguments, function* () { return yield fetch_user(app_id); });
+}
+export { __async };
+"#;
+    let output = apply(input);
+    assert!(output.contains("async function load_user"), "{output}");
+    assert!(output.contains("var __async ="), "{output}");
+    assert!(output.contains("export { __async }"), "{output}");
+}
+
+#[test]
+fn generator_drops_discarded_catch_value_read() {
+    // Babel 7.28 stores the caught value in `_t`. When the catch body never
+    // uses it, Terser drops the unused temp and keeps a bare `_context.v`
+    // read. That read is how the machine hands over the error, not a
+    // statement of the original catch body.
+    let input = r#"
+var _marked = _regenerator().m(toggle);
+function toggle(p) {
+  var t;
+  return _regenerator().w(function (_context) {
+    while (1) switch (_context.p = _context.n) {
+      case 0:
+        t = p.paused;
+        _context.p = 1;
+        _context.n = 2;
+        return p.play();
+      case 2:
+        _context.n = 4;
+        break;
+      case 3:
+        _context.p = 3;
+        _context.v;
+      case 4:
+        if (t) p.pause();
+      case 5:
+        return _context.a(2);
+    }
+  }, _marked, null, [[1, 3]]);
+}
+"#;
+    let expected = r#"
+function* toggle(p) {
+  var t;
+  t = p.paused;
+  try {
+    yield p.play();
+  } catch (error) {}
+  if (t) p.pause();
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
 }

@@ -1,5 +1,5 @@
 use swc_core::atoms::Atom;
-use swc_core::ecma::ast::{Callee, Expr, Lit};
+use swc_core::ecma::ast::{Callee, Expr, Lit, Module, WithStmt};
 use swc_core::ecma::visit::{Visit, VisitWith};
 
 use super::expr_utils::strip_transparent_types;
@@ -9,6 +9,21 @@ pub(crate) enum EvalCallSource {
     NoSource,
     Known(String),
     Unknown,
+}
+
+#[derive(Default)]
+pub(crate) struct DirectEvalPresence {
+    pub(crate) found: bool,
+}
+
+impl Visit for DirectEvalPresence {
+    fn visit_call_expr(&mut self, call: &swc_core::ecma::ast::CallExpr) {
+        if direct_eval_call_source(call).is_some() {
+            self.found = true;
+            return;
+        }
+        call.visit_children_with(self);
+    }
 }
 
 #[derive(Default)]
@@ -185,4 +200,84 @@ pub(crate) fn js_source_mentions_binding(source: &str, name: &Atom) -> bool {
 
 fn is_js_ident_part(ch: char) -> bool {
     ch == '$' || ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+/// Whether the module contains a `with` statement anywhere. Compilers never
+/// emit one, so a module-wide check is the agreed stand-in for a with-scope
+/// model: a rule that reads a free name as the global, renames a binding, or
+/// introduces one skips the module instead (see the dynamic-scope section of
+/// `docs/rewrite-assumptions.md`).
+pub(crate) fn module_has_with_stmt(module: &Module) -> bool {
+    struct Finder(bool);
+    impl Visit for Finder {
+        fn visit_with_stmt(&mut self, _: &WithStmt) {
+            self.0 = true;
+        }
+    }
+    let mut finder = Finder(false);
+    module.visit_with(&mut finder);
+    finder.0
+}
+
+/// Whether `node` contains a `with` statement or a direct `eval` call
+/// anywhere. This is the coarse module-wide skip from the dynamic-scope
+/// policy for a rule that removes, renames, or introduces bindings and
+/// cannot cheaply name every binding a known eval source could mention;
+/// rules that can, use `DirectEvalAnalyzer` with `js_source_mentions_binding`
+/// and keep the known-source best effort instead.
+pub(crate) fn has_dynamic_scope_construct<T>(node: &T) -> bool
+where
+    T: VisitWith<DynamicScopeConstructFinder> + ?Sized,
+{
+    let mut finder = DynamicScopeConstructFinder::default();
+    node.visit_with(&mut finder);
+    finder.found
+}
+
+#[derive(Default)]
+pub(crate) struct DynamicScopeConstructFinder {
+    found: bool,
+}
+
+impl Visit for DynamicScopeConstructFinder {
+    fn visit_with_stmt(&mut self, _: &WithStmt) {
+        self.found = true;
+    }
+
+    fn visit_call_expr(&mut self, call: &swc_core::ecma::ast::CallExpr) {
+        if self.found {
+            return;
+        }
+        if is_direct_eval_call(call) {
+            self.found = true;
+            return;
+        }
+        call.visit_children_with(self);
+    }
+
+    fn visit_stmt(&mut self, stmt: &swc_core::ecma::ast::Stmt) {
+        if !self.found {
+            stmt.visit_children_with(self);
+        }
+    }
+}
+
+/// The module-wide skip from the dynamic-scope policy for a rule that
+/// synthesizes a reference to the global `name` (`undefined`, `Infinity`).
+/// The printed name has no static proof of resolving to the global once a
+/// `with` statement or a direct `eval` can add bindings at runtime, so the
+/// rule leaves the module untouched. A direct `eval` whose source is a known
+/// string blocks only when that source mentions `name`, matching the
+/// name-mention best effort binding-oriented rules use.
+pub(crate) fn module_blocks_global_reference(module: &Module, name: &str) -> bool {
+    if module_has_with_stmt(module) {
+        return true;
+    }
+    let mut analyzer = DirectEvalAnalyzer::default();
+    module.visit_with(&mut analyzer);
+    analyzer.unknown_direct_eval
+        || analyzer
+            .known_direct_eval_sources
+            .iter()
+            .any(|source| js_source_mentions_binding(source, &Atom::from(name)))
 }

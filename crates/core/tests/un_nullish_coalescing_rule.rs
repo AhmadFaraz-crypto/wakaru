@@ -535,3 +535,81 @@ var v = (G = B.broadcast) === null || G === undefined || G;"#;
         "should transform when temp is only used in pattern: {output}"
     );
 }
+
+#[test]
+fn preserves_let_temp_declared_after_the_pattern() {
+    // Same proof as UnOptionalChaining: an uninitialized `let` declared after
+    // the pattern is in its TDZ there; the input throws ReferenceError.
+    let input = r#"
+const x = (n = foo) !== null && n !== void 0 ? n : "bar";
+let n;
+use(x);
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn preserves_parameter_used_as_coalescing_temp() {
+    // Sloppy-mode `arguments` aliases the parameter, so its write is observable.
+    let input = r#"
+function read(n) {
+  const x = (n = foo) !== null && n !== void 0 ? n : "bar";
+  return [x, arguments[0]];
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn preserves_redeclared_coalescing_temp() {
+    let input = r#"
+var n;
+var n;
+const x = (n = foo) !== null && n !== void 0 ? n : "bar";
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn transforms_loose_coalescing_temp_used_only_in_pattern() {
+    let input = r#"
+var n;
+const x = (n = foo) != null ? n : "bar";
+"#;
+    let output = apply(input);
+    assert!(output.contains(r#"foo ?? "bar""#), "{output}");
+}
+
+#[test]
+fn preserves_exported_coalescing_temp() {
+    // Importers read the live `n` binding, so its write is observable.
+    let input = r#"
+export var n;
+export const x = (n = foo) !== null && n !== void 0 ? n : "bar";
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn removes_the_declaration_of_a_consumed_temp() {
+    let input = r#"
+var n;
+const x = (n = foo) !== null && n !== void 0 ? n : "bar";
+"#;
+    let expected = r#"
+const x = foo ?? "bar";
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn keeps_the_declaration_when_one_of_two_sites_is_not_rewritten() {
+    // The second site reads `n` outside a pattern, so neither site may drop
+    // its write and the declaration stays.
+    let input = r#"
+var n;
+const x = (n = foo) !== null && n !== void 0 ? n : "bar";
+const y = n;
+"#;
+    assert_eq_normalized(&apply(input), input);
+}

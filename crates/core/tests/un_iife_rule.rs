@@ -1,6 +1,6 @@
 mod common;
 
-use common::{assert_eq_normalized, render_pipeline, render_rule};
+use common::{assert_eq_normalized, render_pipeline, render_pipeline_until, render_rule};
 use wakaru_core::{rules::UnIife, RewriteLevel};
 
 fn apply(input: &str) -> String {
@@ -73,7 +73,7 @@ fn iife_literal_args_extracted_to_const_when_no_arguments_usage() {
 "#;
     // i, s rename; o, g, r literals become const decls; a, m have no args.
     let expected = r#"
-!((window_1, document_1, a, m) => {
+((window_1, document_1, a, m) => {
   const O = 'script';
   const g = 'https://www.google-analytics.com/analytics.js';
   const r = 'ga';
@@ -526,6 +526,39 @@ fn iife_arg_with_shorter_name_not_renamed() {
     assert_eq_normalized(&output, expected);
 }
 
+#[test]
+fn iife_two_char_arg_not_renamed() {
+    // A two-char arg is as minified as the param. Copying it would only add a
+    // `_1` suffix and hide the param from later naming rules.
+    let input = r#"
+(function(e, t) {
+  e.value = t.name;
+})(et, doc);
+"#;
+    let expected = r#"
+(function(e, doc_1) {
+  e.value = doc_1.name;
+})(et, doc);
+"#;
+    assert_eq_normalized(&apply_rule(input), expected);
+}
+
+#[test]
+fn iife_nan_and_infinity_args_not_renamed() {
+    // `NaN` and `Infinity` name values, not roles; `NaN_1` says nothing.
+    let input = r#"
+(function(e, t, n) {
+  use(e, t, n);
+})(NaN, Infinity, win);
+"#;
+    let expected = r#"
+(function(e, t, win_1) {
+  use(e, t, win_1);
+})(NaN, Infinity, win);
+"#;
+    assert_eq_normalized(&apply_rule(input), expected);
+}
+
 /// When the arg's name collides with a binding in the IIFE body's function
 /// scope, inlining is unsafe; substituting body refs would clash with the
 /// existing `const path`. Fall back to a renamed param with a `_N` suffix so
@@ -571,10 +604,12 @@ const value = 1;
 const path = "abc";
 const value = 1;
 ((path_1, value_1) => {
-  const inner = (e) => e * 2;
+  const inner = (path) => path * 2;
   return inner(path_1) + value_1;
 })(path, value);
 "#;
+    // `inner` stays a separate binding; SmartRename later names its
+    // parameter after the only argument it receives.
     let output = apply(input);
     assert_eq_normalized(&output, expected);
 }
@@ -692,7 +727,7 @@ const Super = function() {};
 "#;
     let expected = r#"
 function Ctor() {}
-const Super = () => {};
+const Super = function() {};
 ((e, t) => {
   e.prototype = Object.create(t && t.prototype, {
     constructor: {
@@ -705,7 +740,9 @@ const Super = () => {};
   t && (Object.setPrototypeOf ? Object.setPrototypeOf(e, t) : e.__proto__ = t);
 })(Ctor, Super);
 "#;
-    let output = apply(input);
+    // The class rule matches this shape, so check what reaches it; the
+    // cleanup UnConditionals pass may expand it afterwards.
+    let output = render_pipeline_until(input, "UnEs6Class");
     assert_eq_normalized(&output, expected);
 }
 
@@ -731,10 +768,30 @@ fn minimal_still_strips_dot_call_on_arrow() {
 
 #[test]
 fn iife_dot_call_on_arrow_with_null_this_arg_stripped() {
-    // The thisArg value doesn't matter for arrows — strip regardless.
+    // An arrow ignores the thisArg value, so an effect-free one can go.
     let input = r#"((a) => { f(a); }).call(null, x);"#;
     let output = apply_rule(input);
     assert_eq_normalized(&output, r#"((a) => { f(a); })(x);"#);
+}
+
+#[test]
+fn iife_dot_call_on_arrow_with_effect_free_this_args_stripped() {
+    for this_arg in ["void 0", "undefined", "exports", "0"] {
+        let input = format!("((a) => {{ f(a); }}).call({this_arg}, x);");
+        let output = apply_rule(&input);
+        assert_eq_normalized(&output, r#"((a) => { f(a); })(x);"#);
+    }
+}
+
+#[test]
+fn iife_dot_call_on_arrow_keeps_effectful_this_arg() {
+    // Stripping would drop the thisArg's evaluation: its side effects, or an
+    // exception from a getter.
+    for this_arg in ["sideEffect()", "obj.prop", "(log(), this)", "x = 1"] {
+        let input = format!("((a) => {{ f(a); }}).call({this_arg}, y);");
+        let output = apply_rule(&input);
+        assert_eq_normalized(&output, &input);
+    }
 }
 
 #[test]
@@ -779,4 +836,355 @@ fn iife_dot_call_module_21_pipeline_strips_wrapper() {
 "#;
     let output = apply(input);
     insta::assert_snapshot!(output);
+}
+
+// --- spread arguments break the positional argument/parameter pairing ---
+
+#[test]
+fn literal_after_spread_argument_is_not_paired_with_a_parameter() {
+    // `...xs` has a runtime length: `3` initializes `c` when `xs` has two
+    // elements, not `b`. Pairing it with `b` returned `[1, 2]` for `[1, 3]`.
+    let input = r#"
+function run(xs) {
+  return (function(a, b, c) { return [a, c]; })(...xs, 3);
+}
+"#;
+    // Only the printer's parenthesization differs from the input.
+    let expected = r#"
+function run(xs) {
+  return function(a, b, c) {
+    return [a, c];
+  }(...xs, 3);
+}
+"#;
+    assert_eq_normalized(&apply_rule(input), expected);
+}
+
+#[test]
+fn identifier_after_spread_argument_is_not_renamed_into_a_parameter() {
+    let input = r#"
+function run(xs, value) {
+  return (function(a, b) { return [a, b]; })(...xs, value);
+}
+"#;
+    let expected = r#"
+function run(xs, value) {
+  return function(a, b) {
+    return [a, b];
+  }(...xs, value);
+}
+"#;
+    assert_eq_normalized(&apply_rule(input), expected);
+}
+
+#[test]
+fn literal_before_spread_argument_is_still_extracted() {
+    // Positions before the spread are exact; only the tail is unknown.
+    let input = r#"
+function run(xs) {
+  return (function(a, b, c) { return [a, b, c]; })(1, ...xs);
+}
+"#;
+    let expected = r#"
+function run(xs) {
+  return function(b, c) {
+    const a = 1;
+    return [a, b, c];
+  }(...xs);
+}
+"#;
+    assert_eq_normalized(&apply_rule(input), expected);
+}
+
+#[test]
+fn renamed_param_stays_visible_to_a_later_param_default() {
+    // The default `r = t` reads a sibling parameter. Renaming `t` to
+    // `locale_1` must rewrite that read too, or the default dangles.
+    let input = r#"
+((e, t, r = t, n) => {
+  if (!a(e)) return e;
+  return t !== r && n != null ? u(e, n) : e;
+})(href, locale, g, prefix);
+"#;
+    let expected = r#"
+((href_1, locale_1, r = locale_1, prefix_1) => {
+  if (!a(href_1)) return href_1;
+  return locale_1 !== r && prefix_1 != null ? u(href_1, prefix_1) : href_1;
+})(href, locale, g, prefix);
+"#;
+    assert_eq_normalized(&apply_rule(input), expected);
+}
+
+#[test]
+fn literal_param_read_by_a_later_param_default_stays_a_param() {
+    // Extracting `e` into a body `const` would leave the default `t = e`
+    // reading an undeclared name: parameter defaults cannot see body bindings.
+    let input = r#"
+(function(e, t = e) {
+  use(e, t);
+})(1, x);
+"#;
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn parameter_rename_preserves_shorthand_keys_in_defaults_and_body() {
+    for input in [
+        "((e, t = {e}) => { use(t.e, {e}); })(source);",
+        "(function(e, t = {e}) { use(t.e, {e}); })(source);",
+    ] {
+        let expected = input
+            .replace("(e, t = {e})", "(source_1, t = {e: source_1})")
+            .replace("use(t.e, {e})", "use(t.e, {e: source_1})");
+        assert_eq_normalized(&apply_rule(input), &expected);
+    }
+}
+
+#[test]
+fn parameter_rename_avoids_bindings_inside_default_functions() {
+    for input in [
+        "((e, t = (source_1) => e) => { use(t(2)); })(source);",
+        "(function(e, t = function(source_1) { return e; }) { use(t(2)); })(source);",
+    ] {
+        let expected = input
+            .replace("(e, t =", "(source_2, t =")
+            .replace("=> e)", "=> source_2)")
+            .replace("return e;", "return source_2;");
+        assert_eq_normalized(&apply_rule(input), &expected);
+    }
+}
+
+#[test]
+fn with_statement_keeps_iife_params_module_wide() {
+    // A `with` anywhere in the module blocks param renames and literal
+    // extraction (docs/rewrite-assumptions.md, dynamic-scope skip); the eval
+    // side is already handled per IIFE body.
+    let input = r#"
+(function(e) {
+  use(e);
+})(1);
+with (scope) { observe(); }
+"#;
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn named_fn_expr_reenter_call_keeps_literal_param() {
+    // A named function expression used as an IIFE may still be invoked again
+    // with a different argument. Baking the IIFE literal into `const a = 0`
+    // would make later `o(next)` drop that argument.
+    let input = r#"
+(function o(a) {
+  if (a < 2) {
+    return o(a + 1);
+  }
+  return a;
+})(0);
+"#;
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn named_fn_expr_reenter_new_keeps_literal_param() {
+    let input = r#"
+(function o(a) {
+  return new o(a + 1);
+})(0);
+"#;
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn named_fn_expr_reenter_dot_call_keeps_literal_param() {
+    let input = r#"
+(function o(a) {
+  return o.call(null, a + 1);
+})(0);
+"#;
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn named_fn_expr_escape_keeps_literal_param() {
+    let input = r#"
+(function o(a) {
+  later(o);
+  return a;
+})(0);
+"#;
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn named_fn_expr_eval_mentioning_name_keeps_literal_param() {
+    // Known eval source can invoke the function name even though the body has
+    // no identifier use of that binding.
+    let input = r#"
+(function o(a) {
+  eval("o(1)");
+  use(a);
+})(0);
+"#;
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn named_fn_expr_typeof_name_keeps_literal_param() {
+    // Any live use of the function-name binding is fail-closed: `typeof o`
+    // does not prove later code cannot observe a fresh call through eval or
+    // an aliased binding we did not reconstruct.
+    let input = r#"
+(function o(a) {
+  use(typeof o, a);
+})(0);
+"#;
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn unused_named_fn_expr_still_extracts_literal_param() {
+    // A name kept only for stack traces is not a re-entry. Extraction stays.
+    let input = r#"
+(function o(a) {
+  use(a);
+})(0);
+"#;
+    let expected = r#"
+(function o() {
+  const a = 0;
+  use(a);
+})();
+"#;
+    assert_eq_normalized(&apply_rule(input), expected);
+}
+
+#[test]
+fn shadowed_named_fn_expr_still_extracts_literal_param() {
+    // Inner `var o` is a different binding after resolver. The function name
+    // is unused, so the IIFE literal is still a single-invocation snapshot.
+    let input = r#"
+(function o(a) {
+  var o = helper;
+  use(a, o);
+})(0);
+"#;
+    let expected = r#"
+(function o() {
+  const a = 0;
+  var o = helper;
+  use(a, o);
+})();
+"#;
+    assert_eq_normalized(&apply_rule(input), expected);
+}
+
+#[test]
+fn nested_param_shadowing_named_fn_expr_still_extracts_literal_param() {
+    // Nested `function inner(o)` is not the IIFE name. Compare binding
+    // identity, not the printed short name.
+    let input = r#"
+(function o(a) {
+  function inner(o) {
+    o(1);
+  }
+  use(a);
+})(0);
+"#;
+    let expected = r#"
+(function o() {
+  const a = 0;
+  function inner(o) {
+    o(1);
+  }
+  use(a);
+})();
+"#;
+    assert_eq_normalized(&apply_rule(input), expected);
+}
+
+#[test]
+fn named_fn_expr_reenter_still_renames_ident_arg() {
+    // Ident args stay parameters. Recursion must still receive the renamed
+    // binding; do not skip the rename path just because the name re-enters.
+    let input = r#"
+(function o(a) {
+  return o(next);
+})(start);
+"#;
+    let expected = r#"
+(function o(start_1) {
+  return o(next);
+})(start);
+"#;
+    assert_eq_normalized(&apply_rule(input), expected);
+}
+
+#[test]
+fn paren_named_fn_expr_reenter_keeps_literal_param() {
+    let input = r#"
+(function o(a) {
+  return o(next);
+})(0);
+"#;
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn named_fn_expr_reenter_keeps_mutated_literal_param() {
+    let input = r#"
+(function o(a) {
+  a += 1;
+  return o(a);
+})(0);
+"#;
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn named_fn_expr_reenter_from_param_default_keeps_literal_param() {
+    // The name binding is visible in parameter initializers. `b = o` can
+    // invoke the function again after the IIFE snapshot; extracting `a`
+    // would freeze it and shift later arguments onto `b`.
+    let input = r#"
+(function o(a, b = o) {
+  return a === 0 ? b(1) : a;
+})(0);
+"#;
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn named_fn_expr_eval_in_param_default_keeps_literal_param() {
+    // Known eval in a default can invoke the name even when the body never
+    // mentions it.
+    let input = r#"
+(function o(a, b = eval("o")) {
+  use(a, b);
+})(0);
+"#;
+    assert_eq_normalized(&apply_rule(input), input);
+}
+
+#[test]
+fn drops_discarded_bang_and_void_prefix_from_iife_statements() {
+    // `!` and `void` on a discarded result have no effect. `+`, `-`, and `~`
+    // run ToNumber, which can call `valueOf`, so they stay.
+    let input = r#"
+!function() { a(); }();
+void function() { b(); }();
+!(() => { c(); })();
++function() { d(); }();
+var x = !function() { e(); }();
+!f();
+"#;
+    let expected = r#"
+(function() { a(); })();
+(function() { b(); })();
+(() => { c(); })();
++function() { d(); }();
+var x = !function() { e(); }();
+!f();
+"#;
+    let output = apply_rule_with_level(input, RewriteLevel::Minimal);
+    assert_eq_normalized(&output, expected);
 }

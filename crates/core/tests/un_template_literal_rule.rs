@@ -1,6 +1,8 @@
 mod common;
 
-use common::{assert_eq_normalized, render, render_rule};
+use common::{assert_eq_normalized, inspect_rule_output, render, render_rule};
+use swc_core::ecma::ast::TplElement;
+use swc_core::ecma::visit::{Visit, VisitWith};
 use wakaru_core::facts::{HelperExportFact, HelperKind, ModuleFacts, ModuleFactsMap};
 use wakaru_core::rules::{RewriteLevel, UnTemplateLiteral};
 
@@ -522,4 +524,272 @@ var out = tag`hello ${name}`;
 "#;
     let output = apply(input);
     assert_eq_normalized(&output, expected);
+}
+
+// ── minimal: only syntax-proven primitive substitutions ──────────────────────
+
+#[test]
+fn minimal_keeps_plus_chain_with_unproven_substitutions() {
+    // `+` coerces with hint "default", a template with hint "string"; an
+    // identifier, member, or call may hold an object whose valueOf and
+    // toString disagree. `standard` accepts this under `string_coercion_hint`;
+    // `minimal` does not.
+    let input = r#"
+var a = "prefix: " + value;
+var b = "user " + user.name + "!";
+var c = "id=" + read();
+var d = value + " suffix";
+"#;
+    let output = apply_minimal(input);
+    assert_eq_normalized(&output, input);
+}
+
+#[test]
+fn minimal_rewrites_plus_chain_with_syntax_proven_primitive_substitutions() {
+    // Literals, arithmetic, typeof, and nested templates are primitives by
+    // syntax; ToPrimitive is the identity on them, so the rewrite is exact.
+    let input = r#"
+var a = "n=" + 1 + " ok=" + true;
+var b = "sum=" + (x + y) + " type=" + typeof z;
+var c = "neg=" + -count + " inner=" + `t${1}`;
+var d = "pick=" + (flag ? 1 : "no") + " cmp=" + (a < b);
+"#;
+    let expected = r#"
+var a = `n=${1} ok=${true}`;
+var b = `sum=${x + y} type=${typeof z}`;
+var c = `neg=${-count} inner=${`t${1}`}`;
+var d = `pick=${flag ? 1 : "no"} cmp=${a < b}`;
+"#;
+    let output = apply_minimal(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn minimal_keeps_logical_substitutions_with_unproven_operands() {
+    // `a || b` yields one operand unchanged, so it is primitive only when both
+    // operands are.
+    let input = r#"
+var a = "v=" + (value || fallback);
+var b = "v=" + (1 || "x");
+"#;
+    let expected = r#"
+var a = "v=" + (value || fallback);
+var b = `v=${1 || "x"}`;
+"#;
+    let output = apply_minimal(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn minimal_keeps_concat_chain_with_unproven_substitutions() {
+    // concat evaluates every argument before coercing any; a template
+    // interleaves the two. `standard` accepts this under
+    // `concat_coercion_order`; `minimal` does not.
+    let input = r#"
+var a = "Hello ".concat(name, "!");
+var b = "".concat(prefix, "/users/").concat(id);
+"#;
+    let output = apply_minimal(input);
+    assert_eq_normalized(&output, input);
+}
+
+#[test]
+fn minimal_rewrites_concat_chain_with_syntax_proven_primitive_substitutions() {
+    let input = r#"
+var a = "n=".concat(1, " ok=", true);
+var b = "".concat(x * 2, "/").concat(typeof y);
+"#;
+    let expected = r#"
+var a = `n=${1} ok=${true}`;
+var b = `${x * 2}/${typeof y}`;
+"#;
+    let output = apply_minimal(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn standard_rewrites_concat_chain_with_unproven_substitutions() {
+    let input = r#"
+var a = "Hello ".concat(name, "!");
+var b = "".concat(prefix, "/users/").concat(id);
+"#;
+    let expected = r#"
+var a = `Hello ${name}!`;
+var b = `${prefix}/users/${id}`;
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn tslib_template_helpers_restore_across_delivery_forms() {
+    for (prefix, helper) in [
+        ("import * as ts from 'tslib';", "ts.__makeTemplateObject"),
+        ("var ts = require('tslib');", "ts.__makeTemplateObject"),
+        ("import { __makeTemplateObject as h } from 'tslib';", "h"),
+        ("var h = require('tslib').__makeTemplateObject;", "h"),
+        ("", "require('tslib').__makeTemplateObject"),
+    ] {
+        let input = format!(
+            "{prefix} var cache; function show(value) {{ return tag(cache || (cache = {helper}(['hello ', ''], ['hello ', ''])), value); }}"
+        );
+        for output in [apply(&input), render(&input)] {
+            assert!(output.contains("tag`hello ${value}`"), "{output}");
+        }
+    }
+}
+
+#[test]
+fn tslib_template_namespace_shadowing_preserves_user_calls() {
+    let input = r#"
+import * as ts from "tslib";
+function show(ts, value) {
+    return tag(ts.__makeTemplateObject(["hello ", ""], ["hello ", ""]), value);
+}
+"#;
+    assert!(render(input).contains("ts.__makeTemplateObject("));
+}
+
+#[test]
+fn tslib_template_shadowed_require_preserves_user_calls() {
+    let input = r#"
+function show(require, value) {
+    return tag(require("tslib").__makeTemplateObject(["hello ", ""], ["hello ", ""]), value);
+}
+"#;
+    assert!(render(input).contains(".__makeTemplateObject("));
+}
+
+#[test]
+fn tslib_template_factory_restores_raw_segments() {
+    let input = r#"
+import * as ts from "tslib";
+function data() {
+    const strings = ts.__makeTemplateObject(["line\n", ""], ["line\\n", ""]);
+    data = function() { return strings; };
+    return strings;
+}
+var result = tag(data(), value);
+"#;
+    assert!(apply(input).contains("tag`line\\n${value}`"));
+}
+
+#[test]
+fn tslib_template_dynamic_lookup_and_spread_arguments_are_preserved() {
+    let input = r#"
+var ts = require("tslib");
+with (scope) {
+    tag(ts.__makeTemplateObject(["hello"], ["hello"]));
+}
+tag(ts.__makeTemplateObject(...args));
+"#;
+    let output = apply(input);
+    assert!(output.contains(".__makeTemplateObject(["), "{output}");
+    assert!(
+        output.contains(".__makeTemplateObject(...args)"),
+        "{output}"
+    );
+}
+
+#[test]
+fn tslib_template_factory_is_kept_when_module_has_dynamic_scope() {
+    // Restoring the tagged template consumes the helper, cache, and factory
+    // bindings; the module-wide dynamic-scope skip applies even when the
+    // hazard sits outside the `with` body.
+    for hazard in ["eval(code);", "with (scope) { observe(); }"] {
+        let input = format!(
+            r#"
+var ts = require("tslib");
+{hazard}
+function data() {{
+    const strings = ts.__makeTemplateObject(["line\n", ""], ["line\\n", ""]);
+    data = function() {{ return strings; }};
+    return strings;
+}}
+var result = tag(data(), value);
+"#
+        );
+        let output = apply(&input);
+        assert!(output.contains("__makeTemplateObject"), "{output}");
+        assert!(!output.contains("tag`"), "{output}");
+    }
+}
+
+#[test]
+fn concat_chain_recovery_ignores_dynamic_scope() {
+    // `.concat` to template recovery touches no binding, so it stays active.
+    let input = "with (scope) { observe(); }\nconst s = 'a'.concat(b, 'c');\n";
+    let output = apply(input);
+    assert!(output.contains("`a${b}c`"), "{output}");
+}
+
+/// The input text each template quasi's span starts at, in source order.
+fn quasi_span_starts(input: &str) -> Vec<Option<String>> {
+    struct Quasis(Vec<swc_core::common::Span>);
+    impl Visit for Quasis {
+        fn visit_tpl_element(&mut self, node: &TplElement) {
+            self.0.push(node.span);
+        }
+    }
+    inspect_rule_output(
+        input,
+        |_| UnTemplateLiteral::new(),
+        |module, text| {
+            let mut quasis = Quasis(Vec::new());
+            module.visit_with(&mut quasis);
+            quasis
+                .0
+                .into_iter()
+                .map(|span| {
+                    text.starting_at(span)
+                        .map(|rest| rest.chars().take(4).collect())
+                })
+                .collect()
+        },
+    )
+}
+
+#[test]
+fn template_quasis_keep_the_spans_of_their_string_literals() {
+    // Plus chain: each quasi starts at its own literal. The concat call's
+    // empty head quasi has no literal and keeps the whole call's span.
+    assert_eq!(
+        quasi_span_starts(r#"a = "x: " + U + "'"; b = "".concat(G, "-1", "!");"#),
+        [
+            Some(r#""x: "#.to_string()),
+            Some(r#""'";"#.to_string()),
+            Some(r#""".c"#.to_string()),
+            Some(r#""-1""#.to_string()),
+        ]
+    );
+}
+
+#[test]
+fn keeps_concatenation_with_lone_surrogate_strings() {
+    // A lone surrogate has no UTF-8 form; converting it to template text
+    // would replace it with U+FFFD and change the string.
+    let input = r#"
+var a = "(" + head + ")|[\uD800-\uDBFF][\uDC00-\uDFFF]" + tail;
+var b = "x\uDC00".concat(n);
+"#;
+    // The inner `"(" + head` has no surrogate and still becomes a template.
+    let expected = r#"
+var a = `(${head}` + ")|[\uD800-\uDBFF][\uDC00-\uDFFF]" + tail;
+var b = "x\uDC00".concat(n);
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn keeps_tagged_template_with_lone_surrogate_cooked_string() {
+    let input = r#"
+function _tagged_template_literal(strings, raw) { return strings; }
+var out = tag(_tagged_template_literal(["\uD800", ""]), name);
+"#;
+    let output = apply(input);
+    assert!(
+        !output.contains('\u{FFFD}'),
+        "lone surrogate must not become U+FFFD: {output}"
+    );
 }

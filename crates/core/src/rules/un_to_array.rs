@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use swc_core::common::Mark;
 use swc_core::ecma::ast::{
@@ -8,7 +8,8 @@ use swc_core::ecma::ast::{
 use swc_core::ecma::visit::{VisitMut, VisitMutWith};
 
 use super::helper_matcher::{
-    binding_key, collect_refs, remaining_refs_outside_declarations, remove_fn_decls_by_binding,
+    binding_key, collect_refs, remaining_refs_outside_declarations,
+    removable_without_remaining_refs, remove_fn_decls_by_binding,
     remove_import_specifiers_by_binding, remove_var_declarators_by_binding, BindingKey,
 };
 use super::transpiler_helper_utils::collect_maybe_array_like_bindings;
@@ -82,8 +83,7 @@ impl VisitMut for UnToArray {
             let mut replacer = ToArrayUnwrapper { helpers: &helpers };
             module.visit_mut_with(&mut replacer);
 
-            let remaining = remaining_refs_outside_declarations(module, &helpers, &helpers);
-            let removable: HashSet<BindingKey> = helpers.difference(&remaining).cloned().collect();
+            let removable = removable_without_remaining_refs(module, &helpers);
             if !removable.is_empty() {
                 remove_import_specifiers_by_binding(&mut module.body, &removable);
                 remove_fn_decls_by_binding(module, &removable);
@@ -228,11 +228,15 @@ fn is_array_rest_assign_target(target: &AssignTarget) -> bool {
     arr.elems.iter().any(|e| matches!(e, Some(Pat::Rest(_))))
 }
 
-fn collect_to_array_bindings(
+/// Bindings proven to hold the `toArray` helper by import path or
+/// `require("…toArray")`. Shared with `UnDestructuring`, which consumes the
+/// helper as a nested-pattern materialization before this rule strips the
+/// outer call.
+pub(crate) fn collect_to_array_bindings(
     module: &Module,
     unresolved_mark: Option<Mark>,
 ) -> HashSet<BindingKey> {
-    let mut bindings = HashSet::new();
+    let mut bindings = HashSet::default();
 
     for item in &module.body {
         match item {
@@ -364,7 +368,7 @@ fn helper_dependency_closure(
     roots: &HashSet<BindingKey>,
     candidate_decls: &[(BindingKey, HashSet<BindingKey>)],
 ) -> HashSet<BindingKey> {
-    let mut reachable = HashSet::new();
+    let mut reachable = HashSet::default();
     let mut stack: Vec<_> = roots.iter().cloned().collect();
 
     while let Some(key) = stack.pop() {

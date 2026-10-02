@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
@@ -365,7 +365,7 @@ pub fn is_likely_vue_sfc_source(source: &str) -> Result<bool> {
         let unresolved_mark = Mark::new();
         let top_level_mark = Mark::new();
         module.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, false));
-        let mut ctx = collect_context(&module, cm, HashMap::new(), HashMap::new());
+        let mut ctx = collect_context(&module, cm, HashMap::default(), HashMap::default());
         ctx.unresolved_ctxt = SyntaxContext::empty().apply_mark(unresolved_mark);
         let Some(render) = find_render_source(&module, None) else {
             return Ok(false);
@@ -551,7 +551,7 @@ fn collect_imported_vue_metadata(
     resolve_import: &mut dyn FnMut(&str) -> Option<String>,
 ) -> Result<ImportedVueMetadata> {
     let mut metadata = ImportedVueMetadata::default();
-    let mut export_cache: HashMap<String, ResolvedImportMetadata> = HashMap::new();
+    let mut export_cache: HashMap<String, ResolvedImportMetadata> = HashMap::default();
 
     for item in &module.body {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
@@ -650,10 +650,10 @@ fn collect_imported_vue_metadata(
 fn directive_exports_from_source(source: &str) -> HashMap<String, String> {
     let cm: Lrc<SourceMap> = Default::default();
     let Ok(module) = parse_module(source, cm) else {
-        return HashMap::new();
+        return HashMap::default();
     };
     let local_directives = local_directive_bindings(&module);
-    let mut exported = HashMap::new();
+    let mut exported = HashMap::default();
 
     for item in &module.body {
         match item {
@@ -702,7 +702,7 @@ fn directive_exports_from_source(source: &str) -> HashMap<String, String> {
 }
 
 fn local_directive_bindings(module: &Module) -> HashMap<String, String> {
-    let mut bindings = HashMap::new();
+    let mut bindings = HashMap::default();
     for item in &module.body {
         let var = match item {
             ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) => var,
@@ -747,14 +747,14 @@ fn directive_name_from_init(expr: &Expr) -> Option<String> {
 fn vue_helper_exports_from_source(source: &str) -> HashSet<String> {
     let cm: Lrc<SourceMap> = Default::default();
     let Ok(module) = parse_module(source, cm) else {
-        return HashSet::new();
+        return HashSet::default();
     };
     let wrapper_exports = exported_vue_helper_wrapper_names(&module);
     if !wrapper_exports.is_empty() {
         return wrapper_exports;
     }
     if !is_likely_vue_runtime_module(&module) {
-        return HashSet::new();
+        return HashSet::default();
     }
     exported_binding_names(&module)
 }
@@ -762,11 +762,11 @@ fn vue_helper_exports_from_source(source: &str) -> HashSet<String> {
 fn exported_vue_helper_wrapper_names(module: &Module) -> HashSet<String> {
     let imported = imported_binding_names(module);
     if imported.is_empty() {
-        return HashSet::new();
+        return HashSet::default();
     }
 
-    let mut local_wrappers = HashSet::new();
-    let mut exported = HashSet::new();
+    let mut local_wrappers = HashSet::default();
+    let mut exported = HashSet::default();
     for item in &module.body {
         match item {
             ModuleItem::Stmt(Stmt::Decl(Decl::Fn(function)))
@@ -811,7 +811,7 @@ fn exported_vue_helper_wrapper_names(module: &Module) -> HashSet<String> {
 }
 
 fn imported_binding_names(module: &Module) -> HashSet<Atom> {
-    let mut imported = HashSet::new();
+    let mut imported = HashSet::default();
     for item in &module.body {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
             continue;
@@ -934,7 +934,7 @@ fn is_vue_runtime_marker_name(name: &str) -> bool {
 }
 
 fn exported_binding_names(module: &Module) -> HashSet<String> {
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
     for item in &module.body {
         match item {
             ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => match &export.decl {
@@ -1036,7 +1036,7 @@ fn component_exports_from_module(module: &Module) -> HashMap<String, String> {
 }
 
 fn collect_local_component_bindings(module: &Module) -> HashMap<Atom, String> {
-    let mut component_bindings = HashMap::new();
+    let mut component_bindings = HashMap::default();
 
     for item in &module.body {
         let (ModuleItem::Stmt(Stmt::Decl(Decl::Var(var)))
@@ -1068,7 +1068,7 @@ fn collect_component_exports(
     module: &Module,
     component_bindings: &HashMap<Atom, String>,
 ) -> HashMap<String, String> {
-    let mut exports = HashMap::new();
+    let mut exports = HashMap::default();
 
     for item in &module.body {
         let ModuleItem::ModuleDecl(decl) = item else {
@@ -1326,7 +1326,7 @@ fn setup_render_source_from_component_expr<'a>(
     expr: &'a Expr,
     component_name: &str,
 ) -> Option<RenderSource<'a>> {
-    let component_bindings = HashMap::new();
+    let component_bindings = HashMap::default();
     if component_name_from_init(expr, &component_bindings).as_deref() != Some(component_name) {
         return None;
     }
@@ -1438,7 +1438,7 @@ fn component_scope_render_sources<'a>(module: &'a Module) -> Vec<RenderSource<'a
 }
 
 fn local_function_decls(module: &Module) -> HashMap<Atom, &FnDecl> {
-    let mut functions = HashMap::new();
+    let mut functions = HashMap::default();
     for item in &module.body {
         match item {
             ModuleItem::Stmt(Stmt::Decl(Decl::Fn(function)))
@@ -1455,7 +1455,7 @@ fn local_function_decls(module: &Module) -> HashMap<Atom, &FnDecl> {
 }
 
 fn local_component_options(module: &Module) -> HashMap<Atom, &ObjectLit> {
-    let mut options = HashMap::new();
+    let mut options = HashMap::default();
     for item in &module.body {
         match item {
             ModuleItem::Stmt(Stmt::Decl(Decl::Var(var)))
@@ -1977,7 +1977,7 @@ fn render_setup_local_declarations(
         component_imports,
     );
     let mut rendered = Vec::new();
-    let mut rendered_module_bindings = HashSet::new();
+    let mut rendered_module_bindings = HashSet::default();
     for declaration in local_declarations {
         if declaration.module_scope {
             if declaration
@@ -2013,7 +2013,7 @@ fn script_local_binding_aliases(
     ref_declarations: &[(String, String, String)],
     component_imports: &[VueComponentScriptImport],
 ) -> HashMap<Atom, Atom> {
-    let mut used = HashSet::new();
+    let mut used = HashSet::default();
     used.extend(ctx.script_imports.keys().cloned());
     used.extend(component_imports.iter().map(|import| import.local.clone()));
     used.extend(
@@ -2052,8 +2052,8 @@ fn script_local_binding_aliases(
             .flat_map(|declaration| declaration.emitted_bindings.iter().cloned()),
     );
 
-    let mut aliases = HashMap::new();
-    let mut seen_module_bindings = HashSet::new();
+    let mut aliases = HashMap::default();
+    let mut seen_module_bindings = HashSet::default();
     for declaration in local_declarations {
         if !declaration.module_scope {
             continue;

@@ -3,18 +3,18 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "1.10.0"
+version = "1.13.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/pionxzh/wakaru"
 
 [workspace.dependencies]
-wakaru = { version = "=1.10.0", path = "crates/wakaru" }
-wakaru-core = { version = "=1.10.0", path = "crates/core" }
+wakaru = { version = "=1.13.0", path = "crates/wakaru" }
+wakaru-core = { version = "=1.13.0", path = "crates/core" }
 wakaru-formatter = { path = "crates/formatter" }
 anyhow = "1.0"
 sourcemap = "9"
-swc_core = { version = "=77.0.0", features = [
+swc_core = { version = "=78.0.2", features = [
   "common",
   "ecma_ast",
   "ecma_codegen",
@@ -43,3 +43,14 @@ strip = "symbols"
 inherits = "release"
 lto = "thin"
 codegen-units = 16
+
+# Optimized CLI for output checks that rebuild after every edit (the
+# wakaru-fixtures runner, reproduction matrices). Without LTO and with
+# incremental codegen, a one-rule change relinks in well under half the
+# dev-release time. Use dev-release or release for performance numbers.
+[profile.dev-opt]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 256
+incremental = true

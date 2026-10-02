@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use swc_core::common::DUMMY_SP;
@@ -61,7 +61,7 @@ pub(super) fn recover_component_attrs(
 ) -> Result<Vec<VueAttr>> {
     let model_modifiers = match expr {
         Expr::Object(object) => component_model_modifiers(object),
-        _ => HashMap::new(),
+        _ => HashMap::default(),
     };
     Ok(collapse_component_model_attrs(
         recover_attrs_for_owner(expr, ctx, AttrOwner::Component)?,

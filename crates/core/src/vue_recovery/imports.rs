@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::common::{sync::Lrc, SourceMap};
@@ -24,13 +24,13 @@ pub(super) fn composable_ref_props_from_source(source: &str) -> HashMap<String, 
     }
 
     let Some(result) = crate::unpacker::unpack_bundle(source) else {
-        return HashMap::new();
+        return HashMap::default();
     };
     if result.modules.len() != 1 {
-        return HashMap::new();
+        return HashMap::default();
     }
     let Some(module) = result.modules.into_iter().next() else {
-        return HashMap::new();
+        return HashMap::default();
     };
     let cm: Lrc<SourceMap> = Default::default();
     parse_module(&module.code, cm)
@@ -75,10 +75,10 @@ fn local_injected_composable_ref_props(
 ) -> HashMap<Atom, HashSet<Atom>> {
     let mut values = local_ref_props.values();
     let Some(provider_ref_props) = values.next() else {
-        return HashMap::new();
+        return HashMap::default();
     };
     if values.next().is_some() {
-        return HashMap::new();
+        return HashMap::default();
     }
 
     local_function_likes(module)
@@ -234,7 +234,7 @@ fn collect_decl_function_likes<'a>(decl: &'a Decl, functions: &mut Vec<(Atom, Fu
 }
 
 fn ref_returning_function_bindings(functions: &[(Atom, FunctionLike<'_>)]) -> HashSet<Atom> {
-    let mut ref_returning = HashSet::new();
+    let mut ref_returning = HashSet::default();
     loop {
         let mut changed = false;
         for (binding, function) in functions {
@@ -267,7 +267,7 @@ fn function_returns_ref_like(
 
 fn function_value_write_bindings(function: FunctionLike<'_>) -> HashSet<Atom> {
     let mut collector = ValueWriteCollector {
-        bindings: HashSet::new(),
+        bindings: HashSet::default(),
     };
     match function {
         FunctionLike::Function(function) => {
@@ -385,7 +385,7 @@ fn composable_ref_props_from_function(
         return None;
     }
 
-    let mut ref_props = HashSet::new();
+    let mut ref_props = HashSet::default();
     for expr in function_return_exprs(function) {
         let Some(object) = returned_object_expr(&expr) else {
             continue;
@@ -408,11 +408,11 @@ pub(super) fn composable_ref_props_from_iife_call(expr: &Expr) -> Option<HashSet
     };
     match unwrap_paren_expr(callee.as_ref()) {
         Expr::Arrow(arrow) => {
-            composable_ref_props_from_function(FunctionLike::Arrow(arrow), &HashSet::new())
+            composable_ref_props_from_function(FunctionLike::Arrow(arrow), &HashSet::default())
         }
         Expr::Fn(function) => composable_ref_props_from_function(
             FunctionLike::Function(&function.function),
-            &HashSet::new(),
+            &HashSet::default(),
         ),
         _ => None,
     }
@@ -447,7 +447,7 @@ fn composable_local_ref_bindings(
 
 fn function_value_member_bindings(function: FunctionLike<'_>) -> HashSet<Atom> {
     let mut collector = ValueMemberCollector {
-        bindings: HashSet::new(),
+        bindings: HashSet::default(),
     };
     match function {
         FunctionLike::Function(function) => {
@@ -464,7 +464,7 @@ fn function_value_member_bindings(function: FunctionLike<'_>) -> HashSet<Atom> {
 
 fn function_strong_value_member_bindings(function: FunctionLike<'_>) -> HashSet<Atom> {
     let mut collector = StrongValueMemberCollector {
-        bindings: HashSet::new(),
+        bindings: HashSet::default(),
         shadowed: Vec::new(),
     };
     match function {
@@ -597,7 +597,7 @@ impl Visit for StrongValueMemberCollector {
 }
 
 fn block_shadowed_bindings(stmts: &[Stmt]) -> HashSet<Atom> {
-    let mut bindings = HashSet::new();
+    let mut bindings = HashSet::default();
     for stmt in stmts {
         if let Stmt::Decl(decl) = stmt {
             collect_decl_bound_atoms(decl, &mut bindings);
@@ -624,7 +624,7 @@ fn collect_decl_bound_atoms(decl: &Decl, bindings: &mut HashSet<Atom>) {
 }
 
 fn pat_bound_atoms(pat: &Pat) -> HashSet<Atom> {
-    let mut bindings = HashSet::new();
+    let mut bindings = HashSet::default();
     collect_pat_bound_atoms(pat, &mut bindings);
     bindings
 }
@@ -690,7 +690,7 @@ impl Visit for ValueMemberCollector {
 
 fn function_called_bindings(function: FunctionLike<'_>) -> HashSet<Atom> {
     let mut collector = CalledBindingCollector {
-        bindings: HashSet::new(),
+        bindings: HashSet::default(),
     };
     match function {
         FunctionLike::Function(function) => {
@@ -728,7 +728,7 @@ fn function_tuple_ref_bindings(
     let mut collector = TupleRefBindingCollector {
         value_member_refs,
         called_bindings,
-        refs: HashSet::new(),
+        refs: HashSet::default(),
         tuple_member_aliases: Vec::new(),
     };
     match function {
@@ -892,7 +892,7 @@ fn object_ref_props(
     local_ref_bindings: &HashSet<Atom>,
     ref_returning_functions: &HashSet<Atom>,
 ) -> HashSet<Atom> {
-    let mut ref_props = HashSet::new();
+    let mut ref_props = HashSet::default();
     for prop in &object.props {
         let PropOrSpread::Prop(prop) = prop else {
             continue;
@@ -1001,7 +1001,7 @@ fn composable_ref_prop_exports(
     local_ref_props: &HashMap<Atom, HashSet<Atom>>,
     ref_returning_functions: &HashSet<Atom>,
 ) -> HashMap<String, HashSet<Atom>> {
-    let mut exports = HashMap::new();
+    let mut exports = HashMap::default();
     for item in &module.body {
         let ModuleItem::ModuleDecl(decl) = item else {
             continue;

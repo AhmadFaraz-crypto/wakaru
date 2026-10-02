@@ -768,8 +768,12 @@ var helper = (
 );
 "#;
     let expected = r#"
-export const first = value => value + 1;
-export const second = value => first(value);
+export const first = function(value) {
+    return value + 1;
+};
+export const second = function(value) {
+    return first(value);
+};
 consume(second(1));
 const helper = value => value;
 "#;
@@ -987,6 +991,26 @@ Object.defineProperty(exports, "rawCache", {
     let expected = r#"
 import rawCache from "./raw-cache.js";
 export { rawCache };
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn define_property_getter_to_mutable_binding_stays_live() {
+    let input = r#"
+let value = 1;
+Object.defineProperty(exports, "value", {
+  enumerable: true,
+  get() {
+    return value;
+  }
+});
+value = 2;
+"#;
+    let expected = r#"
+export let value = 1;
+value = 2;
 "#;
     let output = apply(input);
     assert_eq_normalized(&output, expected);
@@ -1329,6 +1353,41 @@ exports.foo = 1;
 }
 
 #[test]
+fn global_value_export_declares_a_local_binding() {
+    // `export { window as WIN }` would name a binding the module never
+    // declares. The CommonJS write copies the value, so a const does too.
+    let input = r#"
+exports.WIN = window;
+exports.EventTarget = EventTarget;
+"#;
+    let expected = r#"
+export const WIN = window;
+const _EventTarget = EventTarget;
+export { _EventTarget as EventTarget };
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn void_of_a_call_is_not_an_export_sentinel() {
+    // Only `void <literal>` is a placeholder. `void f()` still calls `f`, and
+    // as the last write it is the export's real value.
+    let input = r#"
+exports.foo = void first();
+exports.foo = 1;
+exports.bar = void second();
+"#;
+    let expected = r#"
+void first();
+export const foo = 1;
+export const bar = void second();
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
 fn export_dedup_preserves_dropped_rhs_evaluation() {
     let input = r#"
 exports.foo = sideEffect1();
@@ -1337,6 +1396,87 @@ exports.foo = sideEffect2();
     let expected = r#"
 sideEffect1();
 export const foo = sideEffect2();
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn dropped_default_sentinel_leaves_no_statement() {
+    // Babel declares the default export with a `void 0` placeholder before
+    // assigning the real value. Evaluating the placeholder has no effect.
+    let input = r#"
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.default = void 0;
+var _default = function (a) { return a; };
+exports.default = _default;
+module.exports = exports.default;
+"#;
+    let expected = r#"
+"use strict";
+const _default = (a)=>a;
+export default _default;
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn dropped_sequence_default_sentinel_leaves_no_statement() {
+    let input = r#"
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: !0 }), exports.default = void 0, exports.default = (a)=>a.b, module.exports = exports.default;
+"#;
+    let expected = r#"
+"use strict";
+export default ((a)=>a.b);
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn dropped_module_exports_of_hoisted_binding_leaves_no_statement() {
+    // Reading a function or `var` binding cannot throw, so the dropped
+    // `module.exports = r` needs no leftover read.
+    let input = r#"
+function r(a) { return a; }
+var s = 1;
+module.exports = r;
+module.exports.default = r;
+exports.value = s;
+exports.value = 2;
+"#;
+    let expected = r#"
+function r(a) {
+    return a;
+}
+const s = 1;
+export default r;
+export const value = 2;
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn dropped_export_keeps_read_that_can_throw() {
+    // A lexical binding read can throw before initialization, and an
+    // unresolved read can throw a ReferenceError. Keep both reads.
+    let input = r#"
+module.exports = early;
+let early = 1;
+module.exports.default = early;
+exports.other = missing;
+exports.other = 2;
+"#;
+    let expected = r#"
+early;
+let early = 1;
+export default early;
+missing;
+export const other = 2;
 "#;
     let output = apply(input);
     assert_eq_normalized(&output, expected);
@@ -2017,6 +2157,22 @@ function i(t, e = null) {
 }
 
 #[test]
+fn webpack_export_getter_to_mutable_binding_stays_live() {
+    let input = r#"
+let value = 1;
+require.d(exports, "value", () => value);
+value = 2;
+"#;
+    let expected = r#"
+let value = 1;
+value = 2;
+export { value };
+"#;
+    let output = apply(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
 fn direct_webpack_export_getter_member_return_does_not_leak_helper() {
     let input = r#"
 const effects = require("./effects.js");
@@ -2446,7 +2602,7 @@ export { _in as in };
 fn named_export_does_not_capture_existing_global_reference() {
     let input = r#"
 var marker = typeof runtime !== "undefined" && runtime.pid ? runtime.pid : "";
-module.exports = module.exports.default = function() {
+module.exports = function() {
     return marker;
 };
 module.exports.runtime = function() {
@@ -2455,8 +2611,10 @@ module.exports.runtime = function() {
 "#;
     let expected = r#"
 const marker = typeof runtime !== "undefined" && runtime.pid ? runtime.pid : "";
-export default module.exports.default = () => marker;
-const _runtime = () => marker;
+export default function() { return marker; };
+const _runtime = function() {
+    return marker;
+};
 export { _runtime as runtime };
 "#;
     let output = apply(input);
@@ -2559,7 +2717,7 @@ const r = (n = require("./dep.js")) && n.__esModule ? n : { default: n };
 function read(r) {
   return r.default;
 }
-consume(r.default, read(other));
+consume(r.default, read(other()));
 "#;
     let expected = r#"
 import r from "./dep.js";
@@ -2567,7 +2725,7 @@ let n;
 function read(r) {
   return r.default;
 }
-consume(r, read(other));
+consume(r, read(other()));
 "#;
     let output = apply(input);
     assert_eq_normalized(&output, expected);
@@ -2766,12 +2924,8 @@ module.exports.default = module.exports;
 // Producer: a CJS compiler emits a static `require(mod).Name` as a direct
 // argument of an immediately-evaluated top-level call (typically an IIFE).
 // UnEsm already converts `var x = require("mod").Name` via NamedProp; this
-// shape never reached that classifier. `.default` args stay out of scope.
+// shape never reached that classifier. `.default` args use a parallel pass.
 // ---------------------------------------------------------------------------
-
-fn leftover_require_named_member(output: &str) -> bool {
-    output.contains("require(") && output.contains(".UIBase")
-}
 
 fn apply_unesm(input: &str) -> String {
     render_pipeline_until(input, "UnEsm")
@@ -2942,7 +3096,7 @@ var keep = require("./keep.js");
 }
 
 #[test]
-fn toplevel_require_named_member_default_arg_is_out_of_scope() {
+fn toplevel_iife_require_default_member_arg_to_default_import() {
     let input = r#"
 var keep = require("./keep.js");
 (function (base) {
@@ -2951,9 +3105,52 @@ var keep = require("./keep.js");
 "#;
     let expected = r#"
 import keep from "./keep.js";
+import UIBase from "./UIBase.js";
 (function (base) {
   use(base);
-})(require("./UIBase.js").default);
+})(UIBase);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+    assert!(
+        !output.contains("require("),
+        "the hoisted default member must become an import:\n{output}"
+    );
+}
+
+#[test]
+fn toplevel_require_default_member_uses_readable_fallback_for_numeric_module_name() {
+    let input = r#"
+(function (base) {
+  use(base);
+})(require("./module-42.js").default);
+consume(require("./module-43.js").default);
+consume(require("./module-44.js").default);
+"#;
+    let expected = r#"
+import defaultExport from "./module-42.js";
+import defaultExport_1 from "./module-43.js";
+import defaultExport_2 from "./module-44.js";
+(function (base) {
+  use(base);
+})(defaultExport);
+consume(defaultExport_1);
+consume(defaultExport_2);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_avoids_readable_fallback_collision() {
+    let input = r#"
+let defaultExport = existing;
+consume(require("./module-42.js").default);
+"#;
+    let expected = r#"
+import defaultExport_1 from "./module-42.js";
+let defaultExport = existing;
+consume(defaultExport_1);
 "#;
     let output = apply_unesm(input);
     assert_eq_normalized(&output, expected);
@@ -3156,6 +3353,38 @@ observe(UIBase);
 }
 
 #[test]
+fn toplevel_require_named_member_fails_closed_on_unresolved_assignment_target() {
+    let input = r#"
+UIBase = globalValue;
+var keep = require("./keep.js");
+consume(require("./UIBase.js").UIBase);
+"#;
+    let expected = r#"
+import keep from "./keep.js";
+UIBase = globalValue;
+consume(require("./UIBase.js").UIBase);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_named_member_fails_closed_on_unresolved_jsx_tag() {
+    let input = r#"
+render(<UIBase />);
+var keep = require("./keep.js");
+consume(require("./UIBase.js").UIBase);
+"#;
+    let expected = r#"
+import keep from "./keep.js";
+render(<UIBase />);
+consume(require("./UIBase.js").UIBase);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
 fn toplevel_require_named_member_fails_closed_on_two_sources_one_local() {
     let input = r#"
 var keep = require("./keep.js");
@@ -3342,7 +3571,7 @@ consume(require("./dep.js").UIBase);
 }
 
 #[test]
-fn toplevel_require_named_member_sibling_import_does_not_recover_default_arg() {
+fn toplevel_require_default_member_sibling_named_import_does_not_block_recovery() {
     let input = r#"
 import { keep } from "./keep.js";
 (function (base) {
@@ -3351,14 +3580,1393 @@ import { keep } from "./keep.js";
 "#;
     let expected = r#"
 import { keep } from "./keep.js";
+import UIBase from "./UIBase.js";
+(function (base) {
+  use(base);
+})(UIBase);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_var_init_iife_require_default_member_arg_to_default_import() {
+    let input = r#"
+var Child = (function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+"#;
+    let expected = r#"
+import UIBase from "./UIBase.js";
+var Child = function (base) {
+  use(base);
+}(UIBase);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_iife_computed_require_default_member_arg_to_default_import() {
+    let input = r#"
+(function (base) {
+  use(base);
+})(require("./UIBase.js")["default"]);
+"#;
+    let expected = r#"
+import UIBase from "./UIBase.js";
+(function (base) {
+  use(base);
+})(UIBase);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_arg_reuses_existing_default_prop() {
+    let input = r#"
+var UIBase = require("./UIBase.js").default;
+(function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+"#;
+    let expected = r#"
+import UIBase from "./UIBase.js";
+(function (base) {
+  use(base);
+})(UIBase);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_arg_reuses_existing_default_import() {
+    let input = r#"
+import UIBase from "./UIBase.js";
+(function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+"#;
+    let expected = r#"
+import UIBase from "./UIBase.js";
+(function (base) {
+  use(base);
+})(UIBase);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_promotes_type_only_import_for_runtime_value() {
+    let input = r#"
+import type UIBase from "./UIBase.js";
+(function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+"#;
+    let output = wakaru_core::decompile(
+        input,
+        wakaru_core::DecompileOptions {
+            filename: "fixture.ts".to_string(),
+            ..Default::default()
+        },
+    )
+    .expect("TypeScript input should decompile")
+    .code;
+    let expected = r#"
+import UIBase from "./UIBase.js";
+((base) => {
+  use(base);
+})(UIBase);
+"#;
+
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_arg_reuses_existing_default_import_through_full_pipeline() {
+    let input = r#"
+import UIBase from "./UIBase.js";
+(function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+"#;
+    let expected = r#"
+import UIBase from "./UIBase.js";
+((base) => {
+  use(base);
+})(UIBase);
+"#;
+    let output = render_pipeline(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_arg_reuses_existing_default_prop_through_full_pipeline() {
+    let input = r#"
+var UIBase = require("./UIBase.js").default;
+(function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+"#;
+    let expected = r#"
+import UIBase from "./UIBase.js";
+((base) => {
+  use(base);
+})(UIBase);
+"#;
+    let output = render_pipeline(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_iife_require_default_member_arg_keeps_import_through_full_pipeline() {
+    let input = r#"
+(function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+"#;
+    let expected = r#"
+import UIBase from "./UIBase.js";
+((base) => {
+  use(base);
+})(UIBase);
+"#;
+    let output = render_pipeline(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_shares_local_across_same_source_args() {
+    let input = r#"
+(function (first) {
+  use(first);
+})(require("./UIBase.js").default);
+(function (second) {
+  use(second);
+})(require("./UIBase.js").default);
+"#;
+    let expected = r#"
+import UIBase from "./UIBase.js";
+(function (first) {
+  use(first);
+})(UIBase);
+(function (second) {
+  use(second);
+})(UIBase);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_falls_back_when_basename_matches_import() {
+    let input = r#"
+import { UIBase } from "./other.js";
+var keep = require("./keep.js");
+(function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+"#;
+    let expected = r#"
+import { UIBase } from "./other.js";
+import keep from "./keep.js";
+import defaultExport from "./UIBase.js";
+(function (base) {
+  use(base);
+})(defaultExport);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_falls_back_when_basename_matches_let() {
+    let input = r#"
+let UIBase = 0;
+var keep = require("./keep.js");
+(function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+"#;
+    let expected = r#"
+import keep from "./keep.js";
+import defaultExport from "./UIBase.js";
+let UIBase = 0;
+(function (base) {
+  use(base);
+})(defaultExport);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_falls_back_when_basename_is_unresolved() {
+    let input = r#"
+observe(UIBase);
+var keep = require("./keep.js");
+(function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+"#;
+    let expected = r#"
+import keep from "./keep.js";
+import defaultExport from "./UIBase.js";
+observe(UIBase);
+(function (base) {
+  use(base);
+})(defaultExport);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_falls_back_for_unresolved_assignment_target() {
+    let input = r#"
+UIBase = globalValue;
+consume(require("./UIBase.js").default);
+"#;
+    let expected = r#"
+import defaultExport from "./UIBase.js";
+UIBase = globalValue;
+consume(defaultExport);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_falls_back_for_named_default_declaration() {
+    let input = r#"
+export default function UIBase() {}
+consume(require("./UIBase.js").default);
+"#;
+    let expected = r#"
+import defaultExport from "./UIBase.js";
+export default function UIBase() {}
+consume(defaultExport);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_ternary_arg_is_left_alone() {
+    let input = r#"
+var keep = require("./keep.js");
+f(cond ? require("./UIBase.js").default : other);
+"#;
+    let expected = r#"
+import keep from "./keep.js";
+f(cond ? require("./UIBase.js").default : other);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_inside_then_callback_is_left_alone() {
+    let input = r#"
+var keep = require("./keep.js");
+then(function () {
+  return require("./UIBase.js").default;
+});
+"#;
+    let expected = r#"
+import keep from "./keep.js";
+then(function () {
+  return require("./UIBase.js").default;
+});
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_inside_function_body_is_left_alone() {
+    let input = r#"
+var keep = require("./keep.js");
+function wrap() {
+  (function (base) {
+    use(base);
+  })(require("./UIBase.js").default);
+}
+"#;
+    let expected = r#"
+import keep from "./keep.js";
+function wrap() {
+  (function (base) {
+    use(base);
+  })(require("./UIBase.js").default);
+}
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_dynamic_require_is_left_alone() {
+    let input = r#"
+var keep = require("./keep.js");
+(function (base) {
+  use(base);
+})(require(dyn).default);
+"#;
+    let expected = r#"
+import keep from "./keep.js";
+(function (base) {
+  use(base);
+})(require(dyn).default);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_spread_arg_is_left_alone() {
+    let input = r#"
+var keep = require("./keep.js");
+f(...require("./UIBase.js").default);
+"#;
+    let expected = r#"
+import keep from "./keep.js";
+f(...require("./UIBase.js").default);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_local_require_binding_is_left_alone() {
+    let input = r#"
+function require(x) {
+  return x;
+}
+(function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, input);
+}
+
+#[test]
+fn toplevel_require_default_member_comma_expr_arg_is_left_alone() {
+    let input = r#"
+var keep = require("./keep.js");
+(function (base) {
+  use(base);
+})((0, require("./UIBase.js").default));
+"#;
+    let expected = r#"
+import keep from "./keep.js";
+(function (base) {
+  use(base);
+})((0, require("./UIBase.js").default));
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_fails_closed_on_unknown_eval() {
+    let input = r#"
+eval(source);
+var keep = require("./keep.js");
+(function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+"#;
+    let expected = r#"
+import keep from "./keep.js";
+eval(source);
 (function (base) {
   use(base);
 })(require("./UIBase.js").default);
 "#;
     let output = apply_unesm(input);
     assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_falls_back_when_eval_mentions_basename() {
+    let input = r#"
+eval("UIBase");
+var keep = require("./keep.js");
+(function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+"#;
+    let expected = r#"
+import keep from "./keep.js";
+import defaultExport from "./UIBase.js";
+eval("UIBase");
+(function (base) {
+  use(base);
+})(defaultExport);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_fails_closed_on_eval_of_synthetic_name() {
+    let input = r#"
+import { UIBase } from "./other.js";
+eval("defaultExport");
+var keep = require("./keep.js");
+(function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+"#;
+    let expected = r#"
+import { UIBase } from "./other.js";
+import keep from "./keep.js";
+eval("defaultExport");
+(function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_early_self_read_keeps_commonjs_boundary() {
+    let input = r#"
+consume(require("./module-1.js").default);
+exports.default = 1;
+"#;
+    let output = render_pipeline_until_with_filename(input, "UnEsm", "module-1.js");
+
+    assert_eq_normalized(&output, input);
     assert!(
-        leftover_require_named_member(&output) || output.contains(".default"),
-        "a sibling named import must not recover an out-of-scope .default arg:\n{output}"
+        !output.contains("import ") && !output.contains("export "),
+        "a direct default self-read must not cross only part of its CommonJS boundary:\n{output}"
     );
+}
+
+#[test]
+fn toplevel_require_default_member_fails_closed_on_provider_member_write() {
+    let input = r#"
+consume(require("./dep.js").default);
+require("./dep.js").default = replacement;
+consume(require("./dep.js").default);
+"#;
+    let output = apply_unesm(input);
+
+    assert_eq_normalized(&output, input);
+}
+
+#[test]
+fn toplevel_require_default_member_fails_closed_on_other_provider_member_mutations() {
+    let mutations = [
+        r#"require("./dep.js").default += replacement;"#,
+        r#"require("./dep.js").default++;"#,
+        r#"delete require("./dep.js").default;"#,
+        r#"for (require("./dep.js").default in values) {}"#,
+        r#"for (require("./dep.js").default of values) {}"#,
+    ];
+
+    for mutation in mutations {
+        let input = format!(
+            r#"
+consume(require("./dep.js").default);
+{mutation}
+consume(require("./dep.js").default);
+"#
+        );
+        let output = apply_unesm(&input);
+
+        assert!(
+            !output.contains("import ")
+                && output.matches("require(\"./dep.js\").default").count() >= 2,
+            "provider mutation must keep fresh default member reads:\n{output}"
+        );
+    }
+}
+
+#[test]
+fn toplevel_require_default_member_does_not_reuse_later_default_prop() {
+    let input = r#"
+(function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+var UIBase = require("./UIBase.js").default;
+var keep = require("./keep.js");
+"#;
+    let expected = r#"
+import defaultExport from "./UIBase.js";
+import UIBase from "./UIBase.js";
+import keep from "./keep.js";
+(function (base) {
+  use(base);
+})(defaultExport);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_does_not_reuse_mutated_default_prop() {
+    let input = r#"
+var UIBase = require("./UIBase.js").default;
+UIBase = other;
+(function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+var keep = require("./keep.js");
+"#;
+    let expected = r#"
+import _UIBase from "./UIBase.js";
+import defaultExport from "./UIBase.js";
+import keep from "./keep.js";
+var UIBase = _UIBase;
+UIBase = other;
+(function (base) {
+  use(base);
+})(defaultExport);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_skips_written_binding_and_reuses_later_stable() {
+    // Basename UIBase is taken and eval mentions `defaultExport`, so recovery is
+    // only possible by reusing the later unwritten DefaultProp.
+    let input = r#"
+import { UIBase } from "./other.js";
+eval("defaultExport");
+var keep = require("./keep.js");
+var poisoned = require("./UIBase.js").default;
+poisoned = other;
+var helper = require("./UIBase.js").default;
+(function (base) {
+  use(base);
+})(require("./UIBase.js").default);
+"#;
+    let output = apply_unesm(input);
+    assert!(
+        output.contains("import keep from \"./keep.js\"")
+            && output.contains("import helper from \"./UIBase.js\"")
+            && output.contains("})(helper)")
+            && !output.contains("require(\"./UIBase.js\").default"),
+        "a later unwritten DefaultProp must still be reusable after a mutated one:\n{output}"
+    );
+}
+
+#[test]
+fn toplevel_require_default_member_does_not_reuse_local_across_provider_member_write() {
+    let input = r#"
+var UIBase = require("./dep.js").default;
+require("./dep.js").default = replacement;
+consume(require("./dep.js").default);
+"#;
+    let expected = r#"
+import UIBase from "./dep.js";
+require("./dep.js").default = replacement;
+consume(require("./dep.js").default);
+"#;
+    let output = apply_unesm(input);
+
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_named_member_failure_does_not_block_default_member() {
+    let input = r#"
+import { A } from "./other.js";
+var keep = require("./keep.js");
+(function (a) {
+  use(a);
+})(require("./A.js").A);
+(function (b) {
+  use(b);
+})(require("./B.js").default);
+"#;
+    let expected = r#"
+import { A } from "./other.js";
+import keep from "./keep.js";
+import B from "./B.js";
+(function (a) {
+  use(a);
+})(require("./A.js").A);
+(function (b) {
+  use(b);
+})(B);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn toplevel_require_default_member_failure_does_not_block_named_member() {
+    let input = r#"
+var keep = require("./keep.js");
+require("./B.js").default = replacement;
+(function (a) {
+  use(a);
+})(require("./A.js").A);
+(function (b) {
+  use(b);
+})(require("./B.js").default);
+"#;
+    let expected = r#"
+import keep from "./keep.js";
+import { A } from "./A.js";
+require("./B.js").default = replacement;
+(function (a) {
+  use(a);
+})(A);
+(function (b) {
+  use(b);
+})(require("./B.js").default);
+"#;
+    let output = apply_unesm(input);
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn stable_default_named_write_preserves_the_object_property() {
+    let input = "class Engine {} module.exports = Engine; module.exports.value = next(); observe(Engine.value);";
+    let output = render_pipeline_until(input, "UnEsm");
+    assert!(output.contains("Engine.value = next()"), "{output}");
+    assert_eq!(output.matches("next()").count(), 1, "{output}");
+    assert!(output.contains("export const value ="), "{output}");
+}
+
+#[test]
+fn stable_default_duplicate_named_writes_keep_property_effects() {
+    let input = "class Engine {} module.exports = Engine; module.exports.value = first(); observe(Engine.value); module.exports.value = void 0;";
+    let output = render_pipeline_until(input, "UnEsm");
+    assert!(output.contains("Engine.value = first()"), "{output}");
+    assert!(
+        output.contains("Engine.value = void 0") || output.contains("Engine.value = undefined"),
+        "{output}"
+    );
+}
+
+#[test]
+fn swc_async_runtime_require_preserves_its_namespace_export() {
+    let input = r#"var helper = require("@swc/helpers/_/_async_to_generator"); consume(helper._(unknown));"#;
+    assert_eq_normalized(
+        &apply_unesm(input),
+        r#"import * as helper from "@swc/helpers/_/_async_to_generator"; consume(helper._(unknown));"#,
+    );
+}
+
+#[test]
+fn swc_async_runtime_unsafe_namespace_uses_keep_the_commonjs_boundary() {
+    for effect in [
+        "helper = custom;",
+        "var helper = custom;",
+        "helper._ = custom;",
+        "delete helper._;",
+        "Object.defineProperty(helper, '_', { value: custom });",
+        "consume(helper);",
+        "with (scope) { observe(); }",
+        "eval(code);",
+        "helper(unknown);",
+    ] {
+        let input = format!(
+            r#"var helper = require("@swc/helpers/_/_async_to_generator"); {effect} exports.load = function() {{ return helper._(unknown); }};"#
+        );
+        assert_eq_normalized(&apply_unesm(&input), &input);
+    }
+}
+
+#[test]
+fn swc_async_runtime_namespace_conversion_requires_exact_unresolved_require() {
+    for input in [
+        r#"function require(path) { return custom; } var helper = require("@swc/helpers/_/_async_to_generator"); consume(helper._);"#,
+        r#"var helper = require("@swc/helpers/_/_async_to_generator/extra"); consume(helper._);"#,
+        r#"var helper = require("@swc/helpers/_/_async_to_generator", extra); consume(helper._);"#,
+    ] {
+        assert!(!apply_unesm(input).contains("import * as helper"));
+    }
+}
+
+#[test]
+fn esm_only_modules_keep_import_ordering_and_export_cleanup() {
+    let input = r#"
+import { first } from "a";
+use(first);
+import { second } from "b";
+import { third } from "a";
+var value = makeValue();
+export { value };
+var alias = value;
+export default alias;
+"#;
+    let expected = r#"
+import { first } from "a";
+import { third } from "a";
+import { second } from "b";
+use(first);
+export var value = makeValue();
+export default value;
+"#;
+    let output = common::render_rule(input, |mark| {
+        wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+    });
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn chained_export_initializers_do_not_duplicate_recovered_bindings() {
+    for root in ["exports", "module.exports"] {
+        for value in ["void 0", "undefined"] {
+            for count in [2, 3, 8] {
+                let names: Vec<_> = (0..count).map(|index| format!("value{index}")).collect();
+                let chain = names
+                    .iter()
+                    .map(|name| format!("{root}.{name} = "))
+                    .collect::<String>();
+                let declarations = names
+                    .iter()
+                    .map(|name| format!("const {name} = () => 1; {root}.{name} = {name};"))
+                    .collect::<String>();
+                let source = format!("{chain}{value}; {declarations} function dynamic(code) {{ return eval(code); }}");
+                let once = common::render_pipeline_between(&source, "UnCurlyBraces", "UnEsm");
+                let twice = common::render_pipeline_between(&once, "UnCurlyBraces", "UnEsm");
+                assert_eq_normalized(&once, &twice);
+                assert!(
+                    !once.contains("exports."),
+                    "initializer must be fully consumed: {once}"
+                );
+                let findings = validate_output_modules(&[("entry.js".into(), twice.clone())]);
+                assert!(findings.is_empty(), "{findings:?}\n{twice}");
+                for name in &names {
+                    assert!(
+                        twice.contains(&format!("export const {name} =")),
+                        "missing value: {twice}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn chained_export_initializers_preserve_effectful_and_shadowed_values() {
+    for source in [
+        "exports.left = exports.right = void sideEffect();",
+        "const undefined = sideEffect(); exports.left = exports.right = undefined;",
+        "const exports = {}; exports.left = exports.right = void 0;",
+        "const module = { exports: {} }; module.exports.left = module.exports.right = void 0;",
+    ] {
+        let output = common::render_rule(source, |mark| {
+            wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+        });
+        assert_eq!(
+            output.matches("sideEffect()").count(),
+            source.matches("sideEffect()").count(),
+            "{output}"
+        );
+        if source.starts_with("const exports") || source.starts_with("const module") {
+            assert!(
+                !output.contains("export const"),
+                "local objects are not CommonJS: {output}"
+            );
+        }
+    }
+}
+
+#[test]
+fn conditional_named_exports_become_live_bindings() {
+    for root in ["exports", "module.exports"] {
+        let source = r#"
+if (flag) {
+  $ROOT.current = first();
+} else {
+  $ROOT.current = second();
+}
+function read() {
+  return $ROOT.current();
+}
+function reset() {
+  $ROOT.current = third();
+  return $ROOT.current;
+}
+exports.snapshot = read;
+"#
+        .replace("$ROOT", root);
+        let expected = r#"
+export var current;
+if (flag) {
+  current = first();
+} else {
+  current = second();
+}
+function read() {
+  return current();
+}
+function reset() {
+  current = third();
+  return current;
+}
+export { read as snapshot };
+"#;
+
+        let output = common::render_rule(&source, |mark| {
+            wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+        });
+        assert_eq_normalized(&output, expected);
+    }
+}
+
+#[test]
+fn leading_conditional_export_sentinels_are_removed() {
+    let source = r#"
+"use strict";
+import dependency from "./dependency.js";
+function readDependency() {
+  return dependency;
+}
+exports.current = void 0;
+module.exports.ready = undefined;
+if (flag) {
+  exports.current = first();
+  module.exports.ready = true;
+} else {
+  exports.current = second();
+  module.exports.ready = false;
+}
+consume(readDependency(), exports.current, module.exports.ready);
+"#;
+    let expected = r#"
+import dependency from "./dependency.js";
+export var current;
+export var ready;
+"use strict";
+function readDependency() {
+  return dependency;
+}
+if (flag) {
+  current = first();
+  ready = true;
+} else {
+  current = second();
+  ready = false;
+}
+consume(readDependency(), current, ready);
+"#;
+
+    let output = common::render_rule(source, |mark| {
+        wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+    });
+    assert_eq_normalized(&output, expected);
+
+    let pipeline_output = common::render_pipeline(source);
+    assert!(
+        pipeline_output.contains("export let current;"),
+        "{pipeline_output}"
+    );
+    assert!(
+        pipeline_output.contains("export let ready;"),
+        "{pipeline_output}"
+    );
+    assert!(
+        !pipeline_output.contains("current = undefined"),
+        "{pipeline_output}"
+    );
+    assert!(
+        !pipeline_output.contains("ready = undefined"),
+        "{pipeline_output}"
+    );
+    assert!(
+        validate_output_modules(&[
+            ("entry.js".into(), pipeline_output.clone()),
+            ("dependency.js".into(), "export default {};".into()),
+        ])
+        .is_empty(),
+        "{pipeline_output}"
+    );
+}
+
+#[test]
+fn require_declarations_do_not_end_the_export_sentinel_prefix() {
+    let source = r#"
+const dependency = require("dependency");
+exports.current = void 0;
+if (flag) {
+  exports.current = dependency.first();
+} else {
+  exports.current = dependency.second();
+}
+"#;
+    let expected = r#"
+import dependency from "dependency";
+export var current;
+if (flag) {
+  current = dependency.first();
+} else {
+  current = dependency.second();
+}
+"#;
+
+    let output = common::render_rule(source, |mark| {
+        wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+    });
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn conditional_export_sentinels_after_other_code_are_preserved() {
+    for prefix in [
+        "sideEffect();",
+        "require('side-effect');",
+        "const marker = 1;",
+        "exports.current = initial;",
+    ] {
+        let source = format!(
+            "{prefix} exports.current = void 0; if (flag) {{ exports.current = next(); }} consume(exports.current);"
+        );
+        let output = common::render_rule(&source, |mark| {
+            wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+        });
+        assert!(
+            output.contains("current = void 0") || output.contains("current = undefined"),
+            "{output}"
+        );
+    }
+
+    let shadowed = r#"
+const undefined = fallback;
+exports.current = undefined;
+if (flag) {
+  exports.current = next();
+}
+consume(exports.current);
+"#;
+    let output = common::render_rule(shadowed, |mark| {
+        wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+    });
+    assert!(output.contains("current = undefined"), "{output}");
+
+    let effectful_void = r#"
+exports.current = void sideEffect();
+if (flag) {
+  exports.current = next();
+}
+consume(exports.current);
+"#;
+    let output = common::render_rule(effectful_void, |mark| {
+        wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+    });
+    assert_eq!(output.matches("sideEffect()").count(), 1, "{output}");
+    assert!(output.contains("current = void sideEffect()"), "{output}");
+}
+
+#[test]
+fn conditional_named_export_chains_share_live_bindings() {
+    let source = r#"
+if (flag) {
+  exports.left = module.exports.right = makeValue();
+}
+consume(exports.left, module.exports.right);
+"#;
+    let expected = r#"
+export var left;
+export var right;
+if (flag) {
+  left = right = makeValue();
+}
+consume(left, right);
+"#;
+
+    let output = common::render_rule(source, |mark| {
+        wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+    });
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn conditional_named_export_bindings_do_not_capture_existing_names() {
+    let source = r#"
+const current = local;
+if (flag) {
+  exports.current = next();
+}
+consume(current, exports.current);
+"#;
+    let expected = r#"
+var _current;
+export { _current as current };
+const current = local;
+if (flag) {
+  _current = next();
+}
+consume(current, _current);
+"#;
+
+    let output = common::render_rule(source, |mark| {
+        wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+    });
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn unsafe_conditional_named_exports_keep_the_commonjs_boundary() {
+    for source in [
+        "const alias = exports; if (flag) { exports.value = 1; } exports.ready = 1;",
+        "module.exports = replacement; if (flag) { exports.value = 1; } exports.ready = 1;",
+        "if (flag) { exports[key] = 1; } exports.ready = 1;",
+        "if (flag) { exports.value += 1; } exports.ready = 1;",
+        "if (flag) { delete exports.value; } exports.ready = 1;",
+        "if (flag) { exports.value = 1; } eval('value'); exports.ready = 1;",
+        "if (flag) { exports.value = 1; } with (scope) { observe(); } exports.ready = 1;",
+        "Object.defineProperty(exports, 'value', { value: 0 }); if (flag) { exports.value = 1; } exports.ready = 1;",
+        "if (flag) { exports.value = 1; } function later() { exports.other = 2; } exports.ready = 1;",
+        "if (flag) { exports.value = 1; } observe(exports.other); exports.ready = 1;",
+        "if (flag) { exports.current = first(); } else { exports.current = second(); } consume(exports?.current);",
+    ] {
+        let output = common::render_rule(source, |mark| {
+            wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+        });
+        assert_eq_normalized(&output, source);
+    }
+}
+
+#[test]
+fn mutable_named_export_values_are_snapshots() {
+    let source = r#"
+exports.a = 1;
+if (flag) {
+  exports.a = 2;
+}
+exports.b = exports.a;
+function bump() {
+  exports.a = 3;
+}
+exports.bump = bump;
+"#;
+    let expected = r#"
+export var a;
+a = 1;
+if (flag) {
+  a = 2;
+}
+export const b = a;
+function bump() {
+  a = 3;
+}
+export { bump };
+"#;
+
+    let output = common::render_rule(source, |mark| {
+        wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+    });
+    assert_eq_normalized(&output, expected);
+    let pipeline_output = common::render_pipeline(source);
+    assert!(
+        pipeline_output.contains("export const b = a;"),
+        "{pipeline_output}"
+    );
+    assert!(
+        validate_output_modules(&[("entry.js".into(), pipeline_output.clone())]).is_empty(),
+        "{pipeline_output}"
+    );
+
+    let before_write = r#"
+exports.b = exports.a;
+if (flag) {
+  exports.a = 1;
+}
+"#;
+    let expected = r#"
+export var a;
+export const b = a;
+if (flag) {
+  a = 1;
+}
+"#;
+    let output = common::render_rule(before_write, |mark| {
+        wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+    });
+    assert_eq_normalized(&output, expected);
+
+    let same_name = r#"
+var value = 1;
+exports.value = value;
+function bump() {
+  value = 2;
+}
+"#;
+    let expected = r#"
+var value = 1;
+var _value = value;
+export { _value as value };
+function bump() {
+  value = 2;
+}
+"#;
+    let output = common::render_rule(same_name, |mark| {
+        wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+    });
+    assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn deferred_named_export_writes_do_not_trigger_conditional_recovery() {
+    let source = r#"
+class Example {
+  value = exports.field = createField();
+  constructor() {
+    exports.value = createValue();
+  }
+}
+"#;
+
+    let output = common::render_rule(source, |mark| {
+        wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+    });
+    assert_eq_normalized(&output, source);
+}
+
+#[test]
+fn conditional_named_exports_validate_through_the_pipeline() {
+    let source = r#"
+var selected;
+if (flag) {
+  selected = exports.current = first();
+} else {
+  exports.current = second();
+  selected = exports.current;
+}
+consume(selected, exports.current);
+"#;
+    let output = common::render_pipeline(source);
+
+    assert!(output.contains("export let current;"), "{output}");
+    assert!(!output.contains("exports."), "{output}");
+    assert!(
+        validate_output_modules(&[("entry.js".into(), output.clone())]).is_empty(),
+        "{output}"
+    );
+}
+
+#[test]
+fn unsupported_named_export_chains_keep_the_commonjs_boundary() {
+    for chain in [
+        "module.exports.a = module.exports = void 0;",
+        "module.exports = module.exports.default = function() { return marker; };",
+        "module.exports = exports.default = exports.a = makeValue();",
+        "exports.a = exports.__esModule = true;",
+        "exports.a = module.exports.a = makeValue();",
+        "exports[key()] = exports.b = void 0;",
+        "exports.a = exports.b = local = makeValue();",
+        "exports.a = local = makeValue();",
+        "const initial = exports.a = exports.b = makeValue();",
+        "if (flag) { exports.a = exports.b = makeValue(); }",
+        "class Holder { static { exports.a = exports.b = makeValue(); } }",
+    ] {
+        let source = format!("const dep = require('dep'); {chain} exports.ready = dep; function dynamic(code) {{ return eval(code); }}");
+        let once = common::render_rule(&source, |mark| {
+            wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+        });
+        assert_eq_normalized(&once, &source);
+        let twice = common::render_rule(&once, |mark| {
+            wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+        });
+        assert_eq_normalized(&twice, &once);
+    }
+}
+
+#[test]
+fn local_assignment_tails_keep_existing_export_recovery() {
+    for source in [
+        "var value; exports.item = value = makeValue();",
+        "var Item = build(); exports.Item = Item; exports.Item = Item = decorate(Item);",
+        "exports.Mode = void 0; var Mode; (function(Mode) { Mode[Mode.On = 1] = 'On'; })(Mode || (exports.Mode = Mode = {}));",
+    ] {
+        let output = common::render_pipeline(source);
+        assert!(output.contains("export "), "{output}");
+        assert!(!output.contains("exports."), "{output}");
+        assert!(validate_output_modules(&[("entry.js".into(), output.clone())]).is_empty(), "{output}");
+        assert_eq!(output.matches("makeValue()").count(), source.matches("makeValue()").count());
+        assert_eq!(output.matches("decorate(").count(), source.matches("decorate(").count());
+    }
+}
+
+#[test]
+fn whole_named_export_chains_are_recovered_in_one_pass() {
+    for (source, expected) in [
+        (
+            "exports.a = exports.b = function () { return 1; };",
+            "export var b = function () { return 1; }; export { b as a };",
+        ),
+        (
+            "exports.left = exports.right = () => 2;",
+            "export var right = () => 2; export { right as left };",
+        ),
+        (
+            "exports.a = module.exports.b = void 0; const a = 1; exports.a = a; const b = 2; module.exports.b = b;",
+            "export const a = 1; export const b = 2;",
+        ),
+        (
+            "module.exports = exports.default = function () { return 1; };",
+            "export default function () { return 1; };",
+        ),
+        (
+            "module.exports = exports.helper = function () { return 1; };",
+            "export var helper = function () { return 1; }; export default helper;",
+        ),
+        (
+            "module.exports = module.exports.flag = 1;",
+            "export const flag = 1; export default 1;",
+        ),
+        (
+            "var u; u = exports.paint = () => {}; use(u);",
+            "var u; export var paint = () => {}; u = paint; use(u);",
+        ),
+        (
+            "let u; u = exports.paint = 1; use(u);",
+            "let u; export const paint = 1; u = 1; use(u);",
+        ),
+        (
+            "const b = 1; exports.a = exports.b = () => b;",
+            "const b = 1; var a = () => b; export { a as b }; export { a };",
+        ),
+        (
+            "exports.foo = exports.default = function () {};",
+            "var foo = function () {}; export default foo; export { foo };",
+        ),
+        (
+            "exports.decode = exports.parse = require(\"qs-decode\"); exports.encode = exports.stringify = require(\"qs-encode\");",
+            "import parse from \"qs-decode\"; import stringify from \"qs-encode\"; export { parse }; export { parse as decode }; export { stringify }; export { stringify as encode };",
+        ),
+        (
+            // The mirror pair keeps the existing `export default require(...)` re-export shape.
+            "module.exports = exports.default = require(\"impl-lib\");",
+            "export default require(\"impl-lib\");",
+        ),
+        // A call on a provider binding (a top-level `require("literal")`
+        // declarator that is never rewritten) with repeatable arguments is
+        // evaluated once into a binding at the chain's position
+        // (`chain_receiver_reference_order`).
+        (
+            "var Lib = require(\"./lib\"); var KEY = \"alpha\"; exports.first = exports.second = Lib.matcher(KEY);",
+            "import Lib from \"./lib\"; var KEY = \"alpha\"; export var second = Lib.matcher(KEY); export { second as first };",
+        ),
+        (
+            "var Lib = require(\"./lib\"); exports.first = exports.second = Lib.matcher(\"beta\");",
+            "import Lib from \"./lib\"; export var second = Lib.matcher(\"beta\"); export { second as first };",
+        ),
+        (
+            "var counter = require(\"./lib\").matcher; var T = \"gamma\"; exports.first = exports.second = counter(T);",
+            "import { matcher as counter } from \"./lib\"; var T = \"gamma\"; export var second = counter(T); export { second as first };",
+        ),
+        (
+            "var make = require(\"./make\"); exports.a = exports.b = make(1, void 0);",
+            "import make from \"./make\"; export var b = make(1, void 0); export { b as a };",
+        ),
+        (
+            "var P = require(\"./lib\"); var Q = P; exports.a = exports.b = Q.make(1);",
+            "import P from \"./lib\"; var Q = P; export var b = Q.make(1); export { b as a };",
+        ),
+        (
+            "var Lib = require(\"./lib\"); module.exports = exports.helper = Lib.build.helper();",
+            "import Lib from \"./lib\"; export var helper = Lib.build.helper(); export default helper;",
+        ),
+    ] {
+        let once = common::render_rule(source, |mark| {
+            wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+        });
+        assert_eq_normalized(&once, expected);
+        let twice = common::render_rule(&once, |mark| {
+            wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+        });
+        assert_eq_normalized(&twice, &once);
+    }
+}
+
+#[test]
+fn named_export_chains_keep_the_boundary_under_dynamic_scope_or_effectful_values() {
+    for source in [
+        // The recovered exports become module bindings that direct eval or
+        // `with` could observe.
+        "exports.a = exports.b = () => {}; function dynamic(code) { return eval(code); }",
+        "exports.a = module.exports.b = 1; eval('a');",
+        "module.exports = exports.default = fn; function dynamic(code) { return eval(code); }",
+        "with (scope) { exports.a = exports.b = 1; }",
+        // Evaluating the value may run code that replaces a receiver. Only a
+        // literal-specifier CommonJS require is accepted among calls.
+        "exports.a = exports.b = makeValue();",
+        "exports.a = exports.b = require(name);",
+        "exports.a = exports.b = require(\"x\", extra);",
+        "exports.a = exports.b = require(...specs);",
+        "const require = load; exports.a = exports.b = require(\"x\");",
+        "exports.a = exports.b = new Thing();",
+        "exports.a = exports.b = void sideEffect();",
+        // A provider call is accepted only when the callee is rooted at a
+        // top-level `require("literal")` binding that is declared once and
+        // never rewritten, reached through static keys, and every argument
+        // is repeatable and not a CommonJS wrapper binding.
+        "var Lib = require(\"./lib\"); exports.a = exports.b = Lib.make(other());",
+        "var Lib = require(\"./lib\"); exports.a = exports.b = Lib[key](1);",
+        "var Lib = require(\"./lib\"); exports.a = exports.b = Lib.make(...xs);",
+        "var Lib = require(\"./lib\"); exports.a = exports.b = Lib?.make(1);",
+        "var Lib = require(\"./lib\"); exports.a = exports.b = Lib.make?.(1);",
+        "var Lib = require(\"./lib\"); exports.a = exports.b = Lib.make(module);",
+        "var Lib = require(\"./lib\"); exports.a = exports.b = Lib.make(exports);",
+        "var Lib = require(\"./lib\"); exports.a = exports.b = Lib.make(require);",
+        "var Lib = require(\"./lib\"); exports.a = exports.b = Lib.make(/re/);",
+        "var Lib = require(\"./lib\"); exports.a = exports.b = new Lib.Thing(1);",
+        "var Lib = require(\"./lib\"); Lib = local; exports.a = exports.b = Lib.make(1);",
+        "var Lib = require(\"./lib\"); var Lib = other; exports.a = exports.b = Lib.make(1);",
+        "var Lib = require(\"./lib\"); function reset() { Lib = other; } exports.a = exports.b = Lib.make(1);",
+        // An alias of a rewritten or redeclared root is not a provider either.
+        "var P = require(\"./lib\"); P = function () { module.exports = {}; return 1; }; var Q = P; module.exports.a = module.exports.b = Q();",
+        "var P = require(\"./lib\"); var P = other; var Q = P; exports.a = exports.b = Q(1);",
+        "var P = require(\"./lib\"); var Q = P.make; function swap() { P = other; } exports.a = exports.b = Q(1);",
+        "var P = require(\"./lib\"); var Q = P; Q = local; exports.a = exports.b = Q(1);",
+        "var Lib = require(name); exports.a = exports.b = Lib.make(1);",
+        "var Lib = require(\"./lib\", extra); exports.a = exports.b = Lib.make(1);",
+        "var Lib = require(\"./lib\")[pick]; exports.a = exports.b = Lib.make(1);",
+        "var Lib = require(\"./lib\")(); exports.a = exports.b = Lib.make(1);",
+        "function Lib() {} exports.a = exports.b = Lib.make(1);",
+        "var Lib = { make() {} }; exports.a = exports.b = Lib.make(1);",
+        "function scope() { var Lib = require(\"./lib\"); } exports.a = exports.b = Lib.make(1);",
+        "const require = load; var Lib = require(\"./lib\"); exports.a = exports.b = Lib.make(1);",
+        "module.exports.a = module.exports.b = (module.exports = {}, 1);",
+        "exports.a = exports.b = (exports = {}, 1);",
+        "module.exports = exports.default = (exports = {}, fn);",
+        "exports.a = exports.b = class { static { module.exports = {}; } };",
+        // `module.exports === module` makes the exports key replace the slot.
+        "module.exports.a = module.exports.exports = void 0;",
+        "exports.a = exports.exports = 1;",
+    ] {
+        let once = common::render_rule(source, |mark| {
+            wakaru_core::rules::UnEsm::new(mark, RewriteLevel::Standard)
+        });
+        assert_eq_normalized(&once, source);
+    }
+}
+
+#[test]
+fn whole_named_export_chains_validate_through_the_pipeline() {
+    for source in [
+        "exports.a = exports.b = function () { return 1; };",
+        "module.exports = exports.default = function () { return 1; };",
+        "var u; if (flag) { u = () => 1; } u = exports.paint = () => {}; exports.now = () => 1;",
+        "exports.a = module.exports.b = void 0; const a = () => 1; exports.a = a; var b = () => 2; module.exports.b = b;",
+        "exports.decode = exports.parse = require(\"qs-decode\"); exports.encode = exports.stringify = require(\"qs-encode\");",
+        "var Lib = require(\"shared-lib\"); var KEY = \"alpha\"; exports.name = KEY; exports.root = KEY; exports.first = exports.second = Lib.matcher(KEY); exports.run = function (input) { return Lib.run(input, KEY); };",
+        "var counter = require(\"shared-lib\").matcher; var T = \"gamma\"; exports.first = exports.second = counter(T);",
+    ] {
+        let output = common::render_pipeline(source);
+        assert!(!output.contains("exports."), "{output}");
+        assert!(output.contains("export "), "{output}");
+        assert!(
+            validate_output_modules(&[("entry.js".into(), output.clone())]).is_empty(),
+            "{output}"
+        );
+    }
 }

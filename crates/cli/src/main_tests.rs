@@ -122,6 +122,27 @@ fn parses_debug_trace_command() {
 }
 
 #[test]
+fn debug_trace_reports_an_empty_traced_range() {
+    let changed_only = trace_output_text(&[], false);
+    assert!(changed_only.contains("no rule changed the rendered output"));
+    assert!(changed_only.contains("--all"));
+    assert!(changed_only.ends_with('\n'));
+
+    let with_unchanged = trace_output_text(&[], true);
+    assert!(with_unchanged.contains("no rule ran in the traced range"));
+    assert!(!with_unchanged.contains("--all"));
+
+    let event = wakaru_core::RuleTraceEvent {
+        rule: "RemoveVoid",
+        changed: true,
+        before: "const x = void 0;\n".to_string(),
+        after: "const x = undefined;\n".to_string(),
+    };
+    let traced = trace_output_text(std::slice::from_ref(&event), false);
+    assert_eq!(traced, format_trace_events(std::slice::from_ref(&event)));
+}
+
+#[test]
 fn parses_debug_validate_command() {
     let cli = Cli::try_parse_from(["wakaru", "debug", "validate", "out", "--json"])
         .expect("debug validate command should parse");
@@ -131,9 +152,52 @@ fn parses_debug_validate_command() {
             command: DebugCommand::Validate(args),
         })) => {
             assert_eq!(args.dir, PathBuf::from("out"));
+            assert!(args.input.is_empty());
             assert!(args.json);
         }
         other => panic!("expected debug validate command, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_debug_validate_command_with_repeated_inputs() {
+    let cli = Cli::try_parse_from([
+        "wakaru",
+        "debug",
+        "validate",
+        "out",
+        "--input",
+        "bundle.js",
+        "--input",
+        "chunks",
+    ])
+    .expect("debug validate command should parse");
+
+    match cli.command {
+        Some(Command::Debug(DebugArgs {
+            command: DebugCommand::Validate(args),
+        })) => {
+            assert_eq!(args.dir, PathBuf::from("out"));
+            assert_eq!(
+                args.input,
+                vec![PathBuf::from("bundle.js"), PathBuf::from("chunks")]
+            );
+            assert!(!args.json);
+        }
+        other => panic!("expected debug validate command, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_debug_enumerate_chunks_command() {
+    let cli = Cli::try_parse_from(["wakaru", "debug", "enumerate-chunks", "input.js"])
+        .expect("debug enumerate-chunks command should parse");
+
+    match cli.command {
+        Some(Command::Debug(DebugArgs {
+            command: DebugCommand::EnumerateChunks(args),
+        })) => assert_eq!(args.input, Some(PathBuf::from("input.js"))),
+        other => panic!("expected debug enumerate-chunks command, got {other:?}"),
     }
 }
 
@@ -679,6 +743,193 @@ fn vue_sfc_unpack_writes_source_maps_only_for_js_artifacts() {
     fs::remove_dir_all(&dir).expect("remove temp dir");
 }
 
+fn map_sources_resolved_from(map_path: &Path) -> Vec<PathBuf> {
+    let map_json = fs::read_to_string(map_path).expect("read source map");
+    let map = sourcemap::SourceMap::from_reader(map_json.as_bytes()).expect("parse source map");
+    map.sources()
+        .map(|source| {
+            assert!(
+                !Path::new(source).is_absolute(),
+                "source should be relative to the map: {source}"
+            );
+            fs::canonicalize(map_path.parent().unwrap().join(source))
+                .unwrap_or_else(|e| panic!("{source} should resolve from the map: {e}"))
+        })
+        .collect()
+}
+
+#[test]
+fn single_file_source_map_names_the_input_relative_to_the_map() {
+    let dir = temp_test_dir("single-file-map-sources");
+    fs::create_dir_all(dir.join("in")).expect("create input dir");
+    fs::create_dir_all(dir.join("out")).expect("create output dir");
+    let input_path = dir.join("in/input.js");
+    let output_path = dir.join("out/output.js");
+    fs::write(&input_path, "var a = 1; console.log(a);").expect("write input");
+
+    let cli = Cli::try_parse_from([
+        "wakaru",
+        input_path.to_str().expect("input path should be utf8"),
+        "--emit-source-map",
+        "-o",
+        output_path.to_str().expect("output path should be utf8"),
+    ])
+    .expect("cli should parse");
+    run_default(cli).expect("decompile should succeed");
+
+    assert_eq!(
+        map_sources_resolved_from(&append_map_extension(&output_path)),
+        vec![fs::canonicalize(&input_path).unwrap()]
+    );
+
+    fs::remove_dir_all(&dir).expect("remove temp dir");
+}
+
+#[test]
+fn unpack_source_maps_name_the_bundle_relative_to_each_map() {
+    let dir = temp_test_dir("unpack-map-sources");
+    let out_dir = dir.join("out");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let input_path = dir.join("bundle.js");
+    fs::write(&input_path, webpack5_vue_sfc_bundle_source()).expect("write bundle");
+
+    let cli = Cli::try_parse_from([
+        "wakaru",
+        input_path.to_str().expect("input path should be utf8"),
+        "--unpack",
+        "--emit-source-map",
+        "-o",
+        out_dir.to_str().expect("output path should be utf8"),
+    ])
+    .expect("unpack cli should parse");
+    run_default(cli).expect("unpack should succeed");
+
+    let nested_map = out_dir.join("src/App.vue.js.map");
+    assert!(nested_map.exists(), "a module below out/ should get a map");
+    assert_eq!(
+        map_sources_resolved_from(&nested_map),
+        vec![fs::canonicalize(&input_path).unwrap()]
+    );
+
+    fs::remove_dir_all(&dir).expect("remove temp dir");
+}
+
+/// Every occurrence of `needle` in formatted `code` must carry its own
+/// mapping, and that mapping must point at `needle` in `input`.
+fn assert_map_points_needles_at_input(code: &str, map_json: &str, input: &str, needle: &str) {
+    let map = sourcemap::SourceMap::from_slice(map_json.as_bytes()).expect("valid source map");
+    let input_lines: Vec<&str> = input.split('\n').collect();
+    let mut checked = 0;
+    for (line, text) in code.lines().enumerate() {
+        for (col, _) in text.match_indices(needle) {
+            let (line, col) = (line as u32, col as u32);
+            let token = map
+                .lookup_token(line, col)
+                .unwrap_or_else(|| panic!("{needle} at {line}:{col} should be mapped"));
+            assert_eq!(
+                (token.get_dst_line(), token.get_dst_col()),
+                (line, col),
+                "{needle} at {line}:{col} should have its own mapping"
+            );
+            let source_line = input_lines[token.get_src_line() as usize];
+            assert!(
+                source_line[token.get_src_col() as usize..].starts_with(needle),
+                "{needle} at {line}:{col} maps to {:?}",
+                &source_line[token.get_src_col() as usize..]
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "expected {needle} in:\n{code}");
+}
+
+/// Wider than the formatter's line width once printed, so formatting moves
+/// the arguments onto their own lines.
+const WIDE_CALL_INPUT: &str = "function f(){console.log(alphaAlphaAlpha,betaBetaBetaBeta,gammaGammaGamma,deltaDeltaDelta,console.error)}f();";
+
+#[test]
+fn formatter_carries_single_file_source_map_to_formatted_output() {
+    let dir = temp_test_dir("formatter-single-file-map");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let input_path = dir.join("input.js");
+    let output_path = dir.join("output.js");
+    fs::write(&input_path, WIDE_CALL_INPUT).expect("write input");
+
+    let cli = Cli::try_parse_from([
+        "wakaru",
+        input_path.to_str().expect("input path should be utf8"),
+        "--formatter",
+        "--emit-source-map",
+        "-o",
+        output_path.to_str().expect("output path should be utf8"),
+    ])
+    .expect("cli should parse");
+    run_default(cli).expect("decompile should succeed");
+
+    let code = fs::read_to_string(&output_path).expect("read output");
+    assert!(
+        code.contains("\n    console.error"),
+        "arguments should be broken onto their own lines:\n{code}"
+    );
+    let map_json = fs::read_to_string(append_map_extension(&output_path)).expect("read map");
+    assert_map_points_needles_at_input(&code, &map_json, WIDE_CALL_INPUT, "console");
+    assert_map_points_needles_at_input(&code, &map_json, WIDE_CALL_INPUT, "deltaDeltaDelta");
+
+    fs::remove_dir_all(&dir).expect("remove temp dir");
+}
+
+#[test]
+fn formatter_carries_unpack_source_maps_to_formatted_output() {
+    let dir = temp_test_dir("formatter-unpack-map");
+    let out_dir = dir.join("out");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let input_path = dir.join("bundle.js");
+    let bundle = "(()=>{var e={10:(e,t,n)=>{console.log(alphaAlphaAlpha,betaBetaBetaBeta,gammaGammaGamma,deltaDeltaDelta,console.error,n(20).value)},20:e=>{e.exports={value:1}}},t={};function n(r){var o=t[r];if(void 0!==o)return o.exports;var s=t[r]={exports:{}};return e[r](s,s.exports,n),s.exports}n(10)})();";
+    fs::write(&input_path, bundle).expect("write bundle");
+
+    let cli = Cli::try_parse_from([
+        "wakaru",
+        input_path.to_str().expect("input path should be utf8"),
+        "--unpack",
+        "--formatter",
+        "--emit-source-map",
+        "-o",
+        out_dir.to_str().expect("output path should be utf8"),
+    ])
+    .expect("unpack cli should parse");
+    run_default(cli).expect("unpack should succeed");
+
+    let module = fs::read_dir(&out_dir)
+        .expect("read output dir")
+        .map(|entry| entry.expect("dir entry").path())
+        .find(|path| {
+            path.extension().is_some_and(|ext| ext == "js")
+                && fs::read_to_string(path).is_ok_and(|code| code.contains("console.error"))
+        })
+        .expect("the module that logs should be written");
+    let code = fs::read_to_string(&module).expect("read module");
+    assert!(
+        code.contains("\n  console.error"),
+        "arguments should be broken onto their own lines:\n{code}"
+    );
+    let map_json = fs::read_to_string(append_map_extension(&module)).expect("read map");
+    assert_map_points_needles_at_input(&code, &map_json, bundle, "console");
+
+    fs::remove_dir_all(&dir).expect("remove temp dir");
+}
+
+#[test]
+fn relative_path_climbs_to_the_common_ancestor() {
+    assert_eq!(
+        relative_path(Path::new("/a/out/src"), Path::new("/a/bundle.js")).as_deref(),
+        Some("../../bundle.js")
+    );
+    assert_eq!(
+        relative_path(Path::new("/a"), Path::new("/a/in/x.js")).as_deref(),
+        Some("in/x.js")
+    );
+}
+
 #[test]
 fn parses_json_flag() {
     let cli =
@@ -704,6 +955,7 @@ fn json_modules_describe_vue_sfc_artifact_roles() {
             status: JsonModuleStatus::Decompiled,
             source_filename: None,
             source_map_filename: Some("src/plain.js".to_string()),
+            source_map: None,
         }),
         json_module_for_artifact(&CliOutputArtifact {
             filename: "src/App.vue.js".to_string(),
@@ -712,6 +964,7 @@ fn json_modules_describe_vue_sfc_artifact_roles() {
             status: JsonModuleStatus::VueSfcSourceJs,
             source_filename: Some("src/App.vue".to_string()),
             source_map_filename: Some("src/App.vue".to_string()),
+            source_map: None,
         }),
         json_module_for_artifact(&CliOutputArtifact {
             filename: "src/App.vue".to_string(),
@@ -720,6 +973,7 @@ fn json_modules_describe_vue_sfc_artifact_roles() {
             status: JsonModuleStatus::RecoveredVueSfc,
             source_filename: Some("src/App.vue".to_string()),
             source_map_filename: None,
+            source_map: None,
         }),
         json_module_for_artifact(&CliOutputArtifact {
             filename: "src/Broken.vue.js".to_string(),
@@ -728,6 +982,7 @@ fn json_modules_describe_vue_sfc_artifact_roles() {
             status: JsonModuleStatus::VueSfcFallbackJs,
             source_filename: None,
             source_map_filename: Some("src/Broken.vue".to_string()),
+            source_map: None,
         }),
     ];
 
@@ -770,6 +1025,7 @@ fn json_unpack_total_counts_input_modules_not_artifacts() {
             status: JsonModuleStatus::VueSfcSourceJs,
             source_filename: Some("src/App.vue".to_string()),
             source_map_filename: Some("src/App.vue".to_string()),
+            source_map: None,
         },
         CliOutputArtifact {
             filename: "src/App.vue".to_string(),
@@ -778,6 +1034,7 @@ fn json_unpack_total_counts_input_modules_not_artifacts() {
             status: JsonModuleStatus::RecoveredVueSfc,
             source_filename: Some("src/App.vue".to_string()),
             source_map_filename: None,
+            source_map: None,
         },
     ];
 
@@ -831,6 +1088,7 @@ fn provenance_names_ignore_interleaved_vue_sfc_sidecars() {
             status: JsonModuleStatus::VueSfcSourceJs,
             source_filename: Some("src/App.vue".to_string()),
             source_map_filename: Some("src/App.vue".to_string()),
+            source_map: None,
         },
         CliOutputArtifact {
             filename: "src/App.vue".to_string(),
@@ -839,6 +1097,7 @@ fn provenance_names_ignore_interleaved_vue_sfc_sidecars() {
             status: JsonModuleStatus::RecoveredVueSfc,
             source_filename: Some("src/App.vue".to_string()),
             source_map_filename: None,
+            source_map: None,
         },
         CliOutputArtifact {
             filename: "src/after.js".to_string(),
@@ -847,6 +1106,7 @@ fn provenance_names_ignore_interleaved_vue_sfc_sidecars() {
             status: JsonModuleStatus::Decompiled,
             source_filename: None,
             source_map_filename: Some("src/after.js".to_string()),
+            source_map: None,
         },
     ];
     let resolved = vec![
@@ -997,6 +1257,55 @@ fn decompile_rejects_directory_input() {
     );
 
     fs::remove_dir_all(&dir).expect("remove temp dir");
+}
+
+#[test]
+fn unpack_output_survives_worker_pool_teardown_and_reuse() {
+    let dir = temp_test_dir("unpack-worker-lifetime");
+    fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("bundle.js");
+    let mut source = String::from(
+        "var wrap = (q, K) => () => (K || q((K = { exports: {} }).exports, K), K.exports); ",
+    );
+    for index in 0..64 {
+        source.push_str(&format!(
+            "var value{index} = wrap((exports, module) => {{ module.exports = {index}; }}); ",
+        ));
+    }
+    source.push_str("console.log(value0(), value63());");
+    fs::write(&input, source).unwrap();
+
+    let unpack_on_workers = |workers| {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap();
+        let result = pool.install(|| {
+            run_public_unpack(
+                std::slice::from_ref(&input),
+                false,
+                UnpackMode::Strict,
+                DceMode::Off,
+                RewriteLevel::Standard,
+                false,
+                false,
+            )
+            .unwrap()
+        });
+        drop(pool);
+        // Consume and later free worker-allocated output after the pool owner
+        // is gone. Repeat with fresh pools to exercise allocator thread reuse.
+        let mut modules = result.output.modules;
+        modules.sort();
+        assert!(modules.len() >= 64);
+        assert!(modules.iter().all(|(_, code)| !code.is_empty()));
+        modules
+    };
+    let expected = unpack_on_workers(1);
+    for workers in [4, 2, 4] {
+        assert_eq!(unpack_on_workers(workers), expected);
+    }
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -1701,4 +2010,66 @@ fn public_diagnostic_keeps_facade_code_and_severity() {
     assert_eq!(warning.kind, "fact_collection_failed");
     assert!(!warning.is_error);
     assert_eq!(warning.message, "could not collect facts");
+}
+
+#[test]
+fn regular_unpack_json_has_no_chunk_enumeration_surface() {
+    let json = JsonUnpackOutput {
+        detected_formats: vec!["webpack5".to_string()],
+        safety: "normal".to_string(),
+        modules: Vec::new(),
+        warnings: Vec::new(),
+        total: 0,
+        failed: 0,
+        elapsed_ms: 1,
+    };
+    let rendered = serde_json::to_string(&json).expect("serialize");
+    assert!(
+        !rendered.contains("chunk_enumeration"),
+        "debug metadata leaked into regular unpack JSON:\n{rendered}"
+    );
+}
+
+#[test]
+fn debug_enumerate_chunks_serializes_relative_imports_at_root() {
+    let output = enumerate_chunks_json(
+        r#"import value from "./aaaa1111.js"; import("./lazy-beta.js");"#,
+        "entry.js",
+    )
+    .expect("enumerate chunks");
+    let rendered = serde_json::to_string(&output).expect("serialize");
+    assert!(rendered.contains(r#""input":"entry.js""#), "{rendered}");
+    assert!(rendered.contains(r#""detected_format":null"#), "{rendered}");
+    assert!(rendered.contains(
+        r#""relative_imports":[{"specifier":"./aaaa1111.js","kind":"import"},{"specifier":"./lazy-beta.js","kind":"dynamic_import"}]"#
+    ), "unexpected shape:\n{rendered}");
+}
+
+#[test]
+fn debug_enumerate_chunks_returns_null_without_facts() {
+    let output =
+        enumerate_chunks_json("console.log('plain');", "plain.js").expect("enumerate plain source");
+    assert!(output.detected_format.is_none());
+    assert!(output.enumeration.is_none());
+}
+
+#[test]
+fn debug_enumerate_chunks_reports_webpack_fixture_without_unpacking() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../core/tests/bundles/webpack-gen/dist/wp5-array/bundle.js"
+    );
+    let source = std::fs::read_to_string(fixture).expect("fixture read");
+    let output = enumerate_chunks_json(&source, "bundle.js").expect("enumerate fixture");
+    assert_eq!(output.detected_format.as_deref(), Some("webpack5"));
+    let rendered = output.enumeration.expect("fixture enumeration");
+    assert_eq!(rendered.public_path.status, "runtime_computed");
+    let [asset] = rendered.assets.as_slice() else {
+        panic!("expected one asset");
+    };
+    assert_eq!(asset.kind, "js");
+    assert_eq!(asset.status, "enumerated");
+    assert_eq!(asset.urls.len(), 1);
+    assert_eq!(asset.urls[0].url, "chunk-1.js");
+    assert_eq!(asset.urls[0].source, "ensure_call");
 }

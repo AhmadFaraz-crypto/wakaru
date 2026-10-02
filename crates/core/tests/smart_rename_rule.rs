@@ -616,6 +616,330 @@ class Foo {
 }
 
 #[test]
+fn object_destructuring_in_nested_blocks() {
+    let input = r#"
+function f(r, t) {
+    if (r) {
+        const { foo: o } = r;
+        use(o);
+    }
+    for (;;) {
+        let { bar: b } = t;
+        use(b);
+    }
+    try {
+        const { baz: z } = r;
+        use(z);
+    } catch (err) {
+        const { qux: q } = err;
+        use(q);
+    }
+    switch (t) {
+        case 1:
+            const { quux: x } = t;
+            use(x);
+    }
+}
+"#;
+    let expected = r#"
+function f(r, t) {
+    if (r) {
+        const { foo } = r;
+        use(foo);
+    }
+    for (;;) {
+        let { bar } = t;
+        use(bar);
+    }
+    try {
+        const { baz } = r;
+        use(baz);
+    } catch (err) {
+        const { qux } = err;
+        use(qux);
+    }
+    switch (t) {
+        case 1:
+            const { quux } = t;
+            use(quux);
+    }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn object_destructuring_in_for_heads() {
+    let input = r#"
+function f(items, obj) {
+    for (const { id: i, name: n } of items) {
+        use(i, n);
+    }
+    for (let { length: l } = obj; l > 0; l--) {
+        use(l);
+    }
+}
+"#;
+    let expected = r#"
+function f(items, obj) {
+    for (const { id, name } of items) {
+        use(id, name);
+    }
+    for (let { length } = obj; length > 0; length--) {
+        use(length);
+    }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn object_destructuring_in_arrow_nested_block() {
+    let input = r#"
+const f = (r) => {
+    if (r) {
+        const { foo: o } = r;
+        return o;
+    }
+};
+"#;
+    let expected = r#"
+const f = (r) => {
+    if (r) {
+        const { foo } = r;
+        return foo;
+    }
+};
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn object_destructuring_in_module_level_block() {
+    let input = r#"
+if (cond) {
+    const { foo: o } = obj;
+    use(o);
+}
+"#;
+    let expected = r#"
+if (cond) {
+    const { foo } = obj;
+    use(foo);
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn object_destructuring_sibling_blocks_reuse_the_same_name() {
+    // Block-scoped bindings in disjoint blocks cannot capture each other.
+    let input = r#"
+function f(a, b) {
+    if (a) {
+        const { foo: o } = a;
+        use(o);
+    } else {
+        const { foo: i } = b;
+        use(i);
+    }
+}
+"#;
+    let expected = r#"
+function f(a, b) {
+    if (a) {
+        const { foo } = a;
+        use(foo);
+    } else {
+        const { foo } = b;
+        use(foo);
+    }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn object_destructuring_in_block_does_not_capture_outer_reference() {
+    let input = r#"
+function f(r, foo) {
+    if (r) {
+        const { foo: o } = r;
+        use(o, foo);
+    }
+}
+"#;
+    let expected = r#"
+function f(r, foo) {
+    if (r) {
+        const { foo: foo_1 } = r;
+        use(foo_1, foo);
+    }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn object_destructuring_in_inner_block_does_not_shadow_outer_block_rename() {
+    let input = r#"
+function f(a, b) {
+    if (a) {
+        const { foo: o } = a;
+        if (b) {
+            const { foo: i } = b;
+            use(o, i);
+        }
+    }
+}
+"#;
+    let expected = r#"
+function f(a, b) {
+    if (a) {
+        const { foo } = a;
+        if (b) {
+            const { foo: foo_1 } = b;
+            use(foo, foo_1);
+        }
+    }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn object_destructuring_in_block_does_not_shadow_nested_var_rename() {
+    // `var` in a nested block is function-scoped: its new name is visible in
+    // every block, so a block-scoped rename that sees a reference to it must
+    // not take the same name, in either source order.
+    let input = r#"
+function f(a, b) {
+    if (a) {
+        var { foo: o } = a;
+    }
+    if (b) {
+        const { foo: i } = b;
+        use(i, o);
+    }
+}
+function g(a, b) {
+    if (b) {
+        const { foo: i } = b;
+        use(i, o);
+    }
+    if (a) {
+        var { foo: o } = a;
+    }
+}
+"#;
+    let expected = r#"
+function f(a, b) {
+    if (a) {
+        var { foo } = a;
+    }
+    if (b) {
+        const { foo: foo_1 } = b;
+        use(foo_1, foo);
+    }
+}
+function g(a, b) {
+    if (b) {
+        const { foo } = b;
+        use(foo, foo_1);
+    }
+    if (a) {
+        var { foo: foo_1 } = a;
+    }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn object_destructuring_param_with_default() {
+    let input = r#"
+function t({ left: o = 0, top: r = 0 } = {}) {
+    this.left = o;
+    this.top = r;
+}
+"#;
+    let expected = r#"
+function t({ left = 0, top = 0 } = {}) {
+    this.left = left;
+    this.top = top;
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn object_destructuring_nested_patterns() {
+    let input = r#"
+function f(points) {
+    const { options: { border: s, grid: n }, data: { sets: d } = {} } = this;
+    const [{ x: a, y: b }] = points;
+    use(s, n, d, a, b);
+}
+"#;
+    let expected = r#"
+function f(points) {
+    const { options: { border, grid }, data: { sets } = {} } = this;
+    const [{ x, y }] = points;
+    use(border, grid, sets, x, y);
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn object_destructuring_nested_patterns_in_one_declaration_get_distinct_names() {
+    let input = r#"
+function f() {
+    const [{ x: t, y: n }, { x: r, y: i }] = this.getPoints();
+    use(t, n, r, i);
+}
+"#;
+    let expected = r#"
+function f() {
+    const [{ x, y }, { x: x_1, y: y_1 }] = this.getPoints();
+    use(x, y, x_1, y_1);
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn object_destructuring_in_constructor() {
+    let input = r#"
+class A {
+    constructor({ id: e, viewBox: n } = {}) {
+        this.id = e;
+        this.viewBox = n;
+        const { dispatch: u } = this;
+        if (e) {
+            const { commit: c } = this;
+            use(u, c);
+        }
+    }
+}
+"#;
+    let expected = r#"
+class A {
+    constructor({ id, viewBox } = {}) {
+        this.id = id;
+        this.viewBox = viewBox;
+        const { dispatch } = this;
+        if (id) {
+            const { commit } = this;
+            use(dispatch, commit);
+        }
+    }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
 fn member_init_rename_basic() {
     // var w = zw.NOT_APPLICABLE → rename w to zw_NOT_APPLICABLE
     let input = r#"
@@ -742,6 +1066,161 @@ function f() {
 "#;
     let output = apply(input);
     assert_eq_normalized(&output, expected);
+}
+
+#[test]
+fn named_import_snapshot_alias_uses_readable_local_name() {
+    let input = r#"
+import { unstable_runWithPriority } from "./scheduler.js";
+const Wt = unstable_runWithPriority;
+use(Wt);
+"#;
+    let expected = r#"
+import { unstable_runWithPriority } from "./scheduler.js";
+const unstable_runWithPriority_1 = unstable_runWithPriority;
+use(unstable_runWithPriority_1);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn named_import_snapshot_aliases_get_distinct_readable_names() {
+    let input = r#"
+import { unstable_now } from "./scheduler.js";
+const a = unstable_now;
+const b = unstable_now;
+use(a, b);
+"#;
+    let expected = r#"
+import { unstable_now } from "./scheduler.js";
+const unstable_now_1 = unstable_now;
+const unstable_now_2 = unstable_now;
+use(unstable_now_1, unstable_now_2);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn named_import_snapshot_alias_avoids_nested_name_capture() {
+    let input = r#"
+import { unstable_now } from "./scheduler.js";
+const a = unstable_now;
+function read() {
+    const unstable_now_1 = localClock();
+    return a();
+}
+"#;
+    let expected = r#"
+import { unstable_now } from "./scheduler.js";
+const unstable_now_2 = unstable_now;
+function read() {
+    const unstable_now_1 = localClock();
+    return unstable_now_2();
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn named_import_snapshot_rename_preserves_specifier_export_name() {
+    let input = r#"
+import { unstable_now } from "./scheduler.js";
+const a = unstable_now;
+export { a };
+"#;
+    let expected = r#"
+import { unstable_now } from "./scheduler.js";
+const unstable_now_1 = unstable_now;
+export { unstable_now_1 as a };
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn named_import_snapshot_rename_skips_export_declaration() {
+    let input = r#"
+import { unstable_now } from "./scheduler.js";
+export const a = unstable_now;
+const b = unstable_now;
+use(a, b);
+"#;
+    let expected = r#"
+import { unstable_now } from "./scheduler.js";
+export const a = unstable_now;
+const unstable_now_1 = unstable_now;
+use(a, unstable_now_1);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn named_import_snapshot_rename_keeps_mutable_and_jsx_aliases() {
+    let input = r#"
+import { unstable_now, widget } from "./runtime.js";
+let a = unstable_now;
+const Wt = widget;
+use(a, <Wt />);
+"#;
+    let expected = r#"
+import { unstable_now, widget } from "./runtime.js";
+let a = unstable_now;
+const Widget = widget;
+use(a, <Widget />);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn named_import_snapshot_rename_respects_known_direct_eval_names() {
+    let input = r#"
+import { unstable_now } from "./scheduler.js";
+const a = unstable_now;
+const b = unstable_now;
+eval("a");
+use(a, b);
+"#;
+    let expected = r#"
+import { unstable_now } from "./scheduler.js";
+const a = unstable_now;
+const unstable_now_1 = unstable_now;
+eval("a");
+use(a, unstable_now_1);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn named_import_snapshot_rename_stops_for_unknown_direct_eval() {
+    let input = r#"
+import { unstable_now } from "./scheduler.js";
+const a = unstable_now;
+eval(source);
+use(a);
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn named_import_snapshot_rename_does_not_capture_known_eval_name() {
+    let input = r#"
+import { unstable_now } from "./scheduler.js";
+const a = unstable_now;
+eval("unstable_now_1");
+use(a);
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn named_import_snapshot_rename_stops_for_with_statement() {
+    let input = r#"
+import { unstable_now } from "./scheduler.js";
+const a = unstable_now;
+with (scope) {
+    use(a);
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
 }
 
 // --- semantic regressions ---
@@ -1236,16 +1715,16 @@ function L(e, s) {
     let expected = r#"
 const f = "proc first argument must be an iterator";
 use(f);
-function L(e, parentEffectId, label = "", h) {
+function L(effect, parentEffectId, label = "", h) {
     if (sagaMonitor) {
         sagaMonitor.effectTriggered({
             effectId: v,
             parentEffectId,
             label,
-            effect: e
+            effect
         });
     }
-    use(e, h);
+    use(effect, h);
 }
 "#;
     let output = render_pipeline_between(input, "UnParameters", "SmartRename");
@@ -1274,15 +1753,128 @@ function outer() {
 }
 
 #[test]
-fn value_position_skips_non_value_usage() {
-    // `r` is used as a call callee / member access target — NOT only value position.
+fn value_position_renames_binding_with_other_uses() {
     let input = r#"
 import r from "./m.js";
 r();
-const obj = { Foo: r };
+function g(e) {
+    const t = compute(e);
+    log(t);
+    return { total: t, Foo: r };
+}
+function h() {
+    function n() {}
+    n();
+    return { handler: n };
+}
 "#;
-    let output = apply(input);
-    assert_eq_normalized(&output, input);
+    let expected = r#"
+import Foo from "./m.js";
+Foo();
+function g(e) {
+    const total = compute(e);
+    log(total);
+    return { total, Foo };
+}
+function h() {
+    function handler() {}
+    handler();
+    return { handler };
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn value_position_sole_use_candidate_keeps_its_key_over_relaxed_candidate() {
+    // A binding with other uses must not take a key away from, or collide
+    // with, a binding whose only use is that value position.
+    let input = r#"
+function a(t) {
+    return { createHref: t };
+}
+function b(n) {
+    log(n);
+    return { createHref: n };
+}
+"#;
+    let expected = r#"
+function a(createHref) {
+    return { createHref };
+}
+function b(n) {
+    log(n);
+    return { createHref: n };
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn value_position_generic_and_dollar_keys_need_a_sole_use() {
+    // A generic or `$`-prefixed key names the slot, not the value; it is
+    // only trusted when the value position is the binding's only use.
+    let input = r#"
+function f(e) {
+    const t = g(e);
+    log(t);
+    const n = h(e);
+    log(n);
+    const r = k(e);
+    return { type: t, $set: n, key: r };
+}
+"#;
+    let expected = r#"
+function f(e) {
+    const t = g(e);
+    log(t);
+    const n = h(e);
+    log(n);
+    const key = k(e);
+    return { type: t, $set: n, key };
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn value_position_skips_destructured_and_class_bindings_with_other_uses() {
+    let input = r#"
+function f(e) {
+    const [t] = e;
+    log(t);
+    class n {}
+    log(new n());
+    return { total: t, widget: n };
+}
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn value_position_skips_boolean_test_of_a_same_named_property() {
+    // `!!s.icon` is a flag about `icon`, not the icon itself.
+    let input = r#"
+function f(s) {
+    const t = !!s.icon;
+    const n = s.weight > 0;
+    const r = t && !!s.badge;
+    const i = !!s.flag;
+    use(t, n, r, i);
+    return { icon: t, weight: n, badge: r, visible: i };
+}
+"#;
+    let expected = r#"
+function f(s) {
+    const t = !!s.icon;
+    const n = s.weight > 0;
+    const r = t && !!s.badge;
+    const visible = !!s.flag;
+    use(t, n, r, visible);
+    return { icon: t, weight: n, badge: r, visible };
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
 }
 
 #[test]
@@ -1400,15 +1992,18 @@ use(handler);
 }
 
 #[test]
-fn value_position_skips_when_exported_by_name() {
-    // `export { r }` is an other use — disqualifies.
+fn value_position_rename_keeps_specifier_export_name() {
     let input = r#"
 const r = makeThing();
 export { r };
 const obj = { Foo: r };
 "#;
-    let output = apply(input);
-    assert_eq_normalized(&output, input);
+    let expected = r#"
+const Foo = makeThing();
+export { Foo as r };
+const obj = { Foo };
+"#;
+    assert_eq_normalized(&apply(input), expected);
 }
 
 #[test]
@@ -2084,6 +2679,537 @@ async function rhY({ signal: A }) {
         !output.contains("let { signal, cleanup }"),
         "body destructuring should not shadow renamed param: {output}"
     );
+}
+
+// ============================================================
+// Call-site parameter renames
+// ============================================================
+
+#[test]
+fn call_site_renames_param_when_every_call_passes_the_same_name() {
+    let input = r#"
+function f(e) {
+    return e.trim();
+}
+f(input.text);
+f(text);
+"#;
+    let expected = r#"
+function f(text) {
+    return text.trim();
+}
+f(input.text);
+f(text);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn call_site_renames_arrow_and_function_expression_params() {
+    let input = r#"
+const f = (e, t) => e.get(t);
+const g = function(e) { return e + 1; };
+f(state.cache, key);
+g(config.retryCount);
+"#;
+    let expected = r#"
+const f = (cache, key) => cache.get(key);
+const g = function(retryCount) { return retryCount + 1; };
+f(state.cache, key);
+g(config.retryCount);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn call_site_skips_when_callers_disagree_or_pass_no_name() {
+    let input = r#"
+function f(e) { return e.trim(); }
+function g(e) { return e.trim(); }
+f(input.text);
+f(input.label);
+g(input.text);
+g("literal");
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn call_site_skips_functions_used_other_than_as_direct_callee() {
+    let input = r#"
+function f(e) { return e.trim(); }
+function g(e) { return e.trim(); }
+const h = (e) => e.trim();
+f(text);
+list.map(f);
+g(text);
+g = null;
+h(text);
+h?.(text);
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn call_site_skips_exported_functions() {
+    let input = r#"
+export function f(e) { return e.trim(); }
+f(text);
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn call_site_strips_wakaru_numeric_suffix_from_argument_name() {
+    let input = r#"
+function f(e) { return e.getBoundingClientRect(); }
+f(anchorNode_1);
+"#;
+    let expected = r#"
+function f(anchorNode) { return anchorNode.getBoundingClientRect(); }
+f(anchorNode_1);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn call_site_skips_names_that_carry_no_meaning() {
+    // Mangled module-level names, React ref `.current`, keywords, reserved
+    // property names, and Wakaru-synthesized `t_x` names.
+    let input = r#"
+function a(e) { return e.x; }
+function b(e) { return e.x; }
+function c(e) { return e.x; }
+function d(e) { return e.x; }
+function g(e) { return e.x; }
+function h(e) { return e.x; }
+a(kQz);
+b(J99);
+c(xRef.current);
+d(step.return);
+g(list.length);
+h(t_nextValue);
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn call_site_skips_names_already_present_in_the_function() {
+    let input = r#"
+function f(e) {
+    const text = e.trim();
+    return text;
+}
+function g(e) {
+    return e + text;
+}
+f(input.text);
+g(input.text);
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn call_site_skips_unused_params_and_spread_calls() {
+    let input = r#"
+function f(e) { return 1; }
+function g(e, t) { return t + e; }
+f(input.text);
+g(input.size, ...rest);
+g(input.size, input.count);
+"#;
+    // A spread at or before the parameter's position hides what that call
+    // passes, so `t` keeps its name; `e` still sees `size` at both calls.
+    let expected = r#"
+function f(e) { return 1; }
+function g(size, t) { return t + size; }
+f(input.text);
+g(input.size, ...rest);
+g(input.size, input.count);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn call_site_gives_a_name_to_one_of_two_nested_functions_only() {
+    // Renaming both params to `node` would let the inner one capture the
+    // outer reference.
+    let input = r#"
+function outer(e) {
+    function inner(t) {
+        return t.parent === e;
+    }
+    return inner(tree.node);
+}
+outer(tree.node);
+"#;
+    let output = apply(input);
+    assert_eq!(
+        output.matches("(node)").count(),
+        1,
+        "exactly one param may take `node`: {output}"
+    );
+}
+
+#[test]
+fn call_site_skips_module_with_direct_eval() {
+    let input = r#"
+function f(e) { return eval("e"); }
+f(input.text);
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn call_site_leaves_value_position_names_first() {
+    // The object key names the value itself; the call-site name is weaker.
+    let input = r#"
+function f(e) {
+    return { total: e };
+}
+f(order.amount);
+"#;
+    let expected = r#"
+function f(total) {
+    return { total };
+}
+f(order.amount);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn call_site_keeps_short_value_position_name() {
+    // `fn` is short enough to look generated, but value position just
+    // chose it and is the stronger evidence.
+    let input = r#"
+const f = (e) => ({ fn: e });
+f(task.handler);
+"#;
+    let expected = r#"
+const f = (fn) => ({ fn });
+f(task.handler);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn call_site_skips_params_reused_as_scratch_variables() {
+    let input = r#"
+function f(e, t) {
+    for (t = 0; t < e.length; t++) use(e[t]);
+}
+function g(e) {
+    e++;
+    return e;
+}
+function h(e) {
+    [e] = e.items;
+    return e;
+}
+f(batch.entries, cursor.position);
+g(state.count);
+h(state.list);
+"#;
+    let expected = r#"
+function f(entries, t) {
+    for (t = 0; t < entries.length; t++) use(entries[t]);
+}
+function g(e) {
+    e++;
+    return e;
+}
+function h(e) {
+    [e] = e.items;
+    return e;
+}
+f(batch.entries, cursor.position);
+g(state.count);
+h(state.list);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn call_site_keeps_param_backed_by_shorthand_property() {
+    let input = r#"
+const f = (fn) => ({ fn });
+f(task.handler);
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+// ============================================================
+// Structural-role renames
+// ============================================================
+
+#[test]
+fn role_renames_used_catch_parameter_to_error() {
+    let input = r#"
+try { run(); } catch (e) { report(e.message); }
+try { run(); } catch (t) { }
+try { run(); } catch (failure) { report(failure); }
+"#;
+    let expected = r#"
+try { run(); } catch (error) { report(error.message); }
+try { run(); } catch (t) { }
+try { run(); } catch (failure) { report(failure); }
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn role_catch_falls_back_to_err_when_error_is_taken_and_skips_written() {
+    let input = r#"
+const error = 1;
+try { run(); } catch (e) { report(e, error); }
+function f() {
+    try { run(); } catch (e) { e = wrap(e); throw e; }
+}
+"#;
+    let expected = r#"
+const error = 1;
+try { run(); } catch (err) { report(err, error); }
+function f() {
+    try { run(); } catch (e) { e = wrap(e); throw e; }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn role_nested_catch_takes_err_instead_of_shadowing_error() {
+    let input = r#"
+try { run(); } catch (e) {
+    try { retry(); } catch (t) { report(e, t); }
+}
+try { run(); } catch (e) {
+    report(e);
+    try { retry(); } catch (t) { report(t); }
+}
+"#;
+    let expected = r#"
+try { run(); } catch (error) {
+    try { retry(); } catch (err) { report(error, err); }
+}
+try { run(); } catch (error) {
+    report(error);
+    try { retry(); } catch (err) { report(err); }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn role_uses_alternatives_instead_of_shadowing_an_outer_binding() {
+    let input = r#"
+import { resolve } from "path";
+const base = resolve(dir);
+const load = () => new Promise((e, t) => fetchFile(base, e, t));
+const read = () => new Promise((e) => fetchFile(resolve(dir), e));
+function f() {
+    let { error } = state;
+    try { run(error); } catch (e) { report(e); }
+}
+"#;
+    let expected = r#"
+import { resolve } from "path";
+const base = resolve(dir);
+const load = () => new Promise((resolvePromise, rejectPromise) => fetchFile(base, resolvePromise, rejectPromise));
+const read = () => new Promise((resolvePromise) => fetchFile(resolve(dir), resolvePromise));
+function f() {
+    let { error } = state;
+    try { run(error); } catch (err) { report(err); }
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn role_executor_falls_back_to_promise_suffixed_pair_then_numeric_suffix() {
+    let input = r#"
+import { resolve, resolvePromise } from "path";
+import { reject } from "policy";
+const a = new Promise((e) => e(1));
+const b = new Promise((e, t) => fetchFile(e, t));
+"#;
+    let expected = r#"
+import { resolve, resolvePromise } from "path";
+import { reject } from "policy";
+const a = new Promise((resolve_1) => resolve_1(1));
+const b = new Promise((resolve_1, rejectPromise) => fetchFile(resolve_1, rejectPromise));
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn role_renames_promise_executor_parameters() {
+    let input = r#"
+const a = new Promise((e, t) => {
+    load(e, t);
+});
+const b = new Promise(function (e, t) {
+    e(1);
+});
+"#;
+    let expected = r#"
+const a = new Promise((resolve, reject) => {
+    load(resolve, reject);
+});
+const b = new Promise(function (resolve, reject) {
+    resolve(1);
+});
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn role_skips_local_promise_and_uses_alternatives_for_taken_names() {
+    let input = r#"
+function f(Promise) {
+    return new Promise((e, t) => e(t));
+}
+const b = new Promise((e, t) => {
+    const resolve = 1;
+    e(resolve, t);
+});
+"#;
+    let expected = r#"
+function f(Promise) {
+    return new Promise((e, t) => e(t));
+}
+const b = new Promise((resolvePromise, rejectPromise) => {
+    const resolve = 1;
+    resolvePromise(resolve, rejectPromise);
+});
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn role_skips_module_with_direct_eval() {
+    let input = r#"
+try { run(); } catch (e) { eval("report(e)"); }
+"#;
+    assert_eq_normalized(&apply(input), input);
+}
+
+#[test]
+fn role_renames_reduce_callback_parameters() {
+    let input = r#"
+const a = list.reduce((e, t, n) => e + t * n, 0);
+const b = Object.keys(map).reduce((e, t) => {
+    e[t] = 1;
+    return e;
+}, {});
+const c = state.orders.reduceRight(function (e, t) {
+    return e.concat(t.lines);
+}, []);
+const d = Object.keys(map).sort().reduce((e, t) => e + t, "");
+const f = Object.entries(map).reduce((e, t) => e + t[0], "");
+"#;
+    let expected = r#"
+const a = list.reduce((acc, item, index) => acc + item * index, 0);
+const b = Object.keys(map).reduce((acc, key) => {
+    acc[key] = 1;
+    return acc;
+}, {});
+const c = state.orders.reduceRight(function (acc, order) {
+    return acc.concat(order.lines);
+}, []);
+const d = Object.keys(map).sort().reduce((acc, key) => acc + key, "");
+const f = Object.entries(map).reduce((acc, entry) => acc + entry[0], "");
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn role_singularizes_only_unambiguous_plurals() {
+    let input = r#"
+a.entries.reduce((e, t) => e + t, 0);
+a.batches.reduce((e, t) => e + t, 0);
+a.nodeIndices.reduce((e, t) => e + t, 0);
+a.children.reduce((e, t) => e + t, 0);
+a.e_textures.reduce((e, t) => e + t, 0);
+a.statuses.reduce((e, t) => e + t, 0);
+a.axes.reduce((e, t) => e + t, 0);
+a.status.reduce((e, t) => e + t, 0);
+a.data.reduce((e, t) => e + t, 0);
+"#;
+    let expected = r#"
+a.entries.reduce((acc, entry) => acc + entry, 0);
+a.batches.reduce((acc, batch) => acc + batch, 0);
+a.nodeIndices.reduce((acc, nodeIndex) => acc + nodeIndex, 0);
+a.children.reduce((acc, child) => acc + child, 0);
+a.e_textures.reduce((acc, texture) => acc + texture, 0);
+a.statuses.reduce((acc, item) => acc + item, 0);
+a.axes.reduce((acc, item) => acc + item, 0);
+a.status.reduce((acc, item) => acc + item, 0);
+a.data.reduce((acc, item) => acc + item, 0);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn role_reduce_skips_taken_names_and_written_elements_and_suffixes_nested_acc() {
+    let input = r#"
+const a = list.reduce((e, t) => e + t + item, 0);
+const b = list.reduce((e, t) => {
+    t = t || 0;
+    return e + t;
+}, 0);
+const c = rows.reduce((e, t) => e + t.reduce((n, r) => n + r + e, 0), 0);
+"#;
+    let expected = r#"
+const a = list.reduce((acc, t) => acc + t + item, 0);
+const b = list.reduce((acc, t) => {
+    t = t || 0;
+    return acc + t;
+}, 0);
+const c = rows.reduce((acc, row) => acc + row.reduce((acc_1, item) => acc_1 + item + acc, 0), 0);
+"#;
+    assert_eq_normalized(&apply(input), expected);
+}
+
+#[test]
+fn role_names_loop_element_after_the_array() {
+    let input = r#"
+for (let t = 0; t < e.rows.length; t++) {
+    const n = e.rows[t];
+    draw(n);
+}
+for (let t = 0, r = cells.length; t < r; t++) {
+    const n = cells[t];
+    paint(n, t);
+}
+for (let t = 0; t < arguments.length; t++) {
+    const n = arguments[t];
+    use(n);
+}
+for (let t = 0; t < items.length; t++) {
+    const n = items[t];
+    use(n, item);
+}
+"#;
+    let expected = r#"
+for (let t = 0; t < e.rows.length; t++) {
+    const row = e.rows[t];
+    draw(row);
+}
+for (let t = 0, r = cells.length; t < r; t++) {
+    const cell = cells[t];
+    paint(cell, t);
+}
+for (let t = 0; t < arguments.length; t++) {
+    const n = arguments[t];
+    use(n);
+}
+for (let t = 0; t < items.length; t++) {
+    const n = items[t];
+    use(n, item);
+}
+"#;
+    assert_eq_normalized(&apply(input), expected);
 }
 
 // ============================================================

@@ -66,9 +66,9 @@ struct RuleRunContext<'a> {
     unresolved_mark: Mark,
     rewrite_level: RewriteLevel,
     dce_mode: DceMode,
-    source_import_reads_are_observable: bool,
     module_facts: Option<&'a ModuleFactsMap>,
     current_filename: Option<&'a str>,
+    call_required_plan: Option<&'a crate::rules::CallRequiredPlan>,
     local_helpers: Rc<RefCell<Option<Rc<LocalHelperContext>>>>,
     extracted_function_names: SharedExtractedFunctionNames,
     pre_dead: Option<Rc<PreDeadSet>>,
@@ -76,9 +76,9 @@ struct RuleRunContext<'a> {
 
 pub(super) struct PreDeadSet {
     pub decl_spans:
-        std::collections::HashSet<(swc_core::common::BytePos, swc_core::common::BytePos)>,
+        crate::collections::HashSet<(swc_core::common::BytePos, swc_core::common::BytePos)>,
     pub preserved_import_spans:
-        std::collections::HashSet<(swc_core::common::BytePos, swc_core::common::BytePos)>,
+        crate::collections::HashSet<(swc_core::common::BytePos, swc_core::common::BytePos)>,
 }
 
 impl RuleRunContext<'_> {
@@ -163,11 +163,7 @@ runner!(run_un_computed_properties, |ctx| {
     UnComputedProperties::new(ctx.rewrite_level)
 });
 runner!(run_simplify_sequence, |ctx| {
-    SimplifySequence::new_with_import_semantics(
-        ctx.unresolved_mark,
-        ctx.rewrite_level,
-        ctx.source_import_reads_are_observable,
-    )
+    SimplifySequence::new_with_level(ctx.unresolved_mark, ctx.rewrite_level)
 });
 runner!(run_flip_comparisons, |ctx| FlipComparisons::new(
     ctx.unresolved_mark
@@ -182,12 +178,18 @@ fn run_remove_void(module: &mut Module, ctx: RuleRunContext<'_>) {
 
 runner!(run_unminify_booleans, UnminifyBooleans);
 runner!(run_un_double_negation, UnDoubleNegation);
-runner!(run_un_infinity, UnInfinity);
+fn run_un_infinity(module: &mut Module, ctx: RuleRunContext<'_>) {
+    if UnInfinity::should_run(module) {
+        module.visit_mut_with(&mut UnInfinity::new(ctx.unresolved_mark));
+    }
+}
 runner!(run_un_indirect_call, |ctx| UnIndirectCall::new(
+    ctx.unresolved_mark,
     ctx.rewrite_level
 ));
 runner!(run_un_typeof, UnTypeof);
 runner!(run_un_numeric_literal, UnNumericLiteral);
+runner!(run_un_string_escape, UnStringEscape);
 runner!(run_un_bracket_notation, UnBracketNotation);
 fn run_un_interop_require_default(module: &mut Module, ctx: RuleRunContext<'_>) {
     let local_helpers = ctx.local_helpers(module);
@@ -286,7 +288,9 @@ runner!(run_un_curly_braces, UnCurlyBraces);
 runner!(run_un_esmodule_flag, |ctx| UnEsmoduleFlag::new(
     ctx.unresolved_mark
 ));
-runner!(run_un_assignment_merging, UnAssignmentMerging);
+runner!(run_un_assignment_merging, |ctx| {
+    UnAssignmentMerging::new(ctx.unresolved_mark)
+});
 runner!(run_un_webpack_interop, |ctx| UnWebpackInterop::new(
     ctx.unresolved_mark
 ));
@@ -307,9 +311,11 @@ fn run_un_template_literal(module: &mut Module, ctx: RuleRunContext<'_>) {
 }
 runner!(run_un_while_loop, UnWhileLoop);
 runner!(run_un_type_constructor, |ctx| UnTypeConstructor::new(
+    ctx.unresolved_mark,
     ctx.rewrite_level
 ));
 runner!(run_un_builtin_prototype, |ctx| UnBuiltinPrototype::new(
+    ctx.unresolved_mark,
     ctx.rewrite_level
 ));
 runner!(run_un_argument_spread, |ctx| UnArgumentSpread::new(
@@ -318,6 +324,9 @@ runner!(run_un_argument_spread, |ctx| UnArgumentSpread::new(
 ));
 runner!(run_un_array_concat_spread, |ctx| {
     UnArrayConcatSpread::new_with_level(ctx.rewrite_level)
+});
+runner!(run_un_array_concat_spread_rest, |ctx| {
+    UnArrayConcatSpreadRest::new(ctx.unresolved_mark, ctx.rewrite_level)
 });
 runner!(run_un_spread_array_literal, UnSpreadArrayLiteral);
 runner!(run_object_assign_spread, |ctx| ObjectAssignSpread::new(
@@ -350,10 +359,14 @@ runner!(run_extract_inlined_function, |ctx| {
     )
 });
 fn run_un_conditionals(module: &mut Module, ctx: RuleRunContext<'_>) {
-    module.visit_mut_with(&mut UnConditionals);
+    module.visit_mut_with(&mut UnConditionals::default());
     // UnConditionals rewrites ternary helper bodies (e.g. _defineProperty with
     // _toPropertyKey) into if/else form. This changes helper shapes, so rebuild
     // the cache so UnClassFields and UnDefineProperty see the expanded bodies.
+    ctx.invalidate_local_helpers();
+}
+fn run_un_conditionals_nested(module: &mut Module, ctx: RuleRunContext<'_>) {
+    module.visit_mut_with(&mut UnConditionals::with_nested_actions());
     ctx.invalidate_local_helpers();
 }
 runner!(run_un_parameters, |ctx| UnParameters::new(
@@ -369,11 +382,14 @@ runner!(run_un_jsx, |ctx| UnJsx::new_with_level(
 ));
 fn run_un_es6_class(module: &mut Module, ctx: RuleRunContext<'_>) {
     let local_helpers = ctx.local_helpers(module);
+    let pin_exports =
+        crate::rules::pinned_export_names(ctx.call_required_plan, ctx.current_filename);
     UnEs6Class::run_with_helpers(
         module,
         ctx.unresolved_mark,
         ctx.rewrite_level,
         local_helpers.as_ref(),
+        pin_exports,
     );
 }
 fn run_un_class_fields(module: &mut Module, ctx: RuleRunContext<'_>) {
@@ -416,14 +432,24 @@ runner!(
     ClassExpressionToDeclaration
 );
 runner!(run_obj_shorthand, ObjShorthand);
-runner!(run_obj_method_shorthand, ObjMethodShorthand);
-runner!(run_un_prototype_class, UnPrototypeClass);
+fn run_obj_method_shorthand(module: &mut Module, ctx: RuleRunContext<'_>) {
+    let local_helpers = ctx.local_helpers(module);
+    ObjMethodShorthand::run_with_helpers(module, ctx.unresolved_mark, local_helpers.as_ref());
+}
+fn run_un_prototype_class(module: &mut Module, ctx: RuleRunContext<'_>) {
+    let pin_exports =
+        crate::rules::pinned_export_names(ctx.call_required_plan, ctx.current_filename);
+    module.visit_mut_with(&mut UnPrototypeClass::with_pins(pin_exports));
+}
 runner!(run_exponent, |ctx| Exponent::new(ctx.unresolved_mark));
 runner!(run_arg_rest, |ctx| ArgRest::new(ctx.rewrite_level));
 runner!(run_un_rest_array_copy, |ctx| UnRestArrayCopy::new(
     ctx.unresolved_mark
 ));
-runner!(run_arrow_function, ArrowFunction);
+fn run_arrow_function(module: &mut Module, ctx: RuleRunContext<'_>) {
+    let local_helpers = ctx.local_helpers(module);
+    ArrowFunction::run_with_helpers(module, ctx.unresolved_mark, local_helpers.as_ref());
+}
 runner!(run_un_namespace, UnNamespace);
 runner!(run_arrow_return, ArrowReturn);
 fn run_un_for_of(module: &mut Module, ctx: RuleRunContext<'_>) {
@@ -449,7 +475,9 @@ runner!(run_import_dedup, ImportDedup);
 runner!(run_un_import_rename, |ctx| UnImportRename::new(
     ctx.unresolved_mark
 ));
-runner!(run_un_export_rename, UnExportRename);
+runner!(run_un_export_rename, |ctx| UnExportRename::new(
+    ctx.unresolved_mark
+));
 fn run_un_destructuring(module: &mut Module, ctx: RuleRunContext<'_>) {
     let local_helpers = ctx.local_helpers(module);
     let mut rule = UnDestructuring::new_with_helpers(
@@ -536,6 +564,7 @@ define_rule_registry! {
     ("UnIndirectCall", Syntax, run_un_indirect_call, always_enabled),
     ("UnTypeof", Syntax, run_un_typeof, always_enabled),
     ("UnNumericLiteral", Syntax, run_un_numeric_literal, always_enabled),
+    ("UnStringEscape", Syntax, run_un_string_escape, always_enabled),
     ("UnBracketNotation", Syntax, run_un_bracket_notation, always_enabled),
     ("UnInteropRequireDefault", Helpers, run_un_interop_require_default, always_enabled, requires: [
         "UnIndirectCall",
@@ -551,6 +580,8 @@ define_rule_registry! {
         "UnBracketNotation"
     ]),
     ("UnSlicedToArray", Helpers, run_un_sliced_to_array, always_enabled),
+    // Strips guards already in class syntax so UnClassFields sees field
+    // initializers first. Guards in functions wait for UnClassCallCheck2.
     ("UnClassCallCheck", Helpers, run_un_class_call_check, always_enabled),
     ("UnPossibleConstructorReturn", Helpers, run_un_possible_constructor_return, always_enabled),
     ("UnTypeofPolyfill", Helpers, run_un_typeof_polyfill, always_enabled),
@@ -615,6 +646,15 @@ define_rule_registry! {
     ("UnWhileLoop", Complex, run_un_while_loop, always_enabled, requires: [
         "UnParameters"
     ]),
+    // UnParameters leaves canonical arguments-copy loops intact. Use those
+    // loops as positive Array proof before UnEs6Class consumes the surrounding
+    // Babel inheritance wrapper, then flatten the newly built argument array.
+    ("UnArrayConcatSpreadRest", Complex, run_un_array_concat_spread_rest, standard_or_above, requires: [
+        "UnParameters"
+    ]),
+    ("UnSpreadArrayLiteral2", Complex, run_un_spread_array_literal, standard_or_above, requires: [
+        "UnArrayConcatSpreadRest"
+    ]),
     ("UnEnum", Complex, run_un_enum, always_enabled),
     ("UnJsx", Complex, run_un_jsx, standard_or_above),
     ("UnEs6Class", Complex, run_un_es6_class, always_enabled),
@@ -653,6 +693,13 @@ define_rule_registry! {
     ("ObjShorthand", Modernization, run_obj_shorthand, always_enabled),
     ("ObjMethodShorthand", Modernization, run_obj_method_shorthand, always_enabled),
     ("UnPrototypeClass", Modernization, run_un_prototype_class, always_enabled),
+    // UnEs6Class and UnPrototypeClass clone constructor bodies, including a
+    // Babel classCallCheck that must stay while the constructor is still a
+    // function. Strip it only after both recoveries have committed to class
+    // syntax, then drop helpers with no remaining references.
+    ("UnClassCallCheck2", Modernization, run_un_class_call_check, always_enabled, requires: [
+        "UnPrototypeClass"
+    ]),
     ("Exponent", Modernization, run_exponent, always_enabled),
     ("ArgRest", Modernization, run_arg_rest, always_enabled),
     ("UnRestArrayCopy", Modernization, run_un_rest_array_copy, always_enabled),
@@ -743,10 +790,12 @@ define_rule_registry! {
         "SmartRename",
         "ExtractInlinedFunction"
     ]),
-    // UnJsx2 can expose component aliases and value-position hints in JSX.
-    // Only the JSX-aware sub-rules need to re-run; the non-JSX sub-rules
-    // and recursive function/arrow descent were fully handled by SmartRename.
-    ("SmartRename2", Cleanup, run_smart_rename_second_pass, always_enabled, requires: [
+    // UnJsx2 can expose component aliases and value-position hints in JSX,
+    // and intermediate rules can expose new function-level rename shapes.
+    // Module-level non-JSX sub-rules are skipped; they ran in SmartRename.
+    // Gated like SmartRename: a repeat pass must not run where its first
+    // pass is disabled.
+    ("SmartRename2", Cleanup, run_smart_rename_second_pass, standard_or_above, requires: [
         "UnJsx2"
     ]),
     // Late structural rewrites can consume uninitialized temps used by lowered
@@ -769,8 +818,11 @@ define_rule_registry! {
     ("UnReturn", Cleanup, run_un_return, always_enabled),
     // Late rules (SmartInline, ArrowFunction, UnReturn) can create or expose
     // conditional patterns (return ternaries, short-circuit expression
-    // statements) that the first UnConditionals pass could not see.
-    ("UnConditionals2", Cleanup, run_un_conditionals, always_enabled, requires: [
+    // statements) that the first UnConditionals pass could not see. This pass
+    // also converts actions nested under `&&`, `||`, and ternaries; class and
+    // helper recovery match inlined helpers in that expression form, so the
+    // first pass leaves them alone.
+    ("UnConditionals2", Cleanup, run_un_conditionals_nested, always_enabled, requires: [
         "UnReturn"
     ]),
 }
@@ -783,6 +835,7 @@ pub struct RulePipelineOptions<'a> {
     pub rewrite_level: RewriteLevel,
     pub module_facts: Option<&'a ModuleFactsMap>,
     pub current_filename: Option<&'a str>,
+    pub(crate) call_required_plan: Option<&'a crate::rules::CallRequiredPlan>,
 }
 
 impl Default for RulePipelineOptions<'_> {
@@ -794,6 +847,7 @@ impl Default for RulePipelineOptions<'_> {
             rewrite_level: RewriteLevel::Standard,
             module_facts: None,
             current_filename: None,
+            call_required_plan: None,
         }
     }
 }
@@ -831,6 +885,14 @@ impl<'a> RulePipelineOptions<'a> {
 
     pub fn with_current_filename(mut self, current_filename: &'a str) -> Self {
         self.current_filename = Some(current_filename);
+        self
+    }
+
+    pub(crate) fn with_call_required_plan(
+        mut self,
+        plan: &'a crate::rules::CallRequiredPlan,
+    ) -> Self {
+        self.call_required_plan = Some(plan);
         self
     }
 }
@@ -889,21 +951,27 @@ fn apply_rules_impl(
         unresolved_mark,
         rewrite_level: options.rewrite_level,
         dce_mode: options.dce_mode,
-        source_import_reads_are_observable: preserve_input_import_link_checks,
         module_facts: options.module_facts,
         current_filename: options.current_filename,
+        call_required_plan: options.call_required_plan,
         local_helpers: Rc::new(RefCell::new(None)),
-        extracted_function_names: Rc::new(RefCell::new(ExtractedFunctionNames::new())),
+        extracted_function_names: Rc::new(RefCell::new(ExtractedFunctionNames::default())),
         pre_dead,
     };
     let mut started = options.start_from.is_none();
 
     for descriptor in RULE_DESCRIPTORS {
-        if !descriptor.is_enabled(ctx.clone()) {
-            continue;
-        }
+        // `start_from` / `stop_after` name pipeline positions, so they take
+        // effect whether or not the named rule is enabled at this level:
+        // stopping at a disabled rule stops there instead of running to the end.
         if !started && options.start_from == Some(descriptor.id) {
             started = true;
+        }
+        if !descriptor.is_enabled(ctx.clone()) {
+            if started && options.stop_after == Some(descriptor.id) {
+                return;
+            }
+            continue;
         }
         if !started {
             continue;
@@ -955,6 +1023,59 @@ mod tests {
     }
 
     #[test]
+    fn stop_after_a_disabled_rule_stops_at_its_position() {
+        GLOBALS.set(&Default::default(), || {
+            let mut module = Module {
+                span: DUMMY_SP,
+                body: Vec::new(),
+                shebang: None,
+            };
+            let unresolved_mark = Mark::new();
+            let mut ran: Vec<&'static str> = Vec::new();
+            // SmartRename is standard_or_above, so it is disabled at Minimal.
+            apply_rules_with_observer(
+                &mut module,
+                unresolved_mark,
+                RulePipelineOptions::until("SmartRename").with_rewrite_level(RewriteLevel::Minimal),
+                &mut |name, _| ran.push(name),
+            );
+            assert!(
+                !ran.contains(&"SmartRename"),
+                "disabled stop rule must not run: {ran:?}"
+            );
+            assert!(
+                !ran.contains(&"UnParameters3"),
+                "rules after the disabled stop rule must not run: {ran:?}"
+            );
+            assert!(
+                ran.contains(&"UnParameters2"),
+                "rules before the stop position still run: {ran:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn start_from_a_disabled_rule_starts_at_its_position() {
+        GLOBALS.set(&Default::default(), || {
+            let mut module = Module {
+                span: DUMMY_SP,
+                body: Vec::new(),
+                shebang: None,
+            };
+            let unresolved_mark = Mark::new();
+            let mut ran: Vec<&'static str> = Vec::new();
+            apply_rules_with_observer(
+                &mut module,
+                unresolved_mark,
+                RulePipelineOptions::between("SmartRename", "UnParameters3")
+                    .with_rewrite_level(RewriteLevel::Minimal),
+                &mut |name, _| ran.push(name),
+            );
+            assert_eq!(ran, vec!["UnParameters3"], "{ran:?}");
+        });
+    }
+
+    #[test]
     fn reuses_local_helper_context_within_stable_rule_spans() {
         GLOBALS.set(&Default::default(), || {
             let mut module = Module {
@@ -988,9 +1109,9 @@ mod tests {
                 unresolved_mark,
                 rewrite_level: RewriteLevel::Standard,
                 dce_mode: DceMode::Full,
-                source_import_reads_are_observable: true,
                 module_facts: None,
                 current_filename: None,
+                call_required_plan: None,
                 local_helpers: Rc::new(RefCell::new(Some(Rc::new(LocalHelperContext::default())))),
                 extracted_function_names: Default::default(),
                 pre_dead: None,

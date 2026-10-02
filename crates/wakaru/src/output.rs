@@ -71,6 +71,9 @@ pub struct ModuleOutput {
     /// preserves the input filename.
     pub filename: String,
     pub code: String,
+    /// v3 source map JSON mapping `code` back to its input, when output
+    /// source maps were requested. Unpack maps point into the input the
+    /// module was extracted from and omit `sourcesContent`.
     pub source_map: Option<String>,
     pub provenance: Vec<SourceSpan>,
     /// Inspect-only source context for static analysis. When
@@ -221,6 +224,7 @@ pub enum DiagnosticCode {
     TdzViolation,
     DuplicateDeclaration,
     ImportCycle,
+    CrossModuleClassCall,
     OutputParseRecovered,
     OutputParseFailed,
 }
@@ -236,6 +240,7 @@ impl DiagnosticCode {
             Self::TdzViolation => "tdz_violation",
             Self::DuplicateDeclaration => "duplicate_declaration",
             Self::ImportCycle => "import_cycle",
+            Self::CrossModuleClassCall => "cross_module_class_call",
             Self::OutputParseRecovered => "output_parse_recovered",
             Self::OutputParseFailed => "output_parse_failed",
         }

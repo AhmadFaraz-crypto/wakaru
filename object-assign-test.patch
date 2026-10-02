@@ -1,0 +1,247 @@
+diff --git a/crates/core/tests/object_assign_spread_scope_5e2d9a.rs b/crates/core/tests/object_assign_spread_scope_5e2d9a.rs
+new file mode 100644
+index 00000000..c8a005cf
+--- /dev/null
++++ b/crates/core/tests/object_assign_spread_scope_5e2d9a.rs
+@@ -0,0 +1,241 @@
++mod common;
++
++use common::{assert_eq_normalized, render_rule};
++use wakaru_core::rules::ObjectAssignSpread;
++
++fn standard(input: &str) -> String {
++    render_rule(input, ObjectAssignSpread::new)
++}
++
++// --- positive ---------------------------------------------------------------
++
++#[test]
++fn converts_global_object_assign() {
++    assert_eq_normalized(
++        &standard("const x = Object.assign({}, source);"),
++        "const x = { ...source };",
++    );
++}
++
++#[test]
++fn flattens_literal_sources() {
++    assert_eq_normalized(
++        &standard("const x = Object.assign({}, defaults, { extra: 1 });"),
++        "const x = { ...defaults, extra: 1 };",
++    );
++}
++
++#[test]
++fn preserves_property_overwrite_order_when_flattening() {
++    assert_eq_normalized(
++        &standard("const x = Object.assign({ a: 1 }, { a: 2 });"),
++        "const x = { a: 1, a: 2 };",
++    );
++}
++
++// --- alias ------------------------------------------------------------------
++
++#[test]
++fn converts_const_alias_at_standard() {
++    assert_eq_normalized(
++        &standard("const O = Object;\nconst x = O.assign({}, source);"),
++        "const O = Object;\nconst x = { ...source };",
++    );
++}
++
++#[test]
++fn preserves_let_alias() {
++    // A reassignable binding is not a stable alias of the global.
++    let input = "let O = Object;\nconst x = O.assign({}, source);";
++    assert_eq_normalized(&standard(input), input);
++}
++
++#[test]
++fn respects_syntax_context_of_alias_bindings() {
++    // The outer `O` is a global alias and converts; the inner `O` shadows it
++    // with a different binding and must be left alone.
++    let input = concat!(
++        "const O = Object;\n",
++        "const outer = O.assign({}, a);\n",
++        "function f() {\n",
++        "    const O = other;\n",
++        "    return O.assign({}, b);\n",
++        "}"
++    );
++    let expected = concat!(
++        "const O = Object;\n",
++        "const outer = { ...a };\n",
++        "function f() {\n",
++        "    const O = other;\n",
++        "    return O.assign({}, b);\n",
++        "}"
++    );
++    assert_eq_normalized(&standard(input), expected);
++}
++
++#[test]
++fn preserves_when_object_assign_reassigned_later_in_module() {
++    // Mutation anywhere in the module is disqualifying, even after the call.
++    let input = "const x = Object.assign({}, source);\nObject.assign = custom;";
++    assert_eq_normalized(&standard(input), input);
++}
++
++#[test]
++fn preserves_alias_of_non_object() {
++    let input = "const O = notObject;\nconst x = O.assign({}, source);";
++    assert_eq_normalized(&standard(input), input);
++}
++
++// --- negative (shadowing / target) ------------------------------------------
++
++#[test]
++fn preserves_shadowed_object_binding() {
++    let input = "function f(Object) {\n    return Object.assign({}, source);\n}";
++    assert_eq_normalized(&standard(input), input);
++}
++
++#[test]
++fn preserves_non_object_first_argument() {
++    let input = "const x = Object.assign(target, source);";
++    assert_eq_normalized(&standard(input), input);
++}
++
++// --- mutation ---------------------------------------------------------------
++
++#[test]
++fn preserves_when_object_assign_reassigned() {
++    let input = "Object.assign = custom;\nconst x = Object.assign({}, source);";
++    assert_eq_normalized(&standard(input), input);
++}
++
++#[test]
++fn preserves_when_object_reassigned() {
++    let input = "Object = replacement;\nconst x = Object.assign({}, source);";
++    assert_eq_normalized(&standard(input), input);
++}
++
++#[test]
++fn preserves_alias_when_object_is_mutated() {
++    let input = "const O = Object;\nObject.assign = custom;\nconst x = O.assign({}, source);";
++    assert_eq_normalized(&standard(input), input);
++}
++
++// --- nested scope / with / eval ---------------------------------------------
++
++#[test]
++fn preserves_inside_direct_eval_scope_but_converts_outside() {
++    let input = concat!(
++        "function dyn() {\n",
++        "    eval(\"\");\n",
++        "    return Object.assign({}, source);\n",
++        "}\n",
++        "const x = Object.assign({}, other);"
++    );
++    let expected = concat!(
++        "function dyn() {\n",
++        "    eval(\"\");\n",
++        "    return Object.assign({}, source);\n",
++        "}\n",
++        "const x = { ...other };"
++    );
++    assert_eq_normalized(&standard(input), expected);
++}
++
++#[test]
++fn preserves_inside_with_block() {
++    let input = "with (scope) {\n    Object.assign({}, source);\n}";
++    assert_eq_normalized(&standard(input), input);
++}
++
++// --- accessors --------------------------------------------------------------
++
++#[test]
++fn keeps_getter_source_behind_spread() {
++    assert_eq_normalized(
++        &standard("const x = Object.assign({}, { get a() { return 1; } });"),
++        "const x = { ...{ get a() { return 1; } } };",
++    );
++}
++
++#[test]
++fn keeps_setter_source_behind_spread() {
++    assert_eq_normalized(
++        &standard("const x = Object.assign({}, { set a(v) {} });"),
++        "const x = { ...{ set a(v) {} } };",
++    );
++}
++
++// --- symbols / computed keys ------------------------------------------------
++
++#[test]
++fn flattens_computed_symbol_key_source() {
++    assert_eq_normalized(
++        &standard("const x = Object.assign({}, { [Symbol.iterator]: fn });"),
++        "const x = { [Symbol.iterator]: fn };",
++    );
++}
++
++// --- evaluation order / arguments -------------------------------------------
++
++#[test]
++fn preserves_spread_argument_in_call_position() {
++    let input = "const x = Object.assign({}, ...sources);";
++    assert_eq_normalized(&standard(input), input);
++}
++
++#[test]
++fn preserves_unsafe_accessor_target() {
++    let input = "const x = Object.assign({ get a() { return 1; } }, source);";
++    assert_eq_normalized(&standard(input), input);
++}
++
++// --- detached method aliases ------------------------------------------------
++
++#[test]
++fn converts_detached_method_alias() {
++    // `Object.assign` ignores its `this`, so a detached reference is equivalent.
++    assert_eq_normalized(
++        &standard("const a = Object.assign;\nconst x = a({}, source);"),
++        "const a = Object.assign;\nconst x = { ...source };",
++    );
++}
++
++#[test]
++fn converts_destructured_assign_shorthand() {
++    assert_eq_normalized(
++        &standard("const { assign } = Object;\nconst x = assign({}, source);"),
++        "const { assign } = Object;\nconst x = { ...source };",
++    );
++}
++
++#[test]
++fn converts_renamed_destructured_assign() {
++    assert_eq_normalized(
++        &standard("const { assign: merge } = Object;\nconst x = merge({}, source);"),
++        "const { assign: merge } = Object;\nconst x = { ...source };",
++    );
++}
++
++#[test]
++fn preserves_method_alias_when_object_assign_is_mutated() {
++    let input = "const a = Object.assign;\nObject.assign = custom;\nconst x = a({}, source);";
++    assert_eq_normalized(&standard(input), input);
++}
++
++#[test]
++fn preserves_method_alias_inside_direct_eval_scope() {
++    let input = concat!(
++        "const a = Object.assign;\n",
++        "function dyn() {\n",
++        "    eval(\"\");\n",
++        "    return a({}, source);\n",
++        "}"
++    );
++    assert_eq_normalized(&standard(input), input);
++}
++
++#[test]
++fn preserves_bare_call_that_is_not_an_object_assign_alias() {
++    let input = "function assign(t, s) {\n    return t;\n}\nconst x = assign({}, source);";
++    assert_eq_normalized(&standard(input), input);
++}

@@ -10,6 +10,8 @@ use swc_core::ecma::parser::{lexer::Lexer, EsSyntax, Parser, StringInput, Syntax
 
 pub(crate) use crate::utils::swc_safety::apply_fixer;
 
+use super::line_index::LineIndex;
+
 #[derive(Debug, Clone)]
 pub(super) struct ParsedModule {
     pub module: Module,
@@ -186,6 +188,41 @@ pub(super) fn print_js_with_srcmap(
     Ok((code, srcmap_buf))
 }
 
+/// Add resolved mappings `(output position, input line, input column,
+/// source id)`, keeping one per output position.
+///
+/// The emitter records a node's span start before its children's, so a
+/// parent and its first child land on the same output column. When a rule
+/// moved code (a flipped comparison, an unwrapped `(0, x.y)` callee), their
+/// input positions differ, and consumers disagree on which duplicate wins.
+/// The last one belongs to the innermost node, the token actually printed
+/// there. The emitter only writes forward, so duplicates are adjacent.
+/// Callers filter out unmapped entries first, so a dropped entry never
+/// displaces a mapped one.
+pub(super) fn add_innermost_mappings(
+    builder: &mut sourcemap::SourceMapBuilder,
+    mappings: impl IntoIterator<Item = (LineCol, u32, u32, u32)>,
+) {
+    let mut mappings = mappings.into_iter().peekable();
+    while let Some((out_loc, line, col, src_id)) = mappings.next() {
+        if mappings
+            .peek()
+            .is_some_and(|(next, ..)| (next.line, next.col) == (out_loc.line, out_loc.col))
+        {
+            continue;
+        }
+        builder.add_raw(
+            out_loc.line,
+            out_loc.col,
+            line,
+            col,
+            Some(src_id),
+            None,
+            false,
+        );
+    }
+}
+
 /// Build a v3 source map JSON string from the raw emitter mappings.
 ///
 /// `mappings` are `(input_byte_pos, output_line_col)` entries collected by
@@ -197,31 +234,36 @@ pub(super) fn build_output_sourcemap(
     output_filename: &str,
 ) -> Result<String> {
     let mut builder = sourcemap::SourceMapBuilder::new(Some(output_filename));
+    // Per input file: its line index and source id. The source and its
+    // contents are registered once; `set_source_contents` copies the whole
+    // input on every call.
+    let mut files: crate::collections::HashMap<BytePos, (LineIndex, u32)> =
+        crate::collections::HashMap::default();
+    let mut resolved = Vec::with_capacity(mappings.len());
 
     for &(byte_pos, ref out_loc) in mappings {
         // DUMMY_SP positions (BytePos(0)) have no meaningful source location.
         if byte_pos.0 == 0 {
             continue;
         }
-        let loc = cm.lookup_char_pos(byte_pos);
-        let source_name = match &*loc.file.name {
+        let file = cm.lookup_byte_offset(byte_pos);
+        let source_name = match &*file.sf.name {
             FileName::Custom(name) => name.as_str(),
             _ => continue,
         };
-        let src_id = builder.add_source(source_name);
-        if !loc.file.src.is_empty() {
-            builder.set_source_contents(src_id, Some(loc.file.src.as_ref()));
-        }
-        builder.add_raw(
-            out_loc.line,
-            out_loc.col,
-            (loc.line - 1) as u32,
-            loc.col_display as u32,
-            Some(src_id),
-            None,
-            false,
-        );
+        let (line_index, src_id) = files.entry(file.sf.start_pos).or_insert_with(|| {
+            let src_id = builder.add_source(source_name);
+            if !file.sf.src.is_empty() {
+                builder.set_source_contents(src_id, Some(file.sf.src.as_ref()));
+            }
+            (LineIndex::new(&file.sf.src), src_id)
+        });
+        let Some((line, col)) = line_index.position(file.pos.0) else {
+            continue;
+        };
+        resolved.push((*out_loc, line, col, *src_id));
     }
+    add_innermost_mappings(&mut builder, resolved);
 
     let srcmap = builder.into_sourcemap();
     let mut buf = Vec::new();

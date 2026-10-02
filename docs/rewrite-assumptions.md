@@ -62,11 +62,99 @@ that observes `this`, even though the recovered form matches the original ESM
 source shape.
 
 Affects: `UnIndirectCall` (member-callee forms), `UnInteropRequireDefault`
-(call sites rewritten from `.default`), and `UnEsm` (default interop recovery).
+(call sites rewritten from `.default`), and `UnEsm` (default interop recovery
+and conditional named-export reads rewritten from `exports.fn()` to `fn()`).
 
 Level: receiver-changing `UnIndirectCall` and `UnEsm` forms require `standard`
 or above. Explicit transpiler-helper recovery in `UnInteropRequireDefault`
 applies whenever that helper is recognized.
+
+### `iterator_materialization_independence`
+
+The program does not depend on the eager iterator materialization introduced by
+transpiler helpers, including its ordering relative to destructuring defaults.
+
+For a recognized sliced-to-array helper and a complete default pattern,
+`standard` prefers recovery of the pre-transpile source. Matching the helper's
+literal limit `N` to the pattern's element count constrains the group shape; it
+does not prove that iterator steps, defaults, and iterator closing happen in
+the same order.
+
+For example, start each variant with this state:
+
+```js
+let nextValue = 1;
+function fallback() { nextValue = 99; return 7; }
+function* values() {
+  yield undefined;
+  yield nextValue;
+}
+```
+
+Babel's helper first materializes both values and closes the iterator, then the
+lowered code evaluates the default:
+
+```js
+const tmp = _slicedToArray(values(), 2);
+const a = tmp[0] === undefined ? fallback() : tmp[0];
+const b = tmp[1]; // 1
+```
+
+The recovered pattern evaluates the default before requesting the second value:
+
+```js
+const [a = fallback(), b] = values(); // a = 7, b = 99
+```
+
+This difference was reproduced with `@babel/plugin-transform-destructuring`
+7.28.5 using its default options, without `loose` or extra compiler assumptions.
+It affects later iterator values as well as `IteratorClose` timing; equal `N`
+is not an equivalence proof. Recovering the original source can therefore change
+the behavior of the compiled input in this edge case.
+
+This assumption does not relax helper identity, reassignment, temporary-use,
+or complete-pattern checks. An unproven or reassigned helper call must remain.
+See [helper detection](helper-detection.md) for those proof requirements.
+
+Compressed indexed returns recovered into complete patterns share the helper
+versus native iterator boundary. For example, TypeScript's `__read` calls the
+iterator's `return()` if a later `next()` throws after an earlier successful
+step; native destructuring propagates that error without closing the iterator.
+Recovering the pattern at `standard` accepts this source-recovery difference.
+
+Affects: `UnDestructuring` (complete sliced-helper groups with defaults) and
+`UnSlicedToArray` (compressed indexed returns recovered into complete patterns).
+`UnParameters2` may subsequently fold the recovered pattern into a parameter.
+
+Level: `standard` and above. `minimal` retains the helper materialization for
+these default groups and compressed indexed returns. These recoveries use the
+existing source-recovery policy; helper identity and complete-pattern checks
+remain required.
+
+### `async_iterator_value_await`
+
+The program does not depend on the extra `await` that Babel 7.8–7.13 apply to
+each iteration value of a lowered `for await`.
+
+Every lowerer replaces `for await (const item of iterable)` with an adapter call
+(`_asyncIterator`, `_async_iterator`, `__forAwait`, `__asyncValues`) and a
+`try`/`catch`/`finally` protocol that calls the iterator's `return()` on an
+abrupt exit and rethrows the body's error after it. Native `for await` performs
+the same `IteratorClose` and error propagation, so folding the protocol back is
+not an assumption. Babel 7.8–7.13 additionally emit
+`value = await step.value` in the loop head; native `for await` awaits only the
+result object of `next()`, not its `value`. For an async iterator that yields
+promises as values, the lowered loop observes the settled value while the
+recovered loop observes the promise. Spec-conformant async iterators do not
+yield promises, and the `AsyncFromSyncIterator` wrapper of later Babel
+versions and of the runtime already awaits sync iterator values, so this is a
+source-recovery difference only for that producer range.
+
+Affects: `UnForOf` (`for await` recovery from the Babel 7.8–7.13 protocol).
+The other protocols carry no extra `await` and are recovered without this
+assumption.
+
+Level: `standard` and above, with `UnForOf`.
 
 ### `no_document_all`
 
@@ -211,6 +299,134 @@ depend on this assumption.
 
 Level: `standard` and above. `minimal` preserves the helper call.
 
+### `string_coercion_hint`
+
+Recovering a template literal from a string-literal-led `+` chain assumes the
+substituted values coerce to the same string under ToPrimitive hint `default`
+(what `+` uses) and hint `string` (what a template uses).
+
+```js
+"Hello " + name + "!"   // ToPrimitive(name, "default"): valueOf first
+`Hello ${name}!`        // ToString(name): toString first
+```
+
+Evaluation order is identical in both forms — each operand is evaluated and
+coerced before the next is evaluated — so the hint is the only difference. It
+is observable for objects whose `valueOf` returns a primitive that differs from
+their `toString` (date/time libraries such as moment, dayjs, and luxon return a
+timestamp from `valueOf`), for `Symbol.toPrimitive` implementations that branch
+on the hint, and for objects whose `valueOf` throws (Temporal). Every built-in
+coerces identically: `Date` treats the default hint as `string`, and primitive
+wrappers, arrays, plain objects, and symbols behave the same either way.
+
+Babel loose mode and TypeScript ≤ 4.4 lower templates to this exact shape, so
+the reversal restores the original template where the chain was generated — but
+the shape is indistinguishable from handwritten concatenation, so it is an
+assumption, not a proof. The private fixture suite recovers roughly 3,000
+templates through this path with no substitution shaped like a known
+hint-sensitive object, which is why `standard` keeps it rather than demoting it
+to `aggressive`.
+
+Affects: `UnTemplateLiteral` (plus-chain path).
+
+Level: `standard` and above. `minimal` rewrites only chains whose substitutions
+are primitives by syntax (literals, nested templates, unary/update/arithmetic
+and comparison results, and conditionals or logical operators over those),
+where ToPrimitive is the identity and the hint cannot be observed.
+
+### `concat_coercion_order`
+
+Recovering a template literal from a string-literal-led `.concat` chain assumes
+that coercing one substitution has no effect a later substitution's evaluation
+can observe.
+
+```js
+"a".concat(first(), second())  // evaluates both calls, then coerces both
+`a${first()}${second()}`       // coerces first() before evaluating second()
+```
+
+Under the execution-environment baseline (the `concat` being called is the
+intrinsic `String.prototype.concat`), the method coerces with ToString, the
+same hint a template uses, so the coercion result is identical; only the
+interleaving of evaluation and coercion differs. It is observable only when a
+substitution's `toString` / `Symbol.toPrimitive` has side effects that a later
+substitution reads. A patched `concat` is outside the baseline — `minimal`'s
+primitive-only rewrite is exact with respect to coercion, not with respect to a
+replaced method.
+
+The string-literal receiver is strong producer evidence — Babel (spec mode),
+SWC, esbuild, and TypeScript ≥ 4.5 all lower templates this way and handwritten
+code almost never calls `.concat` on a literal — but the AST cannot prove the
+producer, so this remains a named assumption.
+
+Affects: `UnTemplateLiteral` (concat-chain path). Tagged-template helper
+recovery is a separate, provenance-checked path and does not depend on this.
+
+Level: `standard` and above. `minimal` rewrites only chains whose substitutions
+are primitives by syntax, as for `string_coercion_hint`.
+
+### `call_result_exposes_argument_properties`
+
+A call may copy the properties of an inline object argument onto its result or
+onto its receiver. `ObjMethodShorthand` keeps such a property a `function`
+expression when the same module constructs the matching property of either one:
+
+```js
+var Word = extend({
+    init: function (hi, lo) { this.hi = hi; },
+    describe: function () { return this.hi; }
+});
+new Word.init(1, 2);
+
+Lib.mixin({
+    make: function (first, second) { this.first = first; }
+});
+new Lib.make(alpha, beta);
+```
+
+The AST does not prove that `extend` copies `init` onto its return value, or
+that `mixin` copies `make` onto `Lib`. CryptoJS `Base.extend` does the first
+(`mixIn`, then `subtype.init.prototype = subtype`). A one-argument mixin that
+copies onto its receiver does the second. When the assumption is wrong, the property stays a function expression
+instead of becoming a method. That skips shorthand only; it does not introduce
+a `TypeError`. A spread argument does not establish the link, and neither does
+an argument binding (`extend(props)` does not protect `props.init`). A property
+that is not constructed on the result or the receiver still becomes a method.
+Construction of the property in another module is out of scope.
+
+Affects: `ObjMethodShorthand`, via the shared constructor-sensitivity set.
+
+Level: every level. The rule is `always_enabled`.
+
+### `concat_arguments_are_arrays`
+
+Unknown arguments in an array-literal `.concat(...)` call are ordinary arrays,
+so concat's conditional flattening can be recovered as array spread:
+
+```js
+[head].concat(items, [tail])
+// ->
+[head, ...items, tail]
+```
+
+This is not true for an arbitrary value. Concat appends a scalar or string as
+one element, and spreads only arrays or values opting in through
+`Symbol.isConcatSpreadable`; array spread instead requires an iterable and
+always iterates it. Babel's loose / `iterableIsArray` transforms emit this
+concat shape after assuming their spread inputs are arrays, but the resulting
+AST no longer carries that producer setting.
+
+Affects: `UnArrayConcatSpread` for arguments whose array identity is not proven.
+Array literals are known directly. A separate binding proof covers rest
+parameters, canonical Babel/TypeScript `arguments`-copy arrays, bindings
+initialized with a hole-free array literal, and calls to functions whose whole
+body returns one. Every other use of a proven value binding must be an
+intrinsic-concat operand, and every use of a proven function a direct call, so
+these forms do not depend on this assumption.
+
+Level: `aggressive` only. `minimal` and `standard` preserve unknown concat
+arguments; `standard` may still recover the proof-backed forms.
+
 ### `set_computed_properties`
 
 Folding a sequence of member assignments back into an object literal assumes
@@ -273,6 +489,157 @@ Affects: `UnEs6Class` direct `Object.defineProperty` accessor recovery.
 Level: `standard` and above. `minimal` requires attributes exactly representable
 by class syntax.
 
+### `native_class_inheritance`
+
+The program does not depend on the inheritance-emulation details introduced
+by downlevel compilation.
+
+For a proven TypeScript default derived constructor, `standard` prioritizes
+recovering the native class source over preserving every behavior of the ES5
+inheritance emulation. TypeScript 5.9.3 emits this constructor even when the
+source has no explicit constructor:
+
+```js
+function Child() {
+  return base !== null && base.apply(this, arguments) || this;
+}
+```
+
+Recovering `class Child extends Parent { ... }` removes this constructor and
+uses native construction. It also recovers proven instance/static superclass
+method calls as `super.method(...)`. These changes are intentionally observable:
+
+- With `Parent = null`, the lowered constructor can return `this`; the native
+  default derived constructor throws when instantiated.
+- With a native class as `Parent`, `.apply` throws, whereas native construction
+  can succeed. Built-in constructors can also behave differently.
+- Overriding a parent's `.apply` or a method's `.call` affects the lowered code,
+  but native construction and `super.method(...)` bypass those properties.
+- Replacing `Parent.prototype` after the child is defined affects the lowered
+  `base.prototype.method` lookup. Native `super` follows the child method's
+  home object's prototype instead. Mutating that prototype chain can expose
+  the opposite difference.
+
+This is a source-recovery assumption, not evidence that the runtime parent is
+an ordinary function or that the two programs are execution-equivalent. The
+usual function-to-class changes (including requiring `new`, strict methods and
+non-enumerable methods) also apply. Recognition remains bounded to the compiler
+frame and stable helper bindings; this does not authorize deleting arbitrary
+null guards or rewriting captured superclass references.
+
+Affects: `UnEs6Class` recovery of the TypeScript default derived constructor
+and its instance/static superclass method calls. See
+[helper detection](helper-detection.md#typescript-default-inheritance) for
+recognition and rejection boundaries.
+
+In multi-module unpack, a base constructor that another module calls with
+`.call` / `.apply` becomes a class at `standard` only when that caller is
+predicted to become `class extends` with `super()`
+([fact system](fact-system.md#rules-that-read-facts)). A caller that stays a
+lowered function keeps its base a function, and a surviving call after a wrong
+prediction is reported as `cross_module_class_call`.
+
+Level: `standard` and above. `minimal` preserves this lowered constructor and
+wrapper, and keeps every cross-module `.call` / `.apply` target a function.
+Other existing class recoveries have their own boundaries; this is not a claim
+that `minimal` preserves every lowered class.
+
+### `commonjs_exports_data_properties`
+
+Properties that compiler-emitted code writes on the module's own `exports` /
+`module.exports` object are ordinary data properties. No accessor installed on
+that object runs when such a write is reordered or repeated. The wrapper's
+`module.exports` slot is also an ordinary data property, and the export
+receiver is not a Proxy. Reading that slot therefore neither runs code nor
+returns a different object unless a write replaces it.
+
+CommonJS does not guarantee this. A module may install a setter on its own
+export object:
+
+```js
+let value = 1;
+Object.defineProperty(exports, "b", { set(v) { value = 2; } });
+exports.a = exports.b = value; // chain: reads value once, a receives 1
+exports.b = value; exports.a = value; // split: a receives 2
+```
+
+In the transpiler output examined so far and in the private fixtures, an
+accessor on `exports` never appears together with a chained export assignment:
+TypeScript's `exports.A = exports.B = void 0` and Babel's
+`exports.default = exports.x = value` are emitted against a fresh object whose
+accessors, if any, are live re-export getters on other keys. That is an
+observation, not a guarantee. The hazard is accepted rather than proven; the
+CommonJS wrapper only guarantees that `module`, `exports`, and `require` are
+defined.
+
+Affects: `UnAssignmentMerging` (repeated identifier values and stable
+CommonJS receivers, including chains made entirely of static
+`module.exports.name` stores), and `UnEsm` (every `exports.x = v` to `export`
+recovery replaces a property write with a binding, so an accessor on `exports`
+is already ignored; its whole-chain recovery also evaluates a chained
+function value once into a binding and moves each target's reference
+evaluation past it, which creating a function cannot observe; its conditional
+named-export recovery replaces each eligible property with a live binding at
+the original read/write positions). A primitive literal or `void <number>`
+needs no assumption about the repeated value, but receiver stability is a
+separate condition. Nested receiver chains that also replace
+`module.exports`, mutate prototypes, or write the `exports` key stay intact;
+splitting them would require a stronger proof or a receiver capture. A
+conditional named-export chain may mix static `exports.name` and
+`module.exports.name` roots only after proving that neither receiver can be
+rebound, replaced, aliased, or observed dynamically.
+
+Level: all levels. UnEsm's recovery is itself unconditional on this point.
+
+### `chain_receiver_reference_order`
+
+Recovering a chained named-export assignment as one operation evaluates the
+value first and the target references afterwards. The original chain
+evaluates every target reference (`exports`, `module.exports`) before the
+value. The two orders differ only if evaluating the value synchronously
+rebinds `exports` or replaces `module.exports`; the property writes
+themselves happen in the same order, to the same objects, with the value
+evaluated exactly once in both forms.
+
+```js
+var Lib = require("lib");
+exports.first = exports.second = Lib.matcher(KEY);
+// recovered: the value is stored first, then each target reads the receiver
+var second = Lib.matcher(KEY);
+exports.second = second;
+exports.first = second;
+```
+
+Rebinding `exports` needs a write to that parameter, which only code lexically
+inside this module can perform. Replacing `module.exports` needs the `module`
+object, which only this module's code holds unless it passes `module` out. A
+call on a provider binding (a top-level `require("literal")` declarator, or a
+static member chain rooted at one, declared once and never written) with
+identifier or literal arguments therefore cannot rebind either receiver on its
+own. It can do so only by calling back into a closure this module registered
+earlier, or through an escaped `module`, and the single-export recovery
+(`exports.name = Lib.make(x)` to `export const name = Lib.make(x)`) already
+accepts those channels without inspecting the module for them. The chain
+recovery accepts them on the same terms and does not widen them: arguments
+that are the wrapper bindings `module`, `exports`, or `require`, computed
+callee keys, spread arguments, optional calls, `new`, and every call whose
+callee root is a local function, object, or an unresolved global stay whole.
+The value stays at the chain's own position; unlike the `require("literal")`
+value (`import_hoisting_eagerness`), nothing is hoisted.
+
+This is an accepted assumption in the same sense as
+`commonjs_exports_data_properties`: it names the residual rather than proving
+it absent. A local call (`makeValue()`) is excluded not because the argument
+fails but because a local function body that writes `module.exports` is a
+realistic shape, while a provider re-entering this module's receivers is not.
+
+Affects: `UnEsm` whole-chain recovery of top-level named-export chains whose
+value is a provider call. Everything the recovery does afterwards (binding
+name, snapshot exports, `module.exports` head) is the existing function-value
+path.
+
+Level: all levels, matching the rest of the chain recovery.
+
 ### `import_hoisting_eagerness`
 
 Converting a CommonJS `require()` into an ESM `import` moves the provider's
@@ -294,13 +661,47 @@ hazard every `require`-to-`import` conversion in this codebase already
 accepts.
 
 Affects: `UnEsm` require conversion, `commonjs_default_object_composition`,
-and every fact-consuming recovery that imports a proven provider. The esbuild
+and every fact-consuming recovery that imports a proven provider. UnEsm's
+whole-chain recovery of `exports.a = exports.b = require("x")` evaluates the
+provider once into a binding before the export writes and then converts it
+the same way; it accepts this ordering deviation and does not prove that the
+provider leaves the consumer's `module.exports` slot untouched. The esbuild
 unpacker's ownership relocation (moving a top-level state writer into the
 module that owns the state declaration) shifts that statement's evaluation to
 the owner's import time — the same provider-versus-consumer interleaving
 deviation.
 
 Level: all levels. This is inherent to emitting ESM from CommonJS.
+
+## Execution Environment Baseline
+
+Every level assumes the program runs in a standard ECMAScript environment:
+intrinsic objects, global bindings, and prototype methods retain their
+specified behavior. wakaru does not model mutations performed by opaque calls,
+other scripts or modules, host code, other realms, or dynamically evaluated
+code, and there is currently **no pipeline-wide mutation detection** — an
+explicit `String.prototype.concat = ...` in the same input does not stop the
+`.concat` rewrite. Individual rules may fail closed on a mutation directly
+visible to their own matcher; that coverage is rule-specific hardening, not a
+contract. `minimal` reduces speculative source recovery; it is not a guarantee
+against a modified runtime.
+
+This is what lets a rule treat an unresolved `Math`, `Object`, `Array`,
+`Promise`, or `String.prototype.concat` as the intrinsic: `Math.pow(a, b)` →
+`a ** b`, `"a".concat(b)` → `` `a${b}` ``, `Object.assign({}, x)` → spread,
+`new (P || (P = Promise))` → a native `async` function. Resolver identity is
+still required — a local binding named `Math` is never the intrinsic. A future
+`EnvironmentHazards` pre-pass over the resolved original AST could record
+directly visible same-input mutations for every rule; once it exists, this
+section should narrow the baseline to exclude them. It is deliberately
+distinct from `stable_builtins`, which is narrower: that
+assumption says a builtin is not patched *between an alias capture and its
+later use*, because alias inlining moves the lookup in time. The baseline says
+the intrinsics are intact to begin with.
+
+Rationale: requiring each rule to prove the whole realm untouched would reject
+essentially every real toolchain shape for a hazard wakaru cannot observe
+anyway. The trade is recorded here once instead of being re-argued per rule.
 
 ## Generated Temporaries
 
@@ -326,6 +727,23 @@ console.log(_tmp);
 
 This is a hard rule, not a level-gated policy. It prevents the assumption
 system from becoming a mechanism to skip safety checks.
+
+`TempIsolation` in `rules/binding_facts.rs` implements this proof. A temp is
+isolated when the module has no other use of it and its only declaration is
+an uninitialized declarator a pattern may assign. That excludes parameters,
+which sloppy-mode `arguments` aliases, and a `let` written in its TDZ. It
+also excludes an exported declaration, which importers can read, and an
+ambient `declare var`, which creates no binding.
+
+Every rule that can drop a temp's write passes each rewrite through
+`TempIsolation::accept_expr_rewrite` (or `accept_stmts_rewrite`) at its
+choke point. The rewrite is rejected if it drops a write to a binding that
+is not isolated to the rewritten input, or if its output still reads that
+binding. This covers code paths that have no pattern proof of their own. An
+accepted rewrite reports which declarations became dead, for
+`remove_consumed_uninitialized_decls`, and updates the use counts for later
+rewrites. A pattern's own count check, where it has one, is an early exit and
+a shape policy. It does not replace this check.
 
 `SmartInline` applies a separate, position-independent proof to generic
 single-read `const` aliases. It only removes generated-looking names used in
@@ -358,9 +776,82 @@ deliberately does not simulate
 expression evaluation order: once the local source is proven frozen, delaying
 its read is harmless; otherwise the alias stays.
 
-Candidate declarations still participate in reference counting. This prevents
-two independently removable aliases from forming a replacement chain whose
-intermediate binding is deleted before a non-recursive substitution uses it.
+Candidate declarations still participate in reference counting. Replacement
+chains are resolved to their surviving source before substitution, and that
+source's emitted name is checked again at each alias's use. If it would be
+captured there, the alias stays declared while its initializer receives safe
+substitutions for earlier links.
+
+## Declaration-Kind Capture Safety
+
+`VarDeclToLetConst` treats references to local function declarations as possible
+execution or escape, regardless of invocation syntax (`f()`, `f.call(...)`,
+`f.apply(...)`, callback arguments, or alias creation). Resolver binding IDs
+connect references between declarations in the same function/module scope.
+Captures include nested closures, parameter defaults, computed keys and class
+members. Anonymous closures and class expressions are conservatively observed
+at creation; the rule does not follow aliases through properties or model
+individual APIs.
+
+Named class declarations can defer their captures until a local value
+reference only when creation cannot execute those captures: no superclass,
+computed keys, decorators, static fields or static blocks. Constructors,
+ordinary/private methods (including static methods), and non-computed instance
+fields are deferred. Other class shapes remain exposed at creation. In
+particular, a static block or initializer can invoke `this.method()` without
+referencing the class identifier; it must not use the deferred path.
+An earlier reference cannot execute a simple class's captures before that
+class initializes: its own TDZ prevents access. The ordered scan queues such
+references until the class declaration completes, then expands its summary.
+This also applies to transitive references from hoisted functions or classes.
+
+A captured `var` can become lexical only when its declaration has completed
+before the exposure in a containing statement-list block. This includes
+ordinary nested blocks, but does not infer initialization across branches,
+`switch` cases, or loop headers. Existing block-escape, loop-capture, duplicate
+declaration and dynamic-scope guards still apply. A plain function/arrow
+initializer may reference its own binding: creating it cannot execute its
+body before initialization. Calls and class initializers do not get that
+exception.
+
+The reference graph expands each declaration summary once at its earliest local
+exposure; it does not build a transitive capture set for every function.
+Analysis is bounded to each scope and reuses one capture traversal for named
+functions/classes and anonymous function-like values. Enclosing scopes still inspect
+nested bodies for captures, so this is not a claim of globally linear AST
+processing across arbitrarily deep function nesting.
+
+Pure ESM export specifiers (`export { f }`, including aliases/default names)
+link bindings without evaluating their values, so they do not add a local
+exposure. A default-export expression consisting only of a parenthesized or
+bare identifier bound to a local function declaration or simple class
+declaration also adds no capture exposure. Unlike a specifier's live binding,
+`export default f` evaluates and snapshots the binding value, but does not
+execute its body. The value read and any class TDZ error remain in the output;
+ordinary variables still undergo use-before-declaration checks. This exception
+does not include calls, object/array literals, sequences, aliases or anonymous
+functions/classes. Property stores and getter closures still expose captures.
+Named function declarations retain the existing declaration-position capture
+guard, independently of whether they are exported. Simple named class
+declarations use the deferred boundary above, including named/default exports;
+anonymous default classes remain exposed at creation.
+
+This proof does not add cross-module entry roots for every exported function
+or class. It retains `minimal`'s exported-`var` preservation. Arbitrary ESM-cycle
+entry before module execution requires a separate cross-module policy;
+same-scope analysis is not such a proof.
+
+Accepted residual at every level: storing a function in an object property
+before its captured variable is initialized can preserve `var` even when the
+function actually runs only later. This includes compiler-emitted lazy
+CommonJS wrappers whose exports object is a local alias. An exports-like name
+is not proof: a same-scope member call or setter can invoke that function early.
+We deliberately do not track object aliases or assume delayed property use,
+including at `aggressive`. This can also prevent downstream destructuring or
+name recovery. It is a known readability cost of the bounded proof, not a
+claim that each preserved `var` fixes an observed runtime failure. See the
+[cached-wrapper capture boundary](learnings/cached-wrapper-capture-boundary.md)
+for the alias, reentry and exceptional-exit counterexamples behind this decision.
 
 ## Dynamic Scope Limits
 
@@ -387,6 +878,24 @@ regular functions have their own function-only bindings and do not block an
 outer conversion; nested arrows still do. For `function() {}.bind(this)`, a
 source that mentions only `this` is safe because both forms capture the same
 value, while `arguments` and `new.target` still block conversion.
+
+`with` and direct `eval` are module-wide hazards. A rule that reads a free
+name as the global, renames or removes a binding, or introduces a new binding
+skips the whole module when either construct is present. wakaru does not model
+`with` bodies or eval scopes any finer than that: compilers do not emit them,
+and well under 1% of modules in a huge corpus of production bundles contain
+either. A rule that lacks the check is a bug, not a documented exception.
+
+Two boundaries follow from this.
+
+- `SyntaxContext` covers static lexical scope only. It does not see bindings a
+  `with` object or a sloppy direct `eval` introduces at runtime. Unknown direct
+  `eval` blocks renames, binding removal, declaration-kind changes, and
+  synthesized identifier insertion; a known source string keeps the
+  name-mention best effort above.
+- Indirect `eval`, opaque calls, other modules, and host code can mutate
+  globals and intrinsics but not the current lexical scope. Those mutations
+  fall under the Execution Environment Baseline and are not tracked.
 
 This limitation should be documented for users, especially for `minimal`.
 

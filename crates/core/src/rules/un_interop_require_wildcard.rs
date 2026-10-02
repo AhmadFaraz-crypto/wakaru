@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::common::util::take::Take;
 use swc_core::common::DUMMY_SP;
@@ -334,13 +334,13 @@ fn collect_import_dependencies(
 ) -> HashSet<BindingKey> {
     let import_bindings = collect_import_bindings(module);
     if import_bindings.is_empty() {
-        return HashSet::new();
+        return HashSet::default();
     }
 
     let mut collector = ImportDependencyCollector {
         helpers,
         import_bindings: &import_bindings,
-        dependencies: HashSet::new(),
+        dependencies: HashSet::default(),
     };
     for item in &module.body {
         match item {
@@ -374,13 +374,13 @@ fn collect_var_require_dependencies(
 ) -> HashSet<BindingKey> {
     let var_require_bindings = collect_var_require_bindings(module, local_helpers);
     if var_require_bindings.is_empty() {
-        return HashSet::new();
+        return HashSet::default();
     }
 
     let mut collector = VarRequireDependencyCollector {
         helpers,
         var_require_bindings: &var_require_bindings,
-        dependencies: HashSet::new(),
+        dependencies: HashSet::default(),
     };
     for item in &module.body {
         match item {
@@ -411,7 +411,7 @@ fn collect_var_require_bindings(
     module: &Module,
     local_helpers: &LocalHelperContext,
 ) -> HashSet<BindingKey> {
-    let mut bindings = HashSet::new();
+    let mut bindings = HashSet::default();
     for item in &module.body {
         let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var))) = item else {
             continue;
@@ -432,7 +432,7 @@ fn collect_var_require_bindings(
 }
 
 fn collect_import_bindings(module: &Module) -> HashSet<BindingKey> {
-    let mut bindings = HashSet::new();
+    let mut bindings = HashSet::default();
     for item in &module.body {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
             continue;

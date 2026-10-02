@@ -1,13 +1,12 @@
 #!/usr/bin/env node
 
+import { runNodeBatchSync } from "../lib/tool-process.mjs";
+
 import {
   runMatrix, batchRunner, tscBatch, swcBatch,
   esbuildBatch, withTerserVariants, ensureNodeTool,
 } from "../lib/runner.mjs";
 import { mangleValidator } from "../lib/compare.mjs";
-import { join } from "node:path";
-import { writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 
 const snippets = [
   {
@@ -74,11 +73,8 @@ const allSources = snippets.map((s) => s.source);
 
 // Custom tsc batch with downlevelIteration option
 function tscDownlevelBatch(sources, downlevelIteration) {
-  const toolDir = ensureNodeTool("typescript", ["typescript@5"]);
-  const helper = join(toolDir, "tsc-downlevel-batch.cjs");
-  writeFileSync(
-    helper,
-    `
+  const toolDir = ensureNodeTool("typescript-5.9.3", ["typescript@5.9.3"]);
+  const helperSource = `
 const fs = require("node:fs");
 const ts = require("typescript");
 const downlevelIteration = process.env.MATRIX_DOWNLEVEL === "true";
@@ -95,23 +91,13 @@ const results = sources.map(source => {
   } catch (e) { return { error: e.message }; }
 });
 process.stdout.write(JSON.stringify(results));
-`,
-  );
-  const result = spawnSync("node", [helper], {
+`;
+  return runNodeBatchSync(helperSource, sources, {
+    label: "tsc-downlevel-batch.cjs",
+    format: "commonjs",
     cwd: toolDir,
-    input: JSON.stringify(sources),
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024 * 50,
-    env: { ...process.env, MATRIX_DOWNLEVEL: String(downlevelIteration) },
+    env: { MATRIX_DOWNLEVEL: String(downlevelIteration) },
   });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`tsc batch exited ${result.status}: ${result.stderr}`);
-  const outputs = JSON.parse(result.stdout);
-  const map = new Map();
-  for (let i = 0; i < sources.length; i++) {
-    map.set(sources[i], outputs[i].error ? new Error(outputs[i].error) : outputs[i].code);
-  }
-  return map;
 }
 
 // Custom babel batch with for-of + destructuring plugins
@@ -122,10 +108,7 @@ function babelForOfBatch(sources, mode) {
     "@babel/plugin-transform-destructuring@7.28.5",
   ];
   const toolDir = ensureNodeTool("babel-7.28-for-of-destructuring", packages);
-  const helper = join(toolDir, "babel-for-of-batch.mjs");
-  writeFileSync(
-    helper,
-    `
+  const helperSource = `
 import fs from "node:fs";
 const babelModule = await import("@babel/core");
 const forOfModule = await import("@babel/plugin-transform-for-of");
@@ -147,23 +130,12 @@ const results = sources.map(source => {
   } catch (e) { return { error: e.message }; }
 });
 process.stdout.write(JSON.stringify(results));
-`,
-  );
-  const result = spawnSync("node", [helper], {
+`;
+  return runNodeBatchSync(helperSource, sources, {
+    label: "babel-for-of-batch.mjs",
     cwd: toolDir,
-    input: JSON.stringify(sources),
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024 * 50,
-    env: { ...process.env, MATRIX_BABEL_MODE: mode },
+    env: { MATRIX_BABEL_MODE: mode },
   });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`babel batch exited ${result.status}: ${result.stderr}`);
-  const outputs = JSON.parse(result.stdout);
-  const map = new Map();
-  for (let i = 0; i < sources.length; i++) {
-    map.set(sources[i], outputs[i].error ? new Error(outputs[i].error) : outputs[i].code);
-  }
-  return map;
 }
 
 const transformers = [

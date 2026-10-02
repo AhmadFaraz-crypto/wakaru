@@ -1863,3 +1863,208 @@ use(picked, rest, key);
         "the frozen alias declaration must remain: {output}"
     );
 }
+
+#[test]
+fn direct_tslib_rest_restores_object_destructuring() {
+    let input = "var rest = require('tslib').__rest(source, ['x']); use(rest);";
+    let output = render_rule(input, UnObjectRest::new);
+    assert!(output.contains("...rest"), "{output}");
+    assert!(!output.contains(".__rest("), "{output}");
+}
+
+#[test]
+fn direct_tslib_rest_preserves_shadowing_and_dynamic_lookup() {
+    for input in [
+        "function copy(require) { var rest = require('tslib').__rest(source, ['x']); use(rest); }",
+        "with (scope) { var rest = require('tslib').__rest(source, ['x']); use(rest); }",
+        "with (scope) { observe(); } var rest = require('tslib').__rest(source, ['x']); use(rest);",
+        "eval(code); var rest = require('tslib').__rest(source, ['x']); use(rest);",
+        "var rest = require('tslib').__rest(...args); use(rest);",
+    ] {
+        assert_eq_normalized(&render_rule(input, UnObjectRest::new), input);
+    }
+}
+
+#[test]
+fn compressed_returned_rest_recovers_the_complete_pattern() {
+    let input = r#"
+var ts = require("tslib");
+function rest(obj) {
+    var x = obj.x;
+    var tail;
+    return ts.__rest(obj, ["x"]);
+}
+"#;
+    let output = render_rule(input, UnObjectRest::new);
+    assert!(output.contains("...rest_1"), "{output}");
+    assert!(!output.contains(".__rest("), "{output}");
+    let compressed =
+        "var ts=require('tslib');function rest(obj){var x=obj.x,tail;return ts.__rest(obj,['x'])}";
+    assert!(!render(compressed).contains(".__rest("));
+}
+
+#[test]
+fn returned_rest_requires_all_preceding_reads() {
+    for body in [
+        "return ts.__rest(obj, ['x']);",
+        "var x = obj.x; effect(); return ts.__rest(obj, ['x']);",
+        "var x = obj.x; return ts.__rest(obj, ['x', 'y']);",
+        "var x = obj.x; var y = obj.y; return ts.__rest(obj, ['y', 'x']);",
+        "var x = other.x; return ts.__rest(obj, ['x']);",
+        "var x = obj.x; let tail; return ts.__rest(obj, ['x']);",
+    ] {
+        let input = format!("import * as ts from 'tslib'; function rest(obj) {{ {body} }}");
+        assert!(render_rule(&input, UnObjectRest::new).contains(".__rest("));
+    }
+}
+
+#[test]
+fn returned_rest_does_not_capture_existing_names() {
+    let input = r#"
+import * as ts from "tslib";
+function copy(obj, rest) {
+    use(rest, rest_1);
+    var x = obj.x;
+    return ts.__rest(obj, ["x"]);
+}
+"#;
+    let output = render_rule(input, UnObjectRest::new);
+    assert!(output.contains("...rest_2"), "{output}");
+    assert!(output.contains("use(rest, rest_1)"), "{output}");
+}
+
+#[test]
+fn untouched_nested_functions_keep_their_ast_allocations() {
+    use swc_core::common::Mark;
+    use swc_core::ecma::ast::{FnDecl, Function, Module};
+    use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
+
+    #[derive(Default)]
+    struct Functions(Vec<*const Function>);
+    impl Visit for Functions {
+        fn visit_fn_decl(&mut self, decl: &FnDecl) {
+            self.0.push(decl.function.as_ref() as *const Function);
+            decl.visit_children_with(self);
+        }
+    }
+
+    struct CheckAllocations(Mark);
+    impl VisitMut for CheckAllocations {
+        fn visit_mut_module(&mut self, module: &mut Module) {
+            let mut before = Functions::default();
+            module.visit_with(&mut before);
+            module.visit_mut_with(&mut UnObjectRest::new(self.0));
+            let mut after = Functions::default();
+            module.visit_with(&mut after);
+            // Rebuilding each enclosing statement list must not deep-clone
+            // untouched function trees. That repeats work at every nesting level.
+            assert_eq!(before.0.len(), 3);
+            assert_eq!(before.0, after.0);
+        }
+    }
+
+    let input = r#"
+import { __rest } from "tslib";
+function outer(obj) {
+    function middle() {
+        function inner() { return obj.value; }
+        return inner();
+    }
+    var x = obj.x;
+    var rest = __rest(obj, ["x"]);
+    return [middle(), x, rest];
+}
+
+use(outer);
+"#;
+    let expected = r#"
+function outer(obj) {
+    function middle() {
+        function inner() { return obj.value; }
+        return inner();
+    }
+    var { x, ...rest } = obj;
+    return [middle(), x, rest];
+}
+use(outer);
+"#;
+    assert_eq_normalized(&render_rule(input, CheckAllocations), expected);
+}
+
+#[test]
+fn rest_assignment_keeps_local_var_declarations() {
+    for (prefix, suffix) in [("", ""), ("function extract(source) {", "}")] {
+        let input = format!(
+            r#"
+import omit from "@babel/runtime/helpers/objectWithoutProperties";
+{prefix}
+var picked = (source = source === undefined ? {{}} : source).key;
+var other = source.other;
+source = omit(source, ["key", "other"]);
+use(picked, other, source);
+{suffix}
+"#
+        );
+        let expected = format!(
+            r#"
+{prefix}
+source = source === undefined ? {{}} : source;
+var picked;
+var other;
+({{ key: picked, other, ...source }} = source);
+use(picked, other, source);
+{suffix}
+"#
+        );
+        assert_eq_normalized(&render_rule(&input, UnObjectRest::new), &expected);
+    }
+}
+
+#[test]
+fn rest_assignment_preserves_lexical_initialization() {
+    for kind in ["let", "const"] {
+        let input = format!(
+            r#"
+import omit from "@babel/runtime/helpers/objectWithoutProperties";
+function extract(source) {{
+    {kind} picked = source.key;
+    source = omit(source, ["key"]);
+    use(picked, source);
+}}
+"#
+        );
+        assert_eq_normalized(&render_rule(&input, UnObjectRest::new), &input);
+    }
+}
+
+#[test]
+fn module_declarations_reset_rest_lookbehind() {
+    for boundary in ["import 'side-effect';", "export var marker = 0;"] {
+        let source = format!(
+            "import {{ __rest }} from 'tslib';\nvar a = obj.a;\n{boundary}\n\
+             var rest = __rest(obj, ['a']);\nuse(a, rest);"
+        );
+        let output = render_rule(&source, UnObjectRest::new);
+        assert!(output.contains("var a = obj.a;"), "{output}");
+        assert!(!output.contains("__rest("), "{output}");
+        assert!(output.contains("use(a, rest)"), "{output}");
+    }
+}
+
+#[test]
+fn rest_lookbehind_tracks_rebuilt_module_statements() {
+    let source = r#"
+import { __rest } from 'tslib';
+var x = obj.x;
+var first = __rest(obj, ['x']);
+var y = other.y;
+var second = __rest(other, ['y']);
+use(x, first, y, second);
+"#;
+    let expected = r#"
+var { x, ...first } = obj;
+var { y, ...second } = other;
+use(x, first, y, second);
+"#;
+    assert_eq_normalized(&render_rule(source, UnObjectRest::new), expected);
+}

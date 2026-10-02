@@ -1,12 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::common::{Mark, Span, Spanned, DUMMY_SP};
 use swc_core::ecma::ast::{
-    ArrowExpr, AssignExpr, AssignOp, AssignTarget, AssignTargetPat, AwaitExpr, CallExpr, Callee,
-    Decl, Expr, ExprOrSpread, ExprStmt, Function, FunctionBody, Ident, IfStmt, MemberExpr, Module,
-    ObjectPat, ObjectPatProp, Param, Pat, Prop, PropName, ReturnStmt, SeqExpr, SimpleAssignTarget,
-    Stmt, SwitchCase, UnaryOp, VarDecl, VarDeclKind, VarDeclarator, YieldExpr,
+    ArrowExpr, AssignExpr, AssignOp, AssignTarget, AssignTargetPat, AutoAccessor, AwaitExpr,
+    CallExpr, Callee, ClassProp, Constructor, Decl, Expr, ExprOrSpread, ExprStmt, Function,
+    FunctionBody, Ident, IfStmt, MemberExpr, Module, ObjectPat, ObjectPatProp, Param, Pat,
+    PrivateProp, Prop, PropName, ReturnStmt, SeqExpr, SimpleAssignTarget, StaticBlock, Stmt,
+    SwitchCase, ThisExpr, UnaryOp, VarDecl, VarDeclKind, VarDeclarator, YieldExpr,
 };
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
@@ -16,14 +17,18 @@ use super::cross_module_helper_refs::{
 use super::decl_utils::{
     binding_id, collect_decl_binding_ids, collect_pat_names, collect_var_decl_binding_ids,
 };
-use super::eval_utils::is_direct_eval_call;
+use super::eval_utils::{is_direct_eval_call, module_has_with_stmt};
 use super::helper_matcher::{binding_key, ident_matches_binding};
+use super::remove_void::finalize_synthesized_undefined;
 use super::rename_utils::{rename_bindings, BindingId, BindingRename};
 use super::state_machine::{
-    invert_condition, stmts_contain_state_opcode_return, ForwardJumpJoin, IndexLoopContinueMode,
-    OpcodeReturnScan, StateMachineProgram,
+    invert_condition, stmts_contain_state_opcode_return, CatchBindings, ForwardJumpJoin,
+    IndexLoopContinueMode, OpcodeReturnScan, StateMachineProgram,
 };
-use super::transpiler_helper_utils::{BindingKey, LocalHelperContext, TsHelperKind};
+use super::transpiler_helper_utils::{
+    tslib_member_ts_helper_kind, tslib_require_ts_helper_kind_with_mark, BindingKey,
+    LocalHelperContext, TsHelperKind,
+};
 use crate::facts::{ModuleFactsMap, TypeScriptHelperKind};
 use crate::js_names::is_likely_generated_alias;
 use crate::utils::paren::strip_parens;
@@ -55,20 +60,24 @@ impl UnAsyncAwait {
         if let Some(module_facts) = module_facts {
             helpers.extend_cross_module(module, module_facts, current_filename);
         }
+        helpers.record_module_hazards(module);
         module.visit_mut_with(&mut UnAsyncAwaitWithHelpers { helpers: &helpers });
         module.visit_mut_with(&mut AwaiterIifeTransformer { helpers: &helpers });
         remove_unused_inline_async_helpers(module, local_helpers);
+        finalize_synthesized_undefined(module, unresolved_mark);
     }
 }
 
 impl VisitMut for UnAsyncAwait {
     fn visit_mut_module(&mut self, module: &mut Module) {
-        let local_helpers = LocalHelperContext::collect(module);
-        let helpers =
+        let local_helpers = LocalHelperContext::collect_with_mark(module, self.unresolved_mark);
+        let mut helpers =
             AsyncHelperContext::from_local_helpers(&local_helpers, Some(self.unresolved_mark));
+        helpers.record_module_hazards(module);
         module.visit_mut_with(&mut UnAsyncAwaitWithHelpers { helpers: &helpers });
         module.visit_mut_with(&mut AwaiterIifeTransformer { helpers: &helpers });
         remove_unused_inline_async_helpers(module, &local_helpers);
+        finalize_synthesized_undefined(module, self.unresolved_mark);
     }
 
     fn visit_mut_function(&mut self, func: &mut Function) {
@@ -99,28 +108,51 @@ impl VisitMut for AwaiterIifeTransformer<'_> {
 }
 
 #[derive(Default)]
-struct AsyncHelperContext {
+pub(crate) struct AsyncHelperContext {
+    tslib_namespaces: HashSet<BindingKey>,
     awaiter_helpers: HashSet<BindingKey>,
     awaiter_namespaces: HashMap<BindingKey, HashSet<String>>,
     generator_helpers: HashSet<BindingKey>,
     generator_namespaces: HashMap<BindingKey, HashSet<String>>,
     values_helpers: HashSet<BindingKey>,
+    values_namespaces: HashMap<BindingKey, HashSet<String>>,
     unresolved_mark: Option<Mark>,
+    /// Bindings written anywhere in the module (assignments, updates,
+    /// destructuring and for-in/of targets). A thisArg alias that is written
+    /// after capture cannot be substituted for `this`: the wrapper reads it
+    /// once at call time, the spliced body would read it live.
+    written_bindings: HashSet<BindingKey>,
+    /// The module contains a `with` statement. Inside its body any identifier
+    /// may resolve to a property of the with-object at runtime, which the
+    /// resolver cannot see, so the identifier-shaped canonical frame slots
+    /// (`undefined`, `arguments`, `Promise`, a `this` alias) are not trusted
+    /// anywhere in the module. `this` and `void <literal>` are unaffected.
+    with_statement_present: bool,
 }
 
 impl AsyncHelperContext {
-    fn from_local_helpers(
+    pub(crate) fn from_local_helpers(
         local_helpers: &LocalHelperContext,
         unresolved_mark: Option<Mark>,
     ) -> Self {
         Self {
+            tslib_namespaces: local_helpers.tslib_namespaces().clone(),
             awaiter_helpers: local_helpers.ts_helpers_of_kind(TsHelperKind::Awaiter),
-            awaiter_namespaces: HashMap::new(),
+            awaiter_namespaces: HashMap::default(),
             generator_helpers: local_helpers.ts_helpers_of_kind(TsHelperKind::Generator),
-            generator_namespaces: HashMap::new(),
+            generator_namespaces: HashMap::default(),
             values_helpers: local_helpers.ts_helpers_of_kind(TsHelperKind::Values),
+            values_namespaces: HashMap::default(),
             unresolved_mark,
+            written_bindings: HashSet::default(),
+            with_statement_present: false,
         }
+    }
+
+    pub(crate) fn record_module_hazards(&mut self, module: &Module) {
+        self.written_bindings =
+            crate::analysis::binding_uses::BindingUseIndex::collect_direct_write_bindings(module);
+        self.with_statement_present = module_has_with_stmt(module);
     }
 
     fn extend_cross_module(
@@ -146,6 +178,15 @@ impl AsyncHelperContext {
         );
         self.generator_helpers.extend(generator.direct);
         self.generator_namespaces.extend(generator.namespaces);
+
+        let values = collect_cross_module_ts_helper_refs(
+            module,
+            module_facts,
+            current_filename,
+            TypeScriptHelperKind::Values,
+        );
+        self.values_helpers.extend(values.direct);
+        self.values_namespaces.extend(values.namespaces);
     }
 
     fn is_awaiter_call(&self, call: &swc_core::ecma::ast::CallExpr) -> bool {
@@ -154,6 +195,7 @@ impl AsyncHelperContext {
             &self.awaiter_helpers,
             &self.awaiter_namespaces,
             "__awaiter",
+            TsHelperKind::Awaiter,
         )
     }
 
@@ -163,6 +205,7 @@ impl AsyncHelperContext {
             &self.generator_helpers,
             &self.generator_namespaces,
             "__generator",
+            TsHelperKind::Generator,
         )
     }
 
@@ -172,6 +215,7 @@ impl AsyncHelperContext {
         helpers: &HashSet<BindingKey>,
         namespaces: &HashMap<BindingKey, HashSet<String>>,
         canonical_name: &str,
+        kind: TsHelperKind,
     ) -> bool {
         let Some(callee) = call
             .callee
@@ -180,6 +224,17 @@ impl AsyncHelperContext {
         else {
             return false;
         };
+        let lookup = match callee {
+            Expr::Ident(id) => Some(id),
+            Expr::Member(member) => match strip_parens(&member.obj) {
+                Expr::Ident(id) => Some(id),
+                _ => None,
+            },
+            _ => None,
+        };
+        if lookup.is_some_and(|id| self.written_bindings.contains(&binding_key(id))) {
+            return false;
+        }
         match callee {
             Expr::Ident(id) => {
                 helpers.contains(&binding_key(id))
@@ -188,7 +243,18 @@ impl AsyncHelperContext {
                             .unresolved_mark
                             .is_some_and(|mark| id.ctxt.outer() == mark))
             }
-            Expr::Member(_) => cross_module_ts_member_helper(callee, namespaces),
+            Expr::Member(_) => {
+                // `with` can replace either the namespace or the require
+                // binding at runtime, even when resolver identity matches.
+                if self.with_statement_present {
+                    return false;
+                }
+                cross_module_ts_member_helper(callee, namespaces)
+                    || tslib_member_ts_helper_kind(callee, &self.tslib_namespaces) == Some(kind)
+                    || self.unresolved_mark.is_some_and(|mark| {
+                        tslib_require_ts_helper_kind_with_mark(callee, mark) == Some(kind)
+                    })
+            }
             _ => false,
         }
     }
@@ -275,18 +341,10 @@ fn contains_unresolved_generator_wrapper(
 
 pub(crate) fn try_transform_ts_generator_body(
     body: &mut FunctionBody,
-    generator_helpers: &[BindingKey],
+    helpers: &AsyncHelperContext,
     reserved_names: &HashSet<Atom>,
 ) -> bool {
-    let helpers = AsyncHelperContext {
-        awaiter_helpers: HashSet::new(),
-        awaiter_namespaces: HashMap::new(),
-        generator_helpers: generator_helpers.iter().cloned().collect(),
-        generator_namespaces: HashMap::new(),
-        values_helpers: HashSet::new(),
-        unresolved_mark: None,
-    };
-    try_transform_generator(body, &helpers, reserved_names)
+    try_transform_generator(body, helpers, reserved_names)
 }
 
 fn try_transform_generator(
@@ -357,9 +415,9 @@ fn extract_generator_stmts(stmt: Stmt, helpers: &AsyncHelperContext) -> Option<E
     let Expr::Fn(fn_expr) = fn_arg else {
         return None;
     };
-    let state_name: Atom = fn_expr.function.params.first().and_then(|p| {
+    let state_param: Ident = fn_expr.function.params.first().and_then(|p| {
         if let Pat::Ident(bi) = &p.pat {
-            Some(bi.id.sym.clone())
+            Some(bi.id.clone())
         } else {
             None
         }
@@ -367,7 +425,7 @@ fn extract_generator_stmts(stmt: Stmt, helpers: &AsyncHelperContext) -> Option<E
     let body = fn_expr.function.body?;
     let mut state_stmt = None;
     let mut callback_locals = Vec::new();
-    let mut callback_local_ids = HashSet::new();
+    let mut callback_local_ids = HashSet::default();
     for stmt in body.stmts {
         match stmt {
             Stmt::Switch(_) | Stmt::Return(_) => {
@@ -387,8 +445,8 @@ fn extract_generator_stmts(stmt: Stmt, helpers: &AsyncHelperContext) -> Option<E
         }
     }
     let decoded = match state_stmt? {
-        Stmt::Switch(sw) => decode_state_machine(state_name, sw.cases, &helpers.values_helpers)?,
-        Stmt::Return(ret) => decode_return_opcode(&Stmt::Return(ret), &helpers.values_helpers)?
+        Stmt::Switch(sw) => decode_state_machine(state_param, sw.cases, helpers)?,
+        Stmt::Return(ret) => decode_return_opcode(&Stmt::Return(ret), helpers)?
             .into_iter()
             .collect(),
         _ => unreachable!("state_stmt is restricted above"),
@@ -401,7 +459,7 @@ fn extract_generator_stmts(stmt: Stmt, helpers: &AsyncHelperContext) -> Option<E
 }
 
 fn binding_names_from_params(params: &[Param]) -> HashSet<Atom> {
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
     for param in params {
         collect_pat_names(&param.pat, &mut names);
     }
@@ -447,7 +505,7 @@ fn hygienically_move_callback_locals(
     reserved.extend(destination_identifier_names(
         moved_stmts,
         None,
-        &HashSet::new(),
+        &HashSet::default(),
     ));
     let renames: Vec<BindingRename> = colliding
         .into_iter()
@@ -838,7 +896,28 @@ fn expand_one_stmt(result: &mut Vec<Stmt>, stmt: &Stmt) {
             let Expr::Cond(cond) = ret.arg.as_ref().unwrap().as_ref() else {
                 unreachable!()
             };
-            if is_opcode_like(&cond.cons) || is_opcode_like(&cond.alt) {
+            let alt_is_sequence = matches!(strip_parens(&cond.alt), Expr::Seq(_));
+            if alt_is_sequence && is_plain_opcode(&cond.cons) {
+                // `return test ? [3, N] : (work, [3, M])`: the guard keeps the
+                // plain opcode and the sequence expands into statements, so
+                // the goto in the sequence stays visible to the block walk.
+                result.push(Stmt::If(IfStmt {
+                    span: ret.span,
+                    test: cond.test.clone(),
+                    cons: Box::new(Stmt::Return(ReturnStmt {
+                        span: ret.span,
+                        arg: Some(cond.cons.clone()),
+                    })),
+                    alt: None,
+                }));
+                expand_one_stmt(
+                    result,
+                    &Stmt::Return(ReturnStmt {
+                        span: ret.span,
+                        arg: Some(cond.alt.clone()),
+                    }),
+                );
+            } else if is_opcode_like(&cond.cons) || is_opcode_like(&cond.alt) {
                 result.push(Stmt::If(IfStmt {
                     span: ret.span,
                     test: invert_condition(&cond.test),
@@ -861,6 +940,11 @@ fn expand_one_stmt(result: &mut Vec<Stmt>, stmt: &Stmt) {
         }
         _ => result.push(stmt.clone()),
     }
+}
+
+/// An opcode array that is not wrapped in a sequence: `[3, N]`, not `(a, [3, N])`.
+fn is_plain_opcode(expr: &Expr) -> bool {
+    !matches!(strip_parens(expr), Expr::Seq(_)) && is_opcode_like(expr)
 }
 
 fn is_opcode_like(expr: &Expr) -> bool {
@@ -896,9 +980,9 @@ fn unwrap_seq_last(expr: &Expr) -> &Expr {
 ///
 /// Phase 3: Group by label and reconstruct try/catch/finally blocks.
 fn decode_state_machine(
-    state_name: Atom,
+    state_param: Ident,
     cases: Vec<SwitchCase>,
-    values_helpers: &HashSet<BindingKey>,
+    helpers: &AsyncHelperContext,
 ) -> Option<Vec<Stmt>> {
     let mut trys: Vec<[Option<usize>; 4]> = Vec::new();
     // (label_idx, stmt) pairs
@@ -912,21 +996,30 @@ fn decode_state_machine(
         let next_case_label = next_numeric_case_label(&cases, idx);
 
         let expanded = expand_terser_case_stmts(&case.cons);
-        for stmt in &expanded {
-            if let Some(region) = extract_trys_push(&state_name, stmt) {
+        for (position, stmt) in expanded.iter().enumerate() {
+            if let Some(region) = extract_trys_push(&state_param, stmt) {
                 trys.push(region);
                 continue;
             }
-            if is_state_label_assign(&state_name, stmt) {
+            if is_state_label_assign(&state_param, stmt) {
                 continue;
             }
 
+            // Only the last statement of the last case is the machine's
+            // implicit end; a void `return [2]` anywhere else is an early
+            // `return;` and must stay.
+            let void_return = if next_case_label.is_none() && position + 1 == expanded.len() {
+                VoidReturn::Drop
+            } else {
+                VoidReturn::Keep
+            };
             if let Some(decoded) = decode_return_opcode_with_backedge(
                 stmt,
-                values_helpers,
+                helpers,
                 idx,
                 next_case_label,
                 &trys,
+                void_return,
             ) {
                 if let Some(s) = decoded {
                     flat.push((idx, s));
@@ -934,7 +1027,12 @@ fn decode_state_machine(
                 continue;
             }
 
-            flat.push((idx, stmt.clone()));
+            // `if (cond) return [2, value];` — an early `return` inside a
+            // branch. The value-return opcode has no label semantics, so it
+            // decodes in place; jumps and yields stay for the shared decoder.
+            let mut stmt = stmt.clone();
+            stmt.visit_mut_with(&mut NestedValueReturnDecoder);
+            flat.push((idx, stmt));
         }
     }
 
@@ -944,36 +1042,42 @@ fn decode_state_machine(
     // assigned from `_a.sent()` (`error_1 = _a.sent(); use(error_1)`). We fold
     // that alias back into the synthesized `error` catch binding.
     let mut catch_aliases: Vec<BindingKey> = Vec::new();
+    let folded_aliases: HashSet<Atom> = flat
+        .iter()
+        .filter_map(|(_, stmt)| catch_sent_alias(&state_param, stmt))
+        .map(|(name, _)| name)
+        .collect();
+    let mut catch_bindings = CatchBindings::for_cases(&cases, &folded_aliases);
     for (idx, stmt) in flat {
-        if is_standalone_sent(&state_name, &stmt) {
+        if is_standalone_sent(&state_param, &stmt) {
             // Standalone _a.sent(); -- the caller discards the yielded value. Drop.
             continue;
         }
-        let in_catch = is_catch_label(idx, &trys);
-        if !in_catch {
+        let catch_binding = catch_bindings.for_label(idx, &trys);
+        if catch_binding.is_none() {
             catch_aliases.clear();
         }
-        if in_catch {
+        if let Some(catch_binding) = &catch_binding {
             // `error_1 = _a.sent()` aliases the caught value. Record it and drop
             // the assignment; later references resolve to the `error` binding.
-            if let Some(alias) = catch_sent_alias(&state_name, &stmt) {
+            if let Some(alias) = catch_sent_alias(&state_param, &stmt) {
                 catch_aliases.push(alias);
                 continue;
             }
             // Rewrite both `_a.sent()` and any recorded alias to `error`.
             let mut replacer = CatchValueReplacer {
-                state_name: state_name.clone(),
+                state_param: state_param.clone(),
                 aliases: catch_aliases.clone(),
-                replacement: Box::new(Expr::Ident(Ident::new_no_ctxt("error".into(), DUMMY_SP))),
+                replacement: Box::new(Expr::Ident(catch_binding.clone())),
             };
             let mut s = stmt;
             s.visit_mut_with(&mut replacer);
             output.push((idx, s));
             continue;
         }
-        if stmt_uses_sent(&state_name, &stmt) {
+        if stmt_uses_sent(&state_param, &stmt) {
             if let Some((_, prev)) = output.last() {
-                if let Some(split) = split_sent_consuming_stmt(&state_name, &stmt, prev) {
+                if let Some(split) = split_sent_consuming_stmt(&state_param, &stmt, prev) {
                     output.pop();
                     output.extend(split.into_iter().map(|stmt| (idx, stmt)));
                     continue;
@@ -988,7 +1092,7 @@ fn decode_state_machine(
                         arg: Some(arg),
                     }));
                     let mut replacer = SentReplacer {
-                        state_name: state_name.clone(),
+                        state_param: state_param.clone(),
                         replacement: yield_expr,
                     };
                     let mut s = stmt.clone();
@@ -1004,7 +1108,7 @@ fn decode_state_machine(
             } else {
                 // No previous yield -- replace sent with undefined
                 let mut replacer = SentReplacer {
-                    state_name: state_name.clone(),
+                    state_param: state_param.clone(),
                     replacement: Box::new(Expr::Ident(Ident::new_no_ctxt(
                         "undefined".into(),
                         DUMMY_SP,
@@ -1020,6 +1124,8 @@ fn decode_state_machine(
     }
 
     let mut recovered = StateMachineProgram::from_labeled_stmts(output, trys)
+        .with_catch_bindings(catch_bindings)
+        .with_index_loops(IndexLoopContinueMode::AdjacentBackEdge)
         .recover_conditional_assignments()
         .recover_conditional_branches(OpcodeReturnScan::SkipNestedFunctions)
         .resolve_labeled_forward_jumps(
@@ -1032,10 +1138,6 @@ fn decode_state_machine(
         return None;
     }
     Some(recovered)
-}
-
-fn is_catch_label(label_idx: usize, trys: &[[Option<usize>; 4]]) -> bool {
-    trys.iter().any(|region| region[1] == Some(label_idx))
 }
 
 /// If `stmt` is `ExprStmt(yield X)`, return `(X, delegate, yield_span)`.
@@ -1054,7 +1156,7 @@ fn extract_yield_from_stmt(stmt: &Stmt) -> Option<(Box<Expr>, bool, Span)> {
     None
 }
 
-fn split_sent_consuming_stmt(state_name: &Atom, stmt: &Stmt, prev: &Stmt) -> Option<Vec<Stmt>> {
+fn split_sent_consuming_stmt(state_param: &Ident, stmt: &Stmt, prev: &Stmt) -> Option<Vec<Stmt>> {
     let (arg, delegate, yield_span) = extract_yield_from_stmt(prev)?;
     let stmt_span = stmt.span();
     let yielded = Box::new(Expr::Yield(YieldExpr {
@@ -1063,7 +1165,7 @@ fn split_sent_consuming_stmt(state_name: &Atom, stmt: &Stmt, prev: &Stmt) -> Opt
         arg: Some(arg),
     }));
 
-    if let Some((left, followup)) = split_yield_arg_sent_assignment(state_name, stmt) {
+    if let Some((left, followup)) = split_yield_arg_sent_assignment(state_param, stmt) {
         return Some(vec![
             assign_stmt(left, yielded, stmt_span),
             Stmt::Expr(ExprStmt {
@@ -1077,7 +1179,7 @@ fn split_sent_consuming_stmt(state_name: &Atom, stmt: &Stmt, prev: &Stmt) -> Opt
         ]);
     }
 
-    if let Some((left, returned)) = split_return_sent_assignment(state_name, stmt) {
+    if let Some((left, returned)) = split_return_sent_assignment(state_param, stmt) {
         return Some(vec![
             assign_stmt(left, yielded, stmt_span),
             Stmt::Return(swc_core::ecma::ast::ReturnStmt {
@@ -1091,7 +1193,7 @@ fn split_sent_consuming_stmt(state_name: &Atom, stmt: &Stmt, prev: &Stmt) -> Opt
 }
 
 fn split_yield_arg_sent_assignment(
-    state_name: &Atom,
+    state_param: &Ident,
     stmt: &Stmt,
 ) -> Option<(AssignTarget, Box<Expr>)> {
     let Stmt::Expr(ExprStmt { expr, .. }) = stmt else {
@@ -1114,7 +1216,7 @@ fn split_yield_arg_sent_assignment(
     let Expr::Assign(assign) = strip_parens(&member.obj) else {
         return None;
     };
-    if assign.op != AssignOp::Assign || !is_sent_call(state_name, &assign.right) {
+    if assign.op != AssignOp::Assign || !is_sent_call(state_param, &assign.right) {
         return None;
     }
     let AssignTarget::Simple(SimpleAssignTarget::Ident(left)) = &assign.left else {
@@ -1130,7 +1232,7 @@ fn split_yield_arg_sent_assignment(
 }
 
 fn split_return_sent_assignment(
-    state_name: &Atom,
+    state_param: &Ident,
     stmt: &Stmt,
 ) -> Option<(AssignTarget, Box<Expr>)> {
     let Stmt::Return(ret) = stmt else {
@@ -1139,7 +1241,7 @@ fn split_return_sent_assignment(
     let Expr::Assign(assign) = ret.arg.as_deref()? else {
         return None;
     };
-    if assign.op != AssignOp::Assign || !is_sent_call(state_name, &assign.right) {
+    if assign.op != AssignOp::Assign || !is_sent_call(state_param, &assign.right) {
         return None;
     }
     let AssignTarget::Simple(SimpleAssignTarget::Ident(left)) = &assign.left else {
@@ -1160,42 +1262,39 @@ fn assign_stmt(left: AssignTarget, right: Box<Expr>, span: Span) -> Stmt {
     })
 }
 
-fn is_sent_call(state_name: &Atom, expr: &Expr) -> bool {
+fn is_sent_call(state_param: &Ident, expr: &Expr) -> bool {
     let Expr::Call(call) = expr else {
         return false;
     };
     let Some(mem) = call.callee.as_expr().and_then(|e| e.as_member()) else {
         return false;
     };
-    matches!(mem.obj.as_ref(), Expr::Ident(id) if id.sym == *state_name)
-        && is_ident_prop(&mem.prop, "sent")
+    is_state_param_ref(&mem.obj, state_param) && is_ident_prop(&mem.prop, "sent")
 }
 
 /// Match `ident = _a.sent()` inside a catch region, returning the aliased
 /// local binding. TSC stores the caught value in a function-scoped temp before
 /// using it; we fold that temp into the reconstructed catch binding.
-fn catch_sent_alias(state_name: &Atom, stmt: &Stmt) -> Option<BindingKey> {
+fn catch_sent_alias(state_param: &Ident, stmt: &Stmt) -> Option<BindingKey> {
     let Stmt::Expr(ExprStmt { expr, .. }) = stmt else {
         return None;
     };
     let Expr::Assign(assign) = expr.as_ref() else {
         return None;
     };
-    if assign.op != AssignOp::Assign || !is_sent_call(state_name, &assign.right) {
+    if assign.op != AssignOp::Assign || !is_sent_call(state_param, &assign.right) {
         return None;
     }
     let ident = assign.left.as_simple()?.as_ident()?;
     Some(binding_key(&ident.id))
 }
 
-fn is_standalone_sent(state_name: &Atom, stmt: &Stmt) -> bool {
+fn is_standalone_sent(state_param: &Ident, stmt: &Stmt) -> bool {
     if let Stmt::Expr(ExprStmt { expr, .. }) = stmt {
         if let Expr::Call(call) = expr.as_ref() {
             if let Some(mem) = call.callee.as_expr().and_then(|e| e.as_member()) {
-                if let Expr::Ident(id) = mem.obj.as_ref() {
-                    if id.sym == *state_name && is_ident_prop(&mem.prop, "sent") {
-                        return true;
-                    }
+                if is_state_param_ref(&mem.obj, state_param) && is_ident_prop(&mem.prop, "sent") {
+                    return true;
                 }
             }
         }
@@ -1220,7 +1319,7 @@ fn next_numeric_case_label(cases: &[SwitchCase], current: usize) -> Option<usize
         .min()
 }
 
-fn extract_trys_push(state_name: &Atom, stmt: &Stmt) -> Option<[Option<usize>; 4]> {
+fn extract_trys_push(state_param: &Ident, stmt: &Stmt) -> Option<[Option<usize>; 4]> {
     // _a.trys.push([s, c, f, n])
     let Stmt::Expr(ExprStmt { expr, .. }) = stmt else {
         return None;
@@ -1237,7 +1336,7 @@ fn extract_trys_push(state_name: &Atom, stmt: &Stmt) -> Option<[Option<usize>; 4
     let Expr::Ident(obj_id) = outer_mem.obj.as_ref() else {
         return None;
     };
-    if obj_id.sym != *state_name {
+    if obj_id.sym != state_param.sym || obj_id.ctxt != state_param.ctxt {
         return None;
     }
     if !is_ident_prop(&outer_mem.prop, "trys") {
@@ -1283,7 +1382,7 @@ fn is_try_region_exit(label: usize, target: usize, trys: &[[Option<usize>; 4]]) 
     })
 }
 
-fn is_state_label_assign(state_name: &Atom, stmt: &Stmt) -> bool {
+fn is_state_label_assign(state_param: &Ident, stmt: &Stmt) -> bool {
     let Stmt::Expr(ExprStmt { expr, .. }) = stmt else {
         return false;
     };
@@ -1296,23 +1395,64 @@ fn is_state_label_assign(state_name: &Atom, stmt: &Stmt) -> bool {
     let Expr::Ident(id) = left_expr.obj.as_ref() else {
         return false;
     };
-    id.sym == *state_name && is_ident_prop(&left_expr.prop, "label")
+    id.sym == state_param.sym
+        && id.ctxt == state_param.ctxt
+        && is_ident_prop(&left_expr.prop, "label")
+}
+
+/// Rewrites `return [2, value]` / `return [2]` nested inside a case
+/// statement's branches into plain returns. Nested functions keep their own
+/// returns.
+struct NestedValueReturnDecoder;
+
+impl VisitMut for NestedValueReturnDecoder {
+    fn visit_mut_function(&mut self, _: &mut Function) {}
+
+    fn visit_mut_arrow_expr(&mut self, _: &mut swc_core::ecma::ast::ArrowExpr) {}
+
+    fn visit_mut_return_stmt(&mut self, ret: &mut swc_core::ecma::ast::ReturnStmt) {
+        let Some(Expr::Array(arr)) = ret.arg.as_deref() else {
+            return;
+        };
+        let is_return_opcode = arr
+            .elems
+            .first()
+            .and_then(|elem| elem.as_ref())
+            .is_some_and(|elem| matches!(elem.expr.as_ref(), Expr::Lit(swc_core::ecma::ast::Lit::Num(n)) if n.value == 2.0));
+        if !is_return_opcode || arr.elems.len() > 2 {
+            return;
+        }
+        ret.arg = arr
+            .elems
+            .get(1)
+            .and_then(|elem| elem.as_ref())
+            .map(|elem| elem.expr.clone());
+    }
+}
+
+/// What a void `return [2]` decodes to: the machine's implicit end is
+/// dropped, an explicit early `return;` is kept.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VoidReturn {
+    Drop,
+    Keep,
 }
 
 /// Returns `Some(Some(stmt))` if an opcode-based return was decoded,
 /// `Some(None)` to drop the statement, or `None` if not a return opcode.
-fn decode_return_opcode(stmt: &Stmt, values_helpers: &HashSet<BindingKey>) -> Option<Option<Stmt>> {
-    decode_return_opcode_with_backedge(stmt, values_helpers, 0, None, &[])
+fn decode_return_opcode(stmt: &Stmt, helpers: &AsyncHelperContext) -> Option<Option<Stmt>> {
+    decode_return_opcode_with_backedge(stmt, helpers, 0, None, &[], VoidReturn::Drop)
 }
 
 /// Like `decode_return_opcode`, but preserves non-fallthrough goto opcodes so
 /// shared state-machine recovery can reconstruct loops and structured branches.
 fn decode_return_opcode_with_backedge(
     stmt: &Stmt,
-    values_helpers: &HashSet<BindingKey>,
+    helpers: &AsyncHelperContext,
     current_case: usize,
     next_case_label: Option<usize>,
     trys: &[[Option<usize>; 4]],
+    void_return: VoidReturn,
 ) -> Option<Option<Stmt>> {
     let Stmt::Return(ret) = stmt else { return None };
     let arg = ret.arg.as_ref()?;
@@ -1337,13 +1477,13 @@ fn decode_return_opcode_with_backedge(
     match opcode {
         2 => {
             // return(value?)
-            let s = argument.map(|a| {
-                Stmt::Return(swc_core::ecma::ast::ReturnStmt {
-                    span: ret_span,
-                    arg: Some(a),
-                })
-            });
-            Some(s)
+            if argument.is_none() && void_return == VoidReturn::Drop {
+                return Some(None);
+            }
+            Some(Some(Stmt::Return(swc_core::ecma::ast::ReturnStmt {
+                span: ret_span,
+                arg: argument,
+            })))
         }
         3 => {
             // goto(label) -- preserve back-edges for loop recovery and
@@ -1355,9 +1495,11 @@ fn decode_return_opcode_with_backedge(
                     None
                 }
             }) {
-                if target > 0
-                    && (target < current_case
-                        || (target > current_case && Some(target) != next_case_label))
+                // A back-edge to label 0 is a loop whose head is the machine
+                // entry (`for (;;)` at the top of the function); dropping it
+                // would leave the body to run once.
+                if (target < current_case
+                    || (target > current_case && Some(target) != next_case_label))
                     && !is_try_region_exit(current_case, target, trys)
                 {
                     return Some(Some(stmt.clone()));
@@ -1385,7 +1527,7 @@ fn decode_return_opcode_with_backedge(
         5 => {
             // yield*(value)
             let expr = argument
-                .map(|a| unwrap_ts_values(a, values_helpers))
+                .map(|a| unwrap_ts_values(a, helpers))
                 .unwrap_or_else(|| {
                     Box::new(Expr::Ident(Ident::new_no_ctxt(
                         "undefined".into(),
@@ -1406,33 +1548,47 @@ fn decode_return_opcode_with_backedge(
     }
 }
 
-fn unwrap_ts_values(expr: Box<Expr>, values_helpers: &HashSet<BindingKey>) -> Box<Expr> {
+fn unwrap_ts_values(expr: Box<Expr>, helpers: &AsyncHelperContext) -> Box<Expr> {
     let Expr::Call(call) = expr.as_ref() else {
         return expr;
     };
+    if call.args.len() != 1 || call.args[0].spread.is_some() || helpers.with_statement_present {
+        return expr;
+    }
     let Some(callee) = call.callee.as_expr() else {
         return expr;
     };
-    let Expr::Ident(id) = callee.as_ref() else {
-        return expr;
+    let lookup = match strip_parens(callee) {
+        Expr::Ident(id) => Some(id),
+        Expr::Member(member) => match strip_parens(&member.obj) {
+            Expr::Ident(id) => Some(id),
+            _ => None,
+        },
+        _ => None,
     };
-    // Match either a detected `__values` / `_ts_values` binding (robust to
-    // minified aliases) or the canonical helper names.
-    let is_values_helper = values_helpers.contains(&binding_key(id))
-        || matches!(id.sym.as_ref(), "__values" | "_ts_values");
+    if lookup.is_some_and(|id| helpers.written_bindings.contains(&binding_key(id))) {
+        return expr;
+    }
+    let is_values_helper = helpers.matches_helper_call(
+        call,
+        &helpers.values_helpers,
+        &helpers.values_namespaces,
+        "__values",
+        TsHelperKind::Values,
+    ) || call.callee.as_expr().is_some_and(|callee| {
+        matches!(strip_parens(callee), Expr::Ident(id)
+            if id.sym.as_ref() == "_ts_values"
+                && helpers.unresolved_mark.is_some_and(|mark| id.ctxt.outer() == mark))
+    });
     if is_values_helper {
-        return call
-            .args
-            .first()
-            .map(|arg| arg.expr.clone())
-            .unwrap_or(expr);
+        return call.args[0].expr.clone();
     }
     expr
 }
 
-fn stmt_uses_sent(state_name: &Atom, stmt: &Stmt) -> bool {
+fn stmt_uses_sent(state_param: &Ident, stmt: &Stmt) -> bool {
     struct Finder {
-        state_name: Atom,
+        state_param: Ident,
         found: bool,
     }
     impl swc_core::ecma::visit::Visit for Finder {
@@ -1442,18 +1598,18 @@ fn stmt_uses_sent(state_name: &Atom, stmt: &Stmt) -> bool {
 
         fn visit_call_expr(&mut self, call: &swc_core::ecma::ast::CallExpr) {
             if let Some(mem) = call.callee.as_expr().and_then(|e| e.as_member()) {
-                if let Expr::Ident(id) = mem.obj.as_ref() {
-                    if id.sym == self.state_name && is_ident_prop(&mem.prop, "sent") {
-                        self.found = true;
-                        return;
-                    }
+                if is_state_param_ref(&mem.obj, &self.state_param)
+                    && is_ident_prop(&mem.prop, "sent")
+                {
+                    self.found = true;
+                    return;
                 }
             }
             call.visit_children_with(self);
         }
     }
     let mut f = Finder {
-        state_name: state_name.clone(),
+        state_param: state_param.clone(),
         found: false,
     };
     swc_core::ecma::visit::VisitWith::visit_with(stmt, &mut f);
@@ -1461,7 +1617,7 @@ fn stmt_uses_sent(state_name: &Atom, stmt: &Stmt) -> bool {
 }
 
 struct SentReplacer {
-    state_name: Atom,
+    state_param: Ident,
     replacement: Box<Expr>,
 }
 
@@ -1473,11 +1629,11 @@ impl VisitMut for SentReplacer {
     fn visit_mut_expr(&mut self, expr: &mut Expr) {
         if let Expr::Call(call) = expr {
             if let Some(mem) = call.callee.as_expr().and_then(|e| e.as_member()) {
-                if let Expr::Ident(id) = mem.obj.as_ref() {
-                    if id.sym == self.state_name && is_ident_prop(&mem.prop, "sent") {
-                        *expr = *self.replacement.clone();
-                        return;
-                    }
+                if is_state_param_ref(&mem.obj, &self.state_param)
+                    && is_ident_prop(&mem.prop, "sent")
+                {
+                    *expr = *self.replacement.clone();
+                    return;
                 }
             }
         }
@@ -1488,7 +1644,7 @@ impl VisitMut for SentReplacer {
 /// Replaces `_a.sent()` and any recorded catch-temp aliases with the catch
 /// binding inside a reconstructed catch body.
 struct CatchValueReplacer {
-    state_name: Atom,
+    state_param: Ident,
     aliases: Vec<BindingKey>,
     replacement: Box<Expr>,
 }
@@ -1501,11 +1657,11 @@ impl VisitMut for CatchValueReplacer {
     fn visit_mut_expr(&mut self, expr: &mut Expr) {
         if let Expr::Call(call) = expr {
             if let Some(mem) = call.callee.as_expr().and_then(|e| e.as_member()) {
-                if let Expr::Ident(id) = mem.obj.as_ref() {
-                    if id.sym == self.state_name && is_ident_prop(&mem.prop, "sent") {
-                        *expr = *self.replacement.clone();
-                        return;
-                    }
+                if is_state_param_ref(&mem.obj, &self.state_param)
+                    && is_ident_prop(&mem.prop, "sent")
+                {
+                    *expr = *self.replacement.clone();
+                    return;
                 }
             }
         }
@@ -1873,7 +2029,7 @@ fn try_transform_awaiter(
 /// declarations are collected directly. Nested callable and class scopes stay
 /// intact and are not part of the move.
 fn moved_function_scope_binding_ids(stmts: &[Stmt]) -> HashSet<BindingId> {
-    let mut ids = HashSet::new();
+    let mut ids = HashSet::default();
     for stmt in stmts {
         if let Stmt::Decl(decl) = stmt {
             collect_decl_binding_ids(decl, &mut ids);
@@ -1928,7 +2084,8 @@ fn extract_awaiter_body(stmt: Stmt, helpers: &AsyncHelperContext) -> Option<Vec<
     if !awaiter_call_has_canonical_frame(&call, helpers) {
         return None;
     }
-    let this_arg = classify_awaiter_this_arg(&call.args[0].expr, helpers.unresolved_mark);
+    let this_arg = classify_awaiter_this_arg(&call.args[0].expr, helpers);
+    let arguments_slot = classify_awaiter_arguments_arg(&call.args[1].expr);
 
     let gen_fn_arg = *call.args.remove(3).expr;
     let Expr::Fn(fn_expr) = gen_fn_arg else {
@@ -1941,7 +2098,10 @@ fn extract_awaiter_body(stmt: Stmt, helpers: &AsyncHelperContext) -> Option<Vec<
     }
     let body = fn_expr.function.body?;
     let mut stmts = body.stmts;
-    apply_awaiter_this_arg(&mut stmts, this_arg)?;
+    if !arguments_slot_survives_splice(arguments_slot, &stmts, AwaiterSplice::EnclosingFunction) {
+        return None;
+    }
+    apply_awaiter_this_arg(&mut stmts, this_arg, AwaiterSplice::EnclosingFunction)?;
     Some(stmts)
 }
 
@@ -1957,7 +2117,7 @@ fn awaiter_call_has_canonical_frame(call: &CallExpr, helpers: &AsyncHelperContex
     if call.args.len() != 4 || call.args.iter().any(|arg| arg.spread.is_some()) {
         return false;
     }
-    is_awaiter_arguments_arg(&call.args[1].expr, helpers.unresolved_mark)
+    is_awaiter_arguments_arg(&call.args[1].expr, helpers)
         && is_awaiter_promise_arg(&call.args[2].expr, helpers)
 }
 
@@ -1976,16 +2136,74 @@ fn is_void_literal(expr: &Expr) -> bool {
 /// the time this rule runs. Any other identifier is not canonical — a real
 /// array here is applied to the generator's parameters, which unwrapping
 /// discards, and an undeclared name would even lose its ReferenceError.
-/// Without a resolver mark, `undefined` cannot be proven global, so it fails
-/// closed.
-fn is_awaiter_arguments_arg(expr: &Expr, unresolved_mark: Option<Mark>) -> bool {
+/// Both canonical names must carry the resolver mark: the implicit
+/// `arguments` object is unresolved, while a (sloppy-mode) binding of that
+/// name is a real array. Without a mark nothing is proven, so it fails closed.
+fn is_awaiter_arguments_arg(expr: &Expr, helpers: &AsyncHelperContext) -> bool {
     match strip_parens(expr) {
-        Expr::Ident(id) if id.sym.as_ref() == "arguments" => true,
-        Expr::Ident(id) if id.sym.as_ref() == "undefined" => {
-            unresolved_mark.is_some_and(|mark| id.ctxt.outer() == mark)
+        Expr::Ident(id) if matches!(id.sym.as_ref(), "arguments" | "undefined") => {
+            !helpers.with_statement_present
+                && helpers
+                    .unresolved_mark
+                    .is_some_and(|mark| id.ctxt.outer() == mark)
         }
         expr => is_void_literal(expr),
     }
+}
+
+/// Where the generator body ends up after unwrapping. The two destinations
+/// give the body different `this` and `arguments` bindings, so the canonical
+/// frame slots are compatible with different body contents in each.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AwaiterSplice {
+    /// `return __awaiter(...)` — the body is spliced into the enclosing
+    /// function, whose `this` and `arguments` it then shares.
+    EnclosingFunction,
+    /// Expression-position `__awaiter(...)` — the body becomes a new
+    /// `(async function () {...})()`, called with no receiver and no
+    /// arguments. No top-level exception: a module's `this` is `undefined`
+    /// like the IIFE's, but wakaru preserves the script goal, and a strict
+    /// script's top-level `this` is the global object.
+    NewFunction,
+}
+
+/// The already-validated arguments slot, classified by what the generator
+/// body observed as `arguments` before unwrapping.
+#[derive(Clone, Copy)]
+enum AwaiterArgumentsArg {
+    /// `arguments` — the enclosing function's arguments object.
+    EnclosingArguments,
+    /// `void 0` / `undefined` — the helper applies an empty list.
+    Empty,
+}
+
+fn classify_awaiter_arguments_arg(expr: &Expr) -> AwaiterArgumentsArg {
+    match strip_parens(expr) {
+        Expr::Ident(id) if id.sym.as_ref() == "arguments" => {
+            AwaiterArgumentsArg::EnclosingArguments
+        }
+        _ => AwaiterArgumentsArg::Empty,
+    }
+}
+
+/// A body that reads `arguments` keeps its meaning only when the destination
+/// binds `arguments` to the same value the helper applied: the enclosing
+/// function's arguments when splicing there, an empty list inside a fresh
+/// IIFE. tsc never emits the mismatching pairs; anything else preserves the
+/// wrapper.
+fn arguments_slot_survives_splice(
+    slot: AwaiterArgumentsArg,
+    stmts: &[Stmt],
+    splice: AwaiterSplice,
+) -> bool {
+    let compatible = matches!(
+        (slot, splice),
+        (
+            AwaiterArgumentsArg::EnclosingArguments,
+            AwaiterSplice::EnclosingFunction
+        ) | (AwaiterArgumentsArg::Empty, AwaiterSplice::NewFunction)
+    );
+    compatible || !stmts_read_lexical_arguments(stmts)
 }
 
 /// The Promise-constructor slot: only shapes that mean "use the native
@@ -1999,9 +2217,12 @@ fn is_awaiter_promise_arg(expr: &Expr, helpers: &AsyncHelperContext) -> bool {
         return true;
     }
     match strip_parens(expr) {
-        Expr::Ident(id) if matches!(id.sym.as_ref(), "undefined" | "Promise") => helpers
-            .unresolved_mark
-            .is_some_and(|mark| id.ctxt.outer() == mark),
+        Expr::Ident(id) if matches!(id.sym.as_ref(), "undefined" | "Promise") => {
+            !helpers.with_statement_present
+                && helpers
+                    .unresolved_mark
+                    .is_some_and(|mark| id.ctxt.outer() == mark)
+        }
         _ => false,
     }
 }
@@ -2010,9 +2231,11 @@ fn is_awaiter_promise_arg(expr: &Expr, helpers: &AsyncHelperContext) -> bool {
 /// wrapper splices the body into the enclosing function, which rebinds `this`,
 /// so anything other than the enclosing `this` must be accounted for.
 enum AwaiterThisArg {
-    /// `this` (same binding after splicing) or `void 0` / `undefined`
-    /// (tsc emits these only where `this` is not used meaningfully).
-    Compatible,
+    /// `this` — the enclosing function's receiver.
+    EnclosingThis,
+    /// `void 0` / `undefined` — the helper applies no receiver (`undefined`
+    /// in strict code, the global object in sloppy code).
+    Undefined,
     /// A captured alias such as tsc's `var _this = this`; body-level `this`
     /// references are rewritten to it.
     Alias(Ident),
@@ -2021,13 +2244,19 @@ enum AwaiterThisArg {
     Unsupported,
 }
 
-fn classify_awaiter_this_arg(expr: &Expr, unresolved_mark: Option<Mark>) -> AwaiterThisArg {
+fn classify_awaiter_this_arg(expr: &Expr, helpers: &AsyncHelperContext) -> AwaiterThisArg {
+    let unresolved_mark = helpers.unresolved_mark;
+    // Under a `with` statement no identifier is trustworthy (see
+    // `with_statement_present`); only `this` and `void <literal>` remain.
+    if helpers.with_statement_present && matches!(strip_parens(expr), Expr::Ident(_)) {
+        return AwaiterThisArg::Unsupported;
+    }
     match strip_parens(expr) {
-        Expr::This(_) => AwaiterThisArg::Compatible,
+        Expr::This(_) => AwaiterThisArg::EnclosingThis,
         // Only `void <literal>`: `void probe()` would delete the side effect.
         Expr::Unary(unary) if unary.op == UnaryOp::Void => {
             if matches!(strip_parens(&unary.arg), Expr::Lit(_)) {
-                AwaiterThisArg::Compatible
+                AwaiterThisArg::Undefined
             } else {
                 AwaiterThisArg::Unsupported
             }
@@ -2039,15 +2268,17 @@ fn classify_awaiter_this_arg(expr: &Expr, unresolved_mark: Option<Mark>) -> Awai
             if id.sym.as_ref() == "undefined"
                 && unresolved_mark.is_some_and(|mark| id.ctxt.outer() == mark) =>
         {
-            AwaiterThisArg::Compatible
+            AwaiterThisArg::Undefined
         }
         // The alias path is for resolver-proven local bindings (tsc's
         // `var _this = this`). An unresolved name would throw ReferenceError
         // when evaluated; if the body never reads `this`, unwrapping would
         // delete that throw entirely. Without a mark nothing is proven, so
-        // fail closed.
+        // fail closed. A written alias is rejected too: the helper reads it
+        // once at call time, while the spliced body would read it live.
         Expr::Ident(id) => {
-            if unresolved_mark.is_some_and(|mark| id.ctxt.outer() != mark) {
+            let proven_local = unresolved_mark.is_some_and(|mark| id.ctxt.outer() != mark);
+            if proven_local && !helpers.written_bindings.contains(&binding_id(id)) {
                 AwaiterThisArg::Alias(id.clone())
             } else {
                 AwaiterThisArg::Unsupported
@@ -2058,9 +2289,24 @@ fn classify_awaiter_this_arg(expr: &Expr, unresolved_mark: Option<Mark>) -> Awai
 }
 
 /// Returns `None` when the thisArg cannot be represented after unwrapping.
-fn apply_awaiter_this_arg(stmts: &mut [Stmt], this_arg: AwaiterThisArg) -> Option<()> {
+///
+/// `this` and `void 0` are each compatible with exactly one destination when
+/// the body reads `this`: splicing into the enclosing function keeps `this`
+/// for a `this` thisArg, while a fresh IIFE (called with no receiver)
+/// reproduces `void 0`. The mismatching pairs change what `this` evaluates
+/// to, so they preserve the wrapper unless the body never reads `this`.
+fn apply_awaiter_this_arg(
+    stmts: &mut [Stmt],
+    this_arg: AwaiterThisArg,
+    splice: AwaiterSplice,
+) -> Option<()> {
     match this_arg {
-        AwaiterThisArg::Compatible => Some(()),
+        AwaiterThisArg::EnclosingThis => (splice == AwaiterSplice::EnclosingFunction
+            || !stmts_read_lexical_this(stmts))
+        .then_some(()),
+        AwaiterThisArg::Undefined => {
+            (splice == AwaiterSplice::NewFunction || !stmts_read_lexical_this(stmts)).then_some(())
+        }
         AwaiterThisArg::Unsupported => None,
         AwaiterThisArg::Alias(alias) => {
             if stmts_declare_name(stmts, &alias.sym) {
@@ -2125,16 +2371,78 @@ impl VisitMut for ThisToAlias {
     }
 
     // `this` is lexical only through arrows; anything with its own `this`
-    // binding keeps its references untouched.
+    // binding keeps its references untouched. Inside a class that means
+    // method/constructor bodies, field initializers, and static blocks — but
+    // the `extends` expression and computed keys evaluate in the enclosing
+    // scope and are rewritten.
     fn visit_mut_function(&mut self, _func: &mut Function) {}
 
-    fn visit_mut_class(&mut self, _class: &mut swc_core::ecma::ast::Class) {}
+    fn visit_mut_constructor(&mut self, _ctor: &mut Constructor) {}
+
+    fn visit_mut_static_block(&mut self, _block: &mut StaticBlock) {}
+
+    fn visit_mut_class_prop(&mut self, prop: &mut ClassProp) {
+        prop.key.visit_mut_with(self);
+    }
+
+    fn visit_mut_private_prop(&mut self, _prop: &mut PrivateProp) {}
+
+    fn visit_mut_auto_accessor(&mut self, accessor: &mut AutoAccessor) {
+        accessor.key.visit_mut_with(self);
+    }
+}
+
+/// Whether the statements read the lexical `this` — through arrows, class
+/// `extends` expressions, and computed keys, but not inside anything with its
+/// own `this` binding.
+fn stmts_read_lexical_this(stmts: &[Stmt]) -> bool {
+    struct Finder(bool);
+    impl Visit for Finder {
+        fn visit_this_expr(&mut self, _: &ThisExpr) {
+            self.0 = true;
+        }
+        fn visit_function(&mut self, _: &Function) {}
+        fn visit_constructor(&mut self, _: &Constructor) {}
+        fn visit_static_block(&mut self, _: &StaticBlock) {}
+        fn visit_class_prop(&mut self, prop: &ClassProp) {
+            prop.key.visit_with(self);
+        }
+        fn visit_private_prop(&mut self, _: &PrivateProp) {}
+        fn visit_auto_accessor(&mut self, accessor: &AutoAccessor) {
+            accessor.key.visit_with(self);
+        }
+    }
+    let mut finder = Finder(false);
+    for stmt in stmts {
+        stmt.visit_with(&mut finder);
+    }
+    finder.0
+}
+
+/// Whether the statements read the lexical `arguments` object — through
+/// arrows, but not inside functions with their own `arguments` binding.
+fn stmts_read_lexical_arguments(stmts: &[Stmt]) -> bool {
+    struct Finder(bool);
+    impl Visit for Finder {
+        fn visit_ident(&mut self, id: &Ident) {
+            self.0 |= id.sym.as_ref() == "arguments";
+        }
+        fn visit_function(&mut self, _: &Function) {}
+        fn visit_constructor(&mut self, _: &Constructor) {}
+        fn visit_static_block(&mut self, _: &StaticBlock) {}
+    }
+    let mut finder = Finder(false);
+    for stmt in stmts {
+        stmt.visit_with(&mut finder);
+    }
+    finder.0
 }
 
 /// Transform a standalone `__awaiter(this, void0, void0, function*() {...})`
 /// expression into `(async function() {...})()`. Handles the IIFE pattern where
 /// `__awaiter(...)` appears at expression level rather than inside a function body.
 fn try_transform_awaiter_iife(expr: &mut Expr, helpers: &AsyncHelperContext) {
+    let splice = AwaiterSplice::NewFunction;
     let original_span = expr.span();
     let Expr::Call(call) = expr else { return };
     if !helpers.is_awaiter_call(call) || !awaiter_call_has_canonical_frame(call, helpers) {
@@ -2152,11 +2460,15 @@ fn try_transform_awaiter_iife(expr: &mut Expr, helpers: &AsyncHelperContext) {
     if contains_unresolved_generator_wrapper(body, helpers) {
         return;
     }
-    let this_arg = classify_awaiter_this_arg(&call.args[0].expr, helpers.unresolved_mark);
+    let this_arg = classify_awaiter_this_arg(&call.args[0].expr, helpers);
+    let arguments_slot = classify_awaiter_arguments_arg(&call.args[1].expr);
     let fn_span = fn_expr.function.span;
 
     let mut stmts = body.stmts.clone();
-    if apply_awaiter_this_arg(&mut stmts, this_arg).is_none() {
+    if !arguments_slot_survives_splice(arguments_slot, &stmts, splice) {
+        return;
+    }
+    if apply_awaiter_this_arg(&mut stmts, this_arg, splice).is_none() {
         return;
     }
     replace_yield_with_await(&mut stmts);
@@ -2244,14 +2556,14 @@ fn collect_awaiter_param_hints(
     helpers: &AsyncHelperContext,
 ) -> HashMap<BindingId, Atom> {
     let Some(body) = &func.body else {
-        return HashMap::new();
+        return HashMap::default();
     };
     if !body
         .stmts
         .iter()
         .any(|stmt| is_awaiter_return(stmt, helpers))
     {
-        return HashMap::new();
+        return HashMap::default();
     }
 
     let param_ids: HashSet<BindingId> = func
@@ -2265,7 +2577,7 @@ fn collect_awaiter_param_hints(
         })
         .collect();
     if param_ids.is_empty() {
-        return HashMap::new();
+        return HashMap::default();
     }
 
     #[derive(Default)]
@@ -2292,7 +2604,7 @@ fn collect_awaiter_param_hints(
 
     let mut collector = Collector {
         param_ids,
-        targets: HashMap::new(),
+        targets: HashMap::default(),
     };
     body.visit_with(&mut collector);
 
@@ -2369,7 +2681,7 @@ fn apply_unused_param_hints(func: &mut Function, hints: HashMap<BindingId, Atom>
     }
 
     let mut collector = UseCollector {
-        uses: HashSet::new(),
+        uses: HashSet::default(),
     };
     for param in &func.params {
         collector.visit_pat(&param.pat);
@@ -2478,6 +2790,12 @@ fn is_valid_param_hint(value: &str) -> bool {
 // ============================================================
 // Helpers
 // ============================================================
+
+/// The state callback's parameter by resolver identity: a nested function
+/// whose parameter shares the spelling is a different binding.
+fn is_state_param_ref(expr: &Expr, state_param: &Ident) -> bool {
+    matches!(expr, Expr::Ident(id) if id.sym == state_param.sym && id.ctxt == state_param.ctxt)
+}
 
 fn is_ident_prop(prop: &swc_core::ecma::ast::MemberProp, name: &str) -> bool {
     matches!(prop, swc_core::ecma::ast::MemberProp::Ident(n) if n.sym.as_str() == name)

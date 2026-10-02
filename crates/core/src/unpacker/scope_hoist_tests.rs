@@ -273,6 +273,42 @@ fn iife_with_only_nested_returns_can_still_be_unwrapped() {
 }
 
 #[test]
+fn minified_bang_iife_can_be_unwrapped() {
+    let body = two_group_fixture("function b1() { return 10; }");
+    let input = format!("!function() {{\n{body}\n}}();");
+
+    assert!(
+        unwraps_first_iife(&input),
+        "the minified Rollup IIFE form should expose its scope-hoisted body"
+    );
+    assert_splits(&input, "the minified Rollup IIFE should split");
+}
+
+#[test]
+fn generator_iife_cannot_be_unwrapped() {
+    let body = two_group_fixture("function b1() { return 10; }");
+    let input = format!("(function*() {{\n{body}\n}})();");
+
+    assert!(
+        !unwraps_first_iife(&input),
+        "calling a generator does not execute its body"
+    );
+    assert_does_not_split(&input, "a generator body must retain its boundary");
+}
+
+#[test]
+fn async_iife_cannot_be_unwrapped() {
+    let body = two_group_fixture("function b1() { return 10; }");
+    let input = format!("(async function() {{\nawait 0;\n{body}\n}})();");
+
+    assert!(
+        !unwraps_first_iife(&input),
+        "an async IIFE must retain its promise and suspension boundary"
+    );
+    assert_does_not_split(&input, "an async IIFE body must retain its boundary");
+}
+
+#[test]
 fn iife_unwrap_declines_cross_scope_binding_collisions() {
     for (name, input) in [
         (
@@ -698,6 +734,7 @@ fn inspection_bounds_cross_item_write_components() {
         &at_limit,
         ScopeHoistRenderMode::Inspect,
         ScopeHoistSource::NestedModule,
+        crate::unpacker::SourcePositions::Discard,
     )
     .expect("the at-limit fixture should split");
     let at_limit_writer = at_limit
@@ -719,6 +756,7 @@ fn inspection_bounds_cross_item_write_components() {
         &above_limit,
         ScopeHoistRenderMode::Inspect,
         ScopeHoistSource::NestedModule,
+        crate::unpacker::SourcePositions::Discard,
     )
     .expect("the above-limit fixture should split");
     let inspection_writer = inspection
@@ -800,6 +838,7 @@ fn inspection_retains_bounded_leaf_writes_inside_a_hub_component() {
         &input,
         ScopeHoistRenderMode::Inspect,
         ScopeHoistSource::NestedModule,
+        crate::unpacker::SourcePositions::Discard,
     )
     .expect("the hub fixture should split");
 
@@ -867,8 +906,8 @@ fn inspection_does_not_accept_offsetting_component_count_changes() {
         TopLevelItem {
             declared_names: Vec::new(),
             top_level_var_names: Vec::new(),
-            referenced_names: HashSet::new(),
-            written_names: HashSet::new(),
+            referenced_names: HashSet::default(),
+            written_names: HashSet::default(),
             is_module_decl: false,
         },
     ];
@@ -930,6 +969,7 @@ fn inspection_backs_off_when_leaf_writes_promote_singletons_to_modules() {
         &input,
         ScopeHoistRenderMode::Inspect,
         ScopeHoistSource::NestedModule,
+        crate::unpacker::SourcePositions::Discard,
     )
     .expect("the independent pair should preserve a split after backoff");
     assert_eq!(
@@ -968,7 +1008,7 @@ fn scope_hoist_trace_reports_cross_write_hub_topology() {
 
 #[test]
 fn cluster_filename_dedup_is_case_insensitive() {
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     assert_eq!(
         dedup_cluster_filename("chunk_Helper.js", &mut seen),
         "chunk_Helper.js"
@@ -1175,6 +1215,77 @@ fn chunk_references_to_imported_bindings_keep_imports() {
 }
 
 #[test]
+fn destructuring_var_export_covers_every_bound_name() {
+    // `b5` consumes names bound by both declarator shapes. Promoting
+    // the declaration must count the destructured names as exported.
+    let input = r#"
+            function a1() { return 1; }
+            function a2() { return a1() + 1; }
+            function a3() { return a2() + 1; }
+            function a4() { return a3() + 1; }
+            var make = mark("make"), { forEach: each, slice: cut } = Array.prototype;
+
+            function b1() { return 10; }
+            function b2() { return b1() + 1; }
+            function b3() { return b2() + 1; }
+            function b4() { return b3() + 1; }
+            function b5() { return b4() + make + each.length + cut.length; }
+            console.log(a4());
+        "#;
+
+    let modules = split(input).expect("should split");
+    let entry = &modules
+        .iter()
+        .find(|(_, _, is_entry)| *is_entry)
+        .expect("should have entry")
+        .1;
+    assert!(
+        entry.contains(
+            "export var make = mark(\"make\"), { forEach: each, slice: cut } = Array.prototype;"
+        ),
+        "the declaration should be exported inline:\n{entry}"
+    );
+    assert!(
+        !entry.contains("export {"),
+        "no name should be exported a second time:\n{entry}"
+    );
+}
+
+#[test]
+fn partially_exported_destructuring_declarator_stays_local() {
+    // Only `each` is consumed; exporting the declarator would also export
+    // `cut`, so it stays a local declaration with a trailing export.
+    let input = r#"
+            function a1() { return 1; }
+            function a2() { return a1() + 1; }
+            function a3() { return a2() + 1; }
+            function a4() { return a3() + 1; }
+            var { forEach: each, slice: cut } = Array.prototype;
+            cut.call([]);
+
+            function b1() { return 10; }
+            function b2() { return b1() + 1; }
+            function b3() { return b2() + 1; }
+            function b4() { return b3() + 1; }
+            function b5() { return b4() + each.length; }
+            console.log(a4());
+        "#;
+
+    let modules = split(input).expect("should split");
+    let entry = &modules
+        .iter()
+        .find(|(_, _, is_entry)| *is_entry)
+        .expect("should have entry")
+        .1;
+    assert!(
+        entry.contains("var { forEach: each, slice: cut } = Array.prototype;")
+            && !entry.contains("export var {")
+            && entry.contains("export { each };"),
+        "only the consumed name should be exported:\n{entry}"
+    );
+}
+
+#[test]
 fn partial_var_export_preserves_declarator_order() {
     // The b-group consumes `exported` from the entry without the entry
     // referencing the b-group back: an entry-side consumer of b5 would form
@@ -1225,6 +1336,7 @@ fn executable_partition_does_not_create_a_global_singleton_cycle() {
         &input,
         ScopeHoistRenderMode::Inspect,
         ScopeHoistSource::DirectAsset,
+        crate::unpacker::SourcePositions::Discard,
     )
     .expect("inspection mode should split independent regions");
     let executable = split_scope_hoisted(&input).expect("executable mode should split");
@@ -1341,6 +1453,7 @@ fn inspection_rendering_keeps_synthetic_clusters_separate() {
         input,
         ScopeHoistRenderMode::Inspect,
         ScopeHoistSource::DirectAsset,
+        crate::unpacker::SourcePositions::Discard,
     )
     .expect("inspection mode should split");
     assert_eq!(result.modules.len(), 6, "cycle should remain split");
@@ -1666,7 +1779,7 @@ fn unreachable_effectful_singleton_folds_into_entry() {
             })
             .collect()
     };
-    let mut reachable: HashSet<String> = HashSet::new();
+    let mut reachable: HashSet<String> = HashSet::default();
     let mut queue = vec![entry.filename.clone()];
     while let Some(filename) = queue.pop() {
         if !reachable.insert(filename.clone()) {
@@ -1731,6 +1844,7 @@ fn direct_inspect_skips_distant_cross_write_merges() {
         distant_write_hub_fixture(),
         ScopeHoistRenderMode::Inspect,
         ScopeHoistSource::DirectAsset,
+        crate::unpacker::SourcePositions::Discard,
     )
     .expect("inspect mode should split the hub fixture");
     let owner = result
@@ -1756,6 +1870,7 @@ fn direct_inspect_keeps_adjacent_cross_write_merges() {
         distant_write_hub_fixture(),
         ScopeHoistRenderMode::Inspect,
         ScopeHoistSource::DirectAsset,
+        crate::unpacker::SourcePositions::Discard,
     )
     .expect("inspect mode should split the hub fixture");
     let hub = result
@@ -1781,6 +1896,7 @@ fn nested_inspect_keeps_component_cap_merges() {
         &input,
         ScopeHoistRenderMode::Inspect,
         ScopeHoistSource::NestedModule,
+        crate::unpacker::SourcePositions::Discard,
     )
     .expect("the fixture should split on the nested path");
     let nested_writer = nested
@@ -1798,6 +1914,7 @@ fn nested_inspect_keeps_component_cap_merges() {
         &input,
         ScopeHoistRenderMode::Inspect,
         ScopeHoistSource::DirectAsset,
+        crate::unpacker::SourcePositions::Discard,
     )
     .expect("the fixture should split on the direct path");
     let direct_writer = direct
@@ -1809,5 +1926,92 @@ fn nested_inspect_keeps_component_cap_merges() {
         !direct_writer.code.contains("var state0"),
         "the same non-adjacent component splits on the direct path:\n{}",
         direct_writer.code
+    );
+}
+
+fn exported_name_collision_fixture(helper_export: &str) -> String {
+    [
+        r#"
+            function b(list, item) { return list.concat([item]); }
+            console.log(b([], 0));
+            function q1() { return 1; }
+            function q2() { return q1() + 1; }
+            function q3() { return q2() * 2; }
+            function q4() { return q3() + 5; }
+            function qM() { return q4(); }
+            function c1(x) { return b(x, 1); }
+            function c2(x) { return b(c1(x), 2); }
+            function c3(x) { return b(c2(x), 3); }
+            function c4(x) { return b(c3(x), 4); }
+            function c5(x) { return b(c4(x), 5); }
+        "#,
+        helper_export,
+    ]
+    .join("\n")
+}
+
+fn module_code<'a>(modules: &'a [(String, String, bool)], filename: &str) -> &'a str {
+    &modules
+        .iter()
+        .find(|(name, _, _)| name == filename)
+        .unwrap_or_else(|| panic!("missing {filename} in {modules:#?}"))
+        .1
+}
+
+#[test]
+fn synthesized_export_avoids_an_export_name_the_module_already_uses() {
+    // `b` is exported as `qM`, so the chunk that needs the local `b` must
+    // import it under a different export name.
+    let modules =
+        split(&exported_name_collision_fixture("export { qM as b };")).expect("should split");
+    let entry = module_code(&modules, "entry.js");
+    assert!(
+        entry.contains("export { qM as b };") && entry.contains("export { b as b$2 };"),
+        "entry should keep its own `b` export and add an alias:\n{entry}"
+    );
+    assert!(
+        !entry.contains("export function b"),
+        "entry must not export the helper as `b`:\n{entry}"
+    );
+    let consumer = module_code(&modules, "chunk_c1.js");
+    assert!(
+        consumer.contains("import { b$2 as b } from \"./entry.js\";"),
+        "consumer should import the helper through the alias:\n{consumer}"
+    );
+}
+
+#[test]
+fn synthesized_export_reuses_an_existing_export_of_the_same_binding() {
+    let modules = split(&exported_name_collision_fixture("export { b };")).expect("should split");
+    let entry = module_code(&modules, "entry.js");
+    assert_eq!(
+        entry.matches("export").count(),
+        1,
+        "entry should export `b` once:\n{entry}"
+    );
+    let consumer = module_code(&modules, "chunk_c1.js");
+    assert!(
+        consumer.contains("import { b } from \"./entry.js\";"),
+        "consumer should import the existing export:\n{consumer}"
+    );
+}
+
+#[test]
+fn export_and_import_names_are_not_local_references() {
+    // `q2`, `q3`, and `q4` below name bindings of other modules or the
+    // exported name, never the chunk's locals, so the entry imports only `qM`.
+    let modules = split(&exported_name_collision_fixture(
+        r#"
+            import { q2 as other } from "./dep.js";
+            export { qM as q3 };
+            export { q4 as again } from "./dep.js";
+            console.log(other);
+        "#,
+    ))
+    .expect("should split");
+    let entry = module_code(&modules, "entry.js");
+    assert!(
+        entry.contains("import { qM } from \"./chunk_q1.js\";"),
+        "entry should import only `qM` from the chunk:\n{entry}"
     );
 }

@@ -1379,3 +1379,74 @@ fn is_helper_module_false_for_plain_module() {
     let facts = collect_facts(r#"export const value = compute();"#);
     assert!(!facts.is_helper_module);
 }
+
+// ============================================================
+// Re-export consolidation: bare uses of the default import
+// ============================================================
+
+fn consolidate_reexports(source: &str, facts: &ModuleFactsMap, filename: &str) -> String {
+    use swc_core::ecma::transforms::base::fixer::fixer;
+    GLOBALS.set(&Default::default(), || {
+        let cm: Lrc<SourceMap> = Default::default();
+        let mut module = common::parse_module_with_filename(source, filename, cm.clone());
+        let unresolved_mark = Mark::new();
+        let top_level_mark = Mark::new();
+        module.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, false));
+        wakaru_core::reexport_consolidation::run_reexport_consolidation(
+            &mut module,
+            facts,
+            Some(filename),
+        );
+        module.visit_mut_with(&mut fixer(None));
+        common::emit_module(&module, cm)
+    })
+}
+
+fn passthrough_facts() -> ModuleFactsMap {
+    let mut facts = ModuleFactsMap::new();
+    facts.insert(
+        "passthrough.js",
+        ModuleFacts {
+            passthrough_target: Some("./provider.js".into()),
+            ..Default::default()
+        },
+    );
+    facts.insert("provider.js", ModuleFacts::default());
+    facts
+}
+
+#[test]
+fn member_only_default_import_is_redirected_to_the_provider_namespace() {
+    let output = consolidate_reexports(
+        r#"
+import lib from "./passthrough.js";
+use(lib.foo);
+"#,
+        &passthrough_facts(),
+        "consumer.js",
+    );
+    assert!(
+        output.contains(r#"import * as lib from "./provider.js""#),
+        "{output}"
+    );
+}
+
+#[test]
+fn default_import_read_bare_in_a_computed_key_is_not_redirected() {
+    // `[lib]` reads the binding itself, not a member: a namespace object
+    // would change the value.
+    let output = consolidate_reexports(
+        r#"
+import lib from "./passthrough.js";
+use(lib.foo);
+const keys = { [lib]: 1 };
+"#,
+        &passthrough_facts(),
+        "consumer.js",
+    );
+    assert!(
+        output.contains(r#"import lib from "./passthrough.js""#),
+        "{output}"
+    );
+    assert!(!output.contains("import * as"), "{output}");
+}

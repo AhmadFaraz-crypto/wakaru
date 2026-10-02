@@ -1,12 +1,11 @@
 #!/usr/bin/env node
 
+import { runNodeBatchSync } from "../lib/tool-process.mjs";
+
 import {
   runMatrix, batchRunner, withTerserVariants, ensureNodeTool, standardLowerers,
 } from "../lib/runner.mjs";
 import { mangleValidator } from "../lib/compare.mjs";
-import { join } from "node:path";
-import { writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 
 const snippets = [
   {
@@ -116,9 +115,9 @@ const babelProfiles = [
     modes: ["spec", "loose", "useBuiltIns"],
   },
   {
-    name: "babel-8-rc",
-    core: "8.0.0-rc.5",
-    plugin: ["@babel/plugin-transform-object-rest-spread", "8.0.0-rc.5"],
+    name: "babel-8",
+    core: "8.0.6",
+    plugin: ["@babel/plugin-transform-object-rest-spread", "8.0.1"],
     modes: ["spec", "loose", "useBuiltIns"],
   },
 ];
@@ -142,10 +141,7 @@ function babelObjectRestSpreadBatch(sources, profile, options) {
   const packages = [`@babel/core@${profile.core}`, `${pluginName}@${pluginVersion}`];
   const toolKey = `babel-${profile.core}-object-rest-spread`;
   const toolDir = ensureNodeTool(toolKey, packages);
-  const helper = join(toolDir, "babel-object-rest-spread-batch.mjs");
-  writeFileSync(
-    helper,
-    `
+  const helperSource = `
 import fs from "node:fs";
 const babelModule = await import("@babel/core");
 const pluginModule = await import(${JSON.stringify(pluginName)});
@@ -162,23 +158,12 @@ const results = sources.map(source => {
   } catch (e) { return { error: e.message }; }
 });
 process.stdout.write(JSON.stringify(results));
-`,
-  );
-  const result = spawnSync("node", [helper], {
+`;
+  return runNodeBatchSync(helperSource, sources, {
+    label: "babel-object-rest-spread-batch.mjs",
     cwd: toolDir,
-    input: JSON.stringify(sources),
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024 * 50,
-    env: { ...process.env, MATRIX_BABEL_OPTIONS: JSON.stringify(options) },
+    env: { MATRIX_BABEL_OPTIONS: JSON.stringify(options) },
   });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`babel batch exited ${result.status}: ${result.stderr}`);
-  const outputs = JSON.parse(result.stdout);
-  const map = new Map();
-  for (let i = 0; i < sources.length; i++) {
-    map.set(sources[i], outputs[i].error ? new Error(outputs[i].error) : outputs[i].code);
-  }
-  return map;
 }
 
 const allSources = snippets.map((s) => s.source);

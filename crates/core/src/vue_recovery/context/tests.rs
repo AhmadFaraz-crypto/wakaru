@@ -3,7 +3,7 @@ use super::{
     binding_renames, is_vue_helper_candidate_source, record_compiled_setup_alias,
     setup_alias_renames, setup_props_renames,
 };
-use std::collections::HashMap;
+use crate::collections::HashMap;
 use swc_core::atoms::Atom;
 use swc_core::common::{SyntaxContext, DUMMY_SP};
 use swc_core::ecma::ast::{Expr, Ident};
@@ -44,7 +44,7 @@ fn binding_renames_key_on_recorded_top_level_context() {
     let ctxt = SyntaxContext::empty();
     let mut ctx = VueRecoveryContext::default();
     ctx.top_level_binding_ctxts.insert(Atom::from("P"), ctxt);
-    let aliases = HashMap::from([
+    let aliases = HashMap::from_iter([
         (Atom::from("P"), Atom::from("Panel_1")),
         (Atom::from("Absent"), Atom::from("Absent_1")),
     ]);

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use swc_core::atoms::Atom;
 use swc_core::ecma::ast::{Expr, ObjectPatProp, Pat, Stmt};
@@ -75,7 +75,7 @@ pub(super) fn collect_local_pat_bindings(pat: &Pat, bindings: &mut HashSet<Atom>
 }
 
 pub(super) fn template_scope_from_pat(pat: &Pat) -> VueTemplateScope {
-    let mut bindings = HashSet::new();
+    let mut bindings = HashSet::default();
     collect_local_pat_bindings(pat, &mut bindings);
     VueTemplateScope::from_locals(bindings.into_iter().map(|binding| binding.to_string()))
 }
@@ -85,12 +85,12 @@ pub(super) fn setup_value_dependency_refs(
     template_usage: &VueTemplateUsage,
 ) -> HashSet<Atom> {
     if ctx.bindings.values.is_empty() {
-        return HashSet::new();
+        return HashSet::default();
     }
 
-    let mut refs = HashSet::new();
+    let mut refs = HashSet::default();
     for value in ctx.bindings.values.values() {
-        let mut value_refs = HashSet::new();
+        let mut value_refs = HashSet::default();
         collect_js_unshadowed_ident_refs(&value.value, &mut value_refs);
         if value_refs
             .iter()
@@ -103,7 +103,7 @@ pub(super) fn setup_value_dependency_refs(
 }
 
 pub(super) fn setup_script_binding_refs(ctx: &VueRecoveryContext) -> HashSet<Atom> {
-    let mut refs = HashSet::new();
+    let mut refs = HashSet::default();
     for binding in &ctx.setup_script_bindings {
         collect_js_unshadowed_ident_refs(&binding.value, &mut refs);
     }

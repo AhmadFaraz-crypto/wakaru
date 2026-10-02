@@ -22,7 +22,7 @@
 //! detector: their importers live in other physical assets, so they are never
 //! drop candidates regardless of local reachability.
 
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use anyhow::Result;
 use swc_core::common::{sync::Lrc, SourceMap, GLOBALS};
@@ -167,11 +167,11 @@ fn compute_dropped(
 
     // Per-module: eager in-set import deps, an external-dep flag (any import that
     // is bare or resolves outside the bundle), and the binding-importer edges.
-    let mut in_deps: std::collections::HashMap<&str, Vec<String>> =
-        std::collections::HashMap::new();
-    let mut has_external: HashSet<&str> = HashSet::new();
-    let mut binding_importers: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut in_deps: crate::collections::HashMap<&str, Vec<String>> =
+        crate::collections::HashMap::default();
+    let mut has_external: HashSet<&str> = HashSet::default();
+    let mut binding_importers: crate::collections::HashMap<String, Vec<String>> =
+        crate::collections::HashMap::default();
     for (filename, _, _, report) in triples {
         let report = report.as_ref().expect("reports are present");
         let mut deps = Vec::new();

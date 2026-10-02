@@ -1,9 +1,10 @@
+import { installNodeTool, nodeToolDir, resolveReproToolsRoot } from "./node-tool.mjs";
+import { parseExactSpec, releaseDateCutoff, RESOLUTION_WINDOW_DAYS } from "./release-date.mjs";
+import { runNodeBatch } from "./tool-process.mjs";
 import { createHash } from "node:crypto";
 import {
   copyFileSync,
-  existsSync,
   mkdtempSync,
-  mkdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -21,6 +22,11 @@ const execHarnessPath = fileURLToPath(new URL("./exec-harness.mjs", import.meta.
 const decompileCache = new Map();
 const decompileKey = (level, source, wakaruArgs = []) => `${level}\0${wakaruArgs.join("\0")}\0${source}`;
 const refreshedNodeTools = new Set();
+let reproToolsRoot;
+function toolDir(name, markerText) {
+  reproToolsRoot ??= resolveReproToolsRoot(repoRoot);
+  return nodeToolDir(reproToolsRoot, name, markerText);
+}
 
 export function readOption(name, fallback) {
   const equalsArg = process.argv.find((arg) => arg.startsWith(`${name}=`));
@@ -80,6 +86,7 @@ async function runMatrixAsync(config) {
   let countYes = 0;
   let countNo = 0;
   let countError = 0;
+  let countInfo = 0;
 
   try {
     // Prewarm all transformer batches concurrently before any shape collection
@@ -149,9 +156,17 @@ async function runMatrixAsync(config) {
         if (!result.recovered && result.failure) {
           failures.push(result.failure);
         }
-        const status = result.status ?? (result.recovered ? "yes" : "no");
+        let status = result.status ?? (result.recovered ? "yes" : "no");
+        // Informational rows record what Wakaru emits for a shape whose
+        // source structure the lowering may erase; they stay out of the
+        // recovery rate either way. Diverged behavior is a bug, not an
+        // observation, so it still counts as `no`.
+        if (snippet.informational && !result.diverged && (status === "yes" || status === "no")) {
+          status = status === "yes" ? "info-yes" : "info-miss";
+        }
         if (status === "yes") countYes++;
         else if (status === "no") countNo++;
+        else if (status.startsWith("info-")) countInfo++;
         else countError++;
         rows.push({
           snippet: snippet.name,
@@ -180,7 +195,7 @@ async function runMatrixAsync(config) {
         {
           name,
           level: rewriteLevel,
-          summary: { yes: countYes, no: countNo, error: countError, pct: total > 0 ? +((countYes / total) * 100).toFixed(1) : 0 },
+          summary: { yes: countYes, no: countNo, error: countError, info: countInfo, pct: total > 0 ? +((countYes / total) * 100).toFixed(1) : 0 },
           rows,
         },
         null,
@@ -229,6 +244,7 @@ async function runMatrixAsync(config) {
     console.log(
       `# ${countYes} yes / ${countNo} no` +
         (countError > 0 ? ` / ${countError} error` : "") +
+        (countInfo > 0 ? ` / ${countInfo} informational` : "") +
         ` (${pct}%)`,
     );
   } finally {
@@ -364,6 +380,7 @@ function runShape(
     }
     return {
       recovered: false,
+      diverged: true,
       notes: `behavior diverged: ${verdict.reason}`,
       code: recovered,
       lowered: shape.lowered,
@@ -512,12 +529,13 @@ export function parseReproJobs(value, optionName = "WAKARU_REPRO_JOBS") {
   return jobs;
 }
 
-function defaultConcurrency() {
+export function defaultConcurrency() {
   // WAKARU_REPRO_JOBS caps every asynchronous pool in the matrix flow. All
   // asynchronous wakaru children run inside those pools; the remaining CLI
   // calls are synchronous and occur only after earlier pools are awaited.
-  // collect-stats also runs matrices sequentially, so a value of 1 bounds the
-  // entire harness to one wakaru process.
+  // collect-stats treats the same value as a budget for the whole run and
+  // splits it between concurrent matrices (lib/matrix-jobs.mjs), so a value
+  // of 1 still bounds the entire harness to one wakaru process.
   const configuredJobs = process.env.WAKARU_REPRO_JOBS;
   if (configuredJobs !== undefined) {
     return parseReproJobs(configuredJobs);
@@ -670,6 +688,12 @@ function wakaruDescription() {
   return resolveWakaruCmd().command;
 }
 
+// Build (unless $WAKARU is set) and return the CLI path, so collect-stats can
+// resolve it once instead of each concurrent matrix running its own build.
+export function wakaruCommand() {
+  return resolveWakaruCmd().command;
+}
+
 function summarize(code) {
   return code.replaceAll(/\s+/g, " ").trim().slice(0, 160).replaceAll("|", "\\|");
 }
@@ -722,66 +746,35 @@ export function batchRunner(lazyBatch) {
   return lookup;
 }
 
-// Spawns the tool process without blocking the event loop, so multiple batches
-// run concurrently under runPool. Pipes JSON sources on stdin, parses the JSON
-// results array on stdout into a source→(code|Error) map.
-function runBatchHelperAsync(command, args, sources, options = {}) {
-  return new Promise((resolvePromise, reject) => {
-    const child = spawn(command, args, {
-      cwd: options.cwd ?? repoRoot,
-      shell: options.shell ?? false,
-      env: { ...process.env, ...(options.env ?? {}) },
-    });
-    const stdout = [];
-    let stderr = "";
-    child.stdout.on("data", (chunk) => stdout.push(chunk));
-    child.stderr.on("data", (chunk) => (stderr += chunk));
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code !== 0) {
-        const detail = [stderr.trim(), Buffer.concat(stdout).toString().trim()].filter(Boolean).join(" ");
-        reject(new Error(`${basename(command)} batch exited ${code}: ${detail}`));
-        return;
-      }
-      try {
-        const outputs = JSON.parse(Buffer.concat(stdout).toString());
-        const map = new Map();
-        for (let i = 0; i < sources.length; i++) {
-          map.set(sources[i], outputs[i].error ? new Error(outputs[i].error) : outputs[i].code);
-        }
-        resolvePromise(map);
-      } catch (error) {
-        reject(error);
-      }
-    });
-    child.stdin.end(JSON.stringify(sources));
-  });
-}
-
 export function ensureNodeTool(name, packages) {
-  const toolRoot = join(repoRoot, "target", "repro-tools");
-  const dir = join(toolRoot, name);
-  const marker = join(dir, ".installed");
-  const markerText = packages.join("\n");
+  const inexact = packages.find((spec) => !parseExactSpec(spec));
+  if (inexact) throw new Error(`repro tool ${name}: ${inexact} is not an exact version`);
+  const markerText = packages.join("\n") + `\nresolved: ${RESOLUTION_WINDOW_DAYS} day(s) after newest publish`;
+  const dir = toolDir(name, markerText);
   const refresh = process.env.WAKARU_REPRO_REFRESH_TOOLS === "1" && !refreshedNodeTools.has(dir);
-  if (!refresh && existsSync(marker) && readFileSync(marker, "utf8") === markerText) {
-    return dir;
-  }
   if (refresh) {
     refreshedNodeTools.add(dir);
   }
-  rmSync(dir, { recursive: true, force: true });
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, "package.json"), JSON.stringify({ private: true, type: "commonjs" }, null, 2));
-  runCommandScript("npm", ["install", "--silent", "--no-audit", "--no-fund", ...packages], { cwd: dir });
-  writeFileSync(marker, markerText);
-  return dir;
+  return installNodeTool(dir, markerText, (staging) => {
+    writeFileSync(join(staging, "package.json"), JSON.stringify({ private: true, type: "commonjs" }, null, 2));
+    const cutoff = releaseDateCutoff(packages, (pkg) => runCommandScript("npm", ["view", pkg, "time", "--json"]));
+    runCommandScript("npm", ["install", "--silent", "--no-audit", "--no-fund", "--before", cutoff, ...packages], { cwd: staging });
+  }, { refresh });
+}
+
+// Shared by several matrices; one pin keeps their rows on the same release.
+export const SWC_CORE_VERSION = "1.16.2";
+export const TERSER_VERSION = "5.51.2";
+
+export function ensureSwcTool() {
+  return ensureNodeTool(`swc-${SWC_CORE_VERSION}`, [`@swc/core@${SWC_CORE_VERSION}`]);
+}
+
+export function ensureTerserTool() {
+  return ensureNodeTool(`terser-${TERSER_VERSION}`, [`terser@${TERSER_VERSION}`]);
 }
 
 export function ensureLockedNodeTool(name, manifestDir) {
-  const toolRoot = join(repoRoot, "target", "repro-tools");
-  const dir = join(toolRoot, name);
-  const marker = join(dir, ".installed");
   const packageJson = join(manifestDir, "package.json");
   const packageLock = join(manifestDir, "package-lock.json");
   const markerText = createHash("sha256")
@@ -789,20 +782,16 @@ export function ensureLockedNodeTool(name, manifestDir) {
     .update("\0")
     .update(readFileSync(packageLock))
     .digest("hex");
+  const dir = toolDir(name, markerText);
   const refresh = process.env.WAKARU_REPRO_REFRESH_TOOLS === "1" && !refreshedNodeTools.has(dir);
-  if (!refresh && existsSync(marker) && readFileSync(marker, "utf8") === markerText) {
-    return dir;
-  }
   if (refresh) {
     refreshedNodeTools.add(dir);
   }
-  rmSync(dir, { recursive: true, force: true });
-  mkdirSync(dir, { recursive: true });
-  copyFileSync(packageJson, join(dir, "package.json"));
-  copyFileSync(packageLock, join(dir, "package-lock.json"));
-  runCommandScript("npm", ["ci", "--silent", "--no-audit", "--no-fund"], { cwd: dir });
-  writeFileSync(marker, markerText);
-  return dir;
+  return installNodeTool(dir, markerText, (staging) => {
+    copyFileSync(packageJson, join(staging, "package.json"));
+    copyFileSync(packageLock, join(staging, "package-lock.json"));
+    runCommandScript("npm", ["ci", "--silent", "--no-audit", "--no-fund"], { cwd: staging });
+  }, { refresh });
 }
 
 function runCommandScript(command, args, options = {}) {
@@ -836,10 +825,7 @@ export function babelBatch(sources, profile, babelOptions = {}) {
   const pluginVersion = profile.plugin[1];
   const packages = [`@babel/core@${profile.core}`, `${pluginName}@${pluginVersion}`];
   const toolDir = ensureNodeTool(`babel-${profile.core}`, packages);
-  const helper = join(toolDir, "babel-batch.mjs");
-  writeFileSync(
-    helper,
-    `
+  const helperSource = `
 import fs from "node:fs";
 const babelModule = await import("@babel/core");
 const pluginModule = await import(${JSON.stringify(pluginName)});
@@ -860,9 +846,9 @@ const results = sources.map(source => {
   } catch (e) { return { error: e.message }; }
 });
 process.stdout.write(JSON.stringify(results));
-`,
-  );
-  return runBatchHelperAsync("node", [helper], sources, {
+`;
+  return runNodeBatch(helperSource, sources, {
+    label: "babelBatch",
     cwd: toolDir,
     env: { MATRIX_BABEL_OPTIONS: JSON.stringify(babelOptions) },
   });
@@ -872,12 +858,9 @@ export function babelMultiPluginBatch(sources, profile, plugins, env = {}) {
   const packages = [`@babel/core@${profile.core}`, ...plugins.map(([name, ver]) => `${name}@${ver}`)];
   const toolKey = `babel-${profile.core}-${plugins.map(([n]) => n.split("/").pop()).join("-")}`;
   const toolDir = ensureNodeTool(toolKey, packages);
-  const helper = join(toolDir, "babel-multi-batch.mjs");
   const pluginImports = plugins.map(([name], i) => `const p${i} = (await import(${JSON.stringify(name)})).default ?? (await import(${JSON.stringify(name)}));`).join("\n");
   const pluginList = plugins.map((_, i) => `p${i}`).join(", ");
-  writeFileSync(
-    helper,
-    `
+  const helperSource = `
 import fs from "node:fs";
 const babelModule = await import("@babel/core");
 const babel = babelModule.default ?? babelModule;
@@ -892,9 +875,12 @@ const results = sources.map(source => {
   } catch (e) { return { error: e.message }; }
 });
 process.stdout.write(JSON.stringify(results));
-`,
-  );
-  return runBatchHelperAsync("node", [helper], sources, { cwd: toolDir, env });
+`;
+  return runNodeBatch(helperSource, sources, {
+    label: "babelMultiPluginBatch",
+    cwd: toolDir,
+    env,
+  });
 }
 
 export function babelPresetEnvBatch(sources, options = {}) {
@@ -905,10 +891,7 @@ export function babelPresetEnvBatch(sources, options = {}) {
     `@babel/core@${coreVersion}`,
     `@babel/preset-env@${presetVersion}`,
   ]);
-  const helper = join(toolDir, "babel-preset-env-batch.mjs");
-  writeFileSync(
-    helper,
-    `
+  const helperSource = `
 import fs from "node:fs";
 const babelModule = await import("@babel/core");
 const presetEnvModule = await import("@babel/preset-env");
@@ -925,9 +908,9 @@ const results = sources.map(source => {
   } catch (e) { return { error: e.message }; }
 });
 process.stdout.write(JSON.stringify(results));
-`,
-  );
-  return runBatchHelperAsync("node", [helper], sources, {
+`;
+  return runNodeBatch(helperSource, sources, {
+    label: "babelPresetEnvBatch",
     cwd: toolDir,
     env: { MATRIX_TARGETS: JSON.stringify(targets) },
   });
@@ -935,30 +918,43 @@ process.stdout.write(JSON.stringify(results));
 
 export function tscBatch(sources, options = {}) {
   const target = options.target ?? "ES5";
-  const version = options.version ?? "5";
-  const toolName = version === "5" ? "typescript" : `typescript-${version}`;
-  const toolDir = ensureNodeTool(toolName, [`typescript@${version}`]);
-  const helper = join(toolDir, "tsc-batch.cjs");
-  writeFileSync(
-    helper,
-    `
+  const module = options.module ?? "ESNext";
+  const version = options.version ?? "5.9.3";
+  const toolDir = ensureNodeTool(`typescript-${version}`, [`typescript@${version}`]);
+  const helperSource = `
 const fs = require("node:fs");
 const ts = require("typescript");
 const target = process.env.MATRIX_TSC_TARGET || "ES5";
+const options = JSON.parse(process.env.MATRIX_TSC_OPTIONS || "{}");
 const sources = JSON.parse(fs.readFileSync(0, "utf8"));
 const results = sources.map(source => {
   try {
     return { code: ts.transpileModule(source, {
-      compilerOptions: { target: ts.ScriptTarget[target], module: ts.ModuleKind.ESNext },
+      compilerOptions: {
+        target: ts.ScriptTarget[target],
+        module: ts.ModuleKind[options.module || "ESNext"],
+        importHelpers: options.importHelpers ?? false,
+        downlevelIteration: options.downlevelIteration ?? false,
+        esModuleInterop: options.esModuleInterop ?? false,
+      },
     }).outputText };
   } catch (e) { return { error: e.message }; }
 });
 process.stdout.write(JSON.stringify(results));
-`,
-  );
-  return runBatchHelperAsync("node", [helper], sources, {
+`;
+  return runNodeBatch(helperSource, sources, {
+    label: "tscBatch",
+    format: "commonjs",
     cwd: toolDir,
-    env: { MATRIX_TSC_TARGET: target },
+    env: {
+      MATRIX_TSC_TARGET: target,
+      MATRIX_TSC_OPTIONS: JSON.stringify({
+        module,
+        importHelpers: options.importHelpers,
+        downlevelIteration: options.downlevelIteration,
+        esModuleInterop: options.esModuleInterop,
+      }),
+    },
   });
 }
 
@@ -966,15 +962,12 @@ export function swcBatch(sources, options = {}) {
   const target = options.target ?? "es5";
   const minify = options.minify ?? false;
   const externalHelpers = options.externalHelpers ?? false;
-  const toolDir = ensureNodeTool("swc", ["@swc/core@1"]);
+  const toolDir = ensureSwcTool();
   const variant = minify ? "minify" : externalHelpers ? "external" : "base";
-  const helper = join(toolDir, variant === "base" ? "swc-batch.cjs" : `swc-${variant}-batch.cjs`);
   const jscExtra =
     (externalHelpers ? ", externalHelpers: true" : "") +
     (minify ? ", minify: { compress: true, mangle: true }" : "");
-  writeFileSync(
-    helper,
-    `
+  const helperSource = `
 const fs = require("node:fs");
 const swc = require("@swc/core");
 const target = process.env.MATRIX_SWC_TARGET || "es5";
@@ -990,9 +983,10 @@ const results = sources.map(source => {
   } catch (e) { return { error: e.message }; }
 });
 process.stdout.write(JSON.stringify(results));
-`,
-  );
-  return runBatchHelperAsync("node", [helper], sources, {
+`;
+  return runNodeBatch(helperSource, sources, {
+    label: "swcBatch",
+    format: "commonjs",
     cwd: toolDir,
     env: { MATRIX_SWC_TARGET: target },
   });
@@ -1002,10 +996,7 @@ export function esbuildBatch(sources, options = {}) {
   const target = options.target ?? "es2015";
   const minify = options.minify ?? false;
   const toolDir = ensureNodeTool("esbuild-0.28", ["esbuild@0.28.0"]);
-  const helper = join(toolDir, minify ? "esbuild-minify-batch.cjs" : "esbuild-batch.cjs");
-  writeFileSync(
-    helper,
-    `
+  const helperSource = `
 const fs = require("node:fs");
 const esbuild = require("esbuild");
 const target = process.env.MATRIX_ESBUILD_TARGET || "es2015";
@@ -1018,9 +1009,10 @@ const results = sources.map(source => {
   } catch (e) { return { error: e.message }; }
 });
 process.stdout.write(JSON.stringify(results));
-`,
-  );
-  return runBatchHelperAsync("node", [helper], sources, {
+`;
+  return runNodeBatch(helperSource, sources, {
+    label: "esbuildBatch",
+    format: "commonjs",
     cwd: toolDir,
     env: { MATRIX_ESBUILD_TARGET: target },
   });
@@ -1028,12 +1020,9 @@ process.stdout.write(JSON.stringify(results));
 
 export function terserBatch(sources, options = {}) {
   const mangle = options.mangle ?? false;
-  const toolDir = ensureNodeTool("terser", ["terser@5"]);
+  const toolDir = ensureTerserTool();
   const suffix = mangle ? "mangle-batch" : "batch";
-  const helper = join(toolDir, `terser-${suffix}.mjs`);
-  writeFileSync(
-    helper,
-    `
+  const helperSource = `
 import fs from "node:fs";
 import { minify } from "terser";
 const mangle = ${mangle};
@@ -1051,9 +1040,11 @@ for (const source of sources) {
   } catch (e) { results.push({ error: e.message }); }
 }
 process.stdout.write(JSON.stringify(results));
-`,
-  );
-  return runBatchHelperAsync("node", [helper], sources, { cwd: toolDir });
+`;
+  return runNodeBatch(helperSource, sources, {
+    label: "terserBatch",
+    cwd: toolDir,
+  });
 }
 
 export function withTerserVariants(name, allSources, runRaw, options = {}) {

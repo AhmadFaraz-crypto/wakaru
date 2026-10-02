@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use swc_core::common::{Mark, Span, Spanned, SyntaxContext, DUMMY_SP};
 use swc_core::ecma::ast::{
@@ -167,7 +167,7 @@ fn collect_require_d_descriptors_module(
     unresolved_mark: Mark,
 ) -> (Vec<(String, Box<Expr>)>, Span, usize) {
     let mut descriptors = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     let mut index = start;
     let mut first_span = DUMMY_SP;
 
@@ -199,7 +199,7 @@ fn collect_require_d_descriptors_stmt(
     unresolved_mark: Mark,
 ) -> (Vec<(String, Box<Expr>)>, Span, usize) {
     let mut descriptors = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     let mut index = start;
     let mut first_span = DUMMY_SP;
 

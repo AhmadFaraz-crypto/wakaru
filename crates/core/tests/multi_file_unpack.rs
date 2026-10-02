@@ -18,6 +18,188 @@ fn assert_valid_module_graph(modules: &[(String, String)]) {
 }
 
 #[test]
+fn webpack_exports_iife_preserves_a_shared_mutable_default() {
+    // A webpack-extracted UMD factory mutates the supplied exports object.
+    let provider = r#"
+(self.webpackChunk_app = self.webpackChunk_app || []).push([[1], {
+    100: function(module, exports) {
+        !function(out) {
+            "use strict";
+            out.value = 42;
+            out.read = function() { return out.value; };
+            globalThis.published = out;
+            Object.defineProperty(out, "__esModule", { value: true });
+        }(exports);
+    }
+}]);
+"#;
+    let consumer = r#"
+(self.webpackChunk_app = self.webpackChunk_app || []).push([[2], {
+    200: function(module, exports, load) {
+        var provider = load(100);
+        module.exports = provider;
+    },
+    300: function(module, exports, load) {
+        var value = load(100).value;
+        exports.result = value;
+    }
+}]);
+"#;
+    for emit_source_map in [false, true] {
+        let inputs = vec![
+            UnpackInput {
+                filename: "provider.js".into(),
+                source: provider.into(),
+            },
+            UnpackInput {
+                filename: "consumer.js".into(),
+                source: consumer.into(),
+            },
+        ];
+        let output = unpack_files(
+            inputs.clone(),
+            DecompileOptions {
+                emit_source_map,
+                ..Default::default()
+            },
+        )
+        .expect("exports-object IIFE should recover");
+        assert_valid_module_graph(&output.modules);
+        let provider = &output
+            .modules
+            .iter()
+            .find(|(name, _)| name == "module-100.js")
+            .unwrap()
+            .1;
+        assert!(provider.contains("export default"), "{provider}");
+        assert!(provider.contains("globalThis.published"), "{provider}");
+        assert!(!provider.contains("module.exports"), "{provider}");
+        let raw = unpack_files_raw(inputs, &DecompileOptions::default())
+            .expect("raw extraction should stay unchanged");
+        let raw_provider = &raw
+            .modules
+            .iter()
+            .find(|(name, _)| name == "module-100.js")
+            .unwrap()
+            .1;
+        assert!(raw_provider.contains("}(exports)"), "{raw_provider}");
+        assert!(!raw_provider.contains("_webpackExports"), "{raw_provider}");
+    }
+}
+
+#[test]
+fn webpack_chunks_recover_healthy_edges_beside_an_opaque_factory() {
+    let application = r#"
+(self.webpackChunk_app = self.webpackChunk_app || []).push([[1], {
+    100: function(module, exports, load) {
+        var dependency = load(200);
+        exports.result = dependency.answer;
+    },
+    400: function(module, exports) { exports.value = 42; }
+}]);
+"#;
+    let library = r#"
+(self.webpackChunk_app = self.webpackChunk_app || []).push([[2], {
+    200: function(module, exports, load) {
+        var dependency = load(400);
+        exports.answer = dependency.value;
+    },
+    300: function(module, exports, load) {
+        function capture() { return exports; }
+        exports = module.exports = load(200);
+        exports.capture = capture;
+    }
+}]);
+"#;
+
+    for emit_source_map in [false, true] {
+        let output = unpack_files(
+            vec![
+                UnpackInput {
+                    filename: "app.js".into(),
+                    source: application.into(),
+                },
+                UnpackInput {
+                    filename: "library.js".into(),
+                    source: library.into(),
+                },
+            ],
+            DecompileOptions {
+                emit_source_map,
+                ..Default::default()
+            },
+        )
+        .expect("healthy chunk edges should survive an opaque sibling");
+        assert_eq!(output.warnings.len(), 1, "{:?}", output.warnings);
+        assert_eq!(output.warnings[0].filename, "module-300.js");
+        assert_eq!(
+            output.warnings[0].kind,
+            wakaru_core::UnpackWarningKind::WebpackFactoryRecoveryFailed
+        );
+        for (consumer, provider) in [
+            ("module-100.js", "module-200.js"),
+            ("module-200.js", "module-400.js"),
+        ] {
+            let code = &output
+                .modules
+                .iter()
+                .find(|(name, _)| name == consumer)
+                .unwrap()
+                .1;
+            assert!(
+                code.contains(&format!("from \"./{provider}\"")),
+                "{consumer}: {code}"
+            );
+            assert!(!code.contains("require("), "{consumer}: {code}");
+        }
+        assert_valid_module_graph(&output.modules);
+    }
+}
+
+#[test]
+fn webpack_chunks_do_not_replace_opaque_targets_with_same_numbered_modules() {
+    let source = r#"
+(self.webpackChunk_app = self.webpackChunk_app || []).push([[1], {
+    100: function(module, exports, load) { module.exports = load(200); },
+    200: function(module, exports, load) {
+        if (globalThis.useAlternate) load = globalThis.alternateLoader;
+        module.exports = load;
+    }
+}]);
+"#;
+    let other = r#"
+(self.webpackChunk_other = self.webpackChunk_other || []).push([[2], {
+    200: function(module) { module.exports = "other"; }
+}]);
+"#;
+    for reverse in [false, true] {
+        let mut inputs = vec![
+            UnpackInput {
+                filename: "app.js".into(),
+                source: source.into(),
+            },
+            UnpackInput {
+                filename: "other.js".into(),
+                source: other.into(),
+            },
+        ];
+        if reverse {
+            inputs.reverse();
+        }
+        let output = unpack_files(inputs, DecompileOptions::default()).unwrap();
+        let consumer = &output
+            .modules
+            .iter()
+            .find(|(name, _)| name == "module-100.js")
+            .unwrap()
+            .1;
+        assert!(consumer.contains("require(200)"), "{consumer}");
+        assert!(!consumer.contains("from "), "{consumer}");
+        assert_eq!(output.warnings.len(), 1, "{:?}", output.warnings);
+    }
+}
+
+#[test]
 fn webpack5_commonjs_chunk_unpacks_modules() {
     let source = fixture("wp5-dynamic/src_greet_js.bundle.js");
     let output = unpack(

@@ -30,6 +30,12 @@ pub(super) fn detect_helper_from_var_decl(
     let init = decl.init.as_ref()?;
     let key = var_declarator_binding_key(decl)?;
 
+    // TypeScript 5.9 wraps __importStar in a zero-argument ownKeys factory.
+    // Its raw TS marker and fallback-body proof already identify this helper.
+    if ts_expr_matches_helper_kind(init, TsHelperKind::ImportStar) {
+        return Some((key, TranspilerHelperKind::InteropRequireWildcard));
+    }
+
     // var _ird = function(obj) { ... }
     if let Expr::Fn(fn_expr) = init.as_ref() {
         if let Some(kind) = detect_helper_from_fn(&fn_expr.function, has_sub_helpers) {
@@ -191,6 +197,9 @@ pub(super) fn detect_helper_from_fn(
     }
     if is_async_to_generator_fn(func) {
         return Some(TranspilerHelperKind::AsyncToGenerator);
+    }
+    if is_async_iterator_fn(func) {
+        return Some(TranspilerHelperKind::AsyncIterator);
     }
     if is_tagged_template_literal_fn(func) {
         return Some(TranspilerHelperKind::TaggedTemplateLiteral);
@@ -758,7 +767,9 @@ fn matches_if_return_form(stmts: &[Stmt], ctx: &MatchContext) -> bool {
 }
 /// Matches: obj && obj.__esModule
 fn matches_esmodule_test(expr: &Expr, ctx: &MatchContext) -> bool {
-    let Expr::Bin(bin) = expr else { return false };
+    let Expr::Bin(bin) = strip_parens(expr) else {
+        return false;
+    };
     if bin.op != BinaryOp::LogicalAnd {
         return false;
     }
@@ -953,10 +964,10 @@ fn matches_negated_instanceof(ctx: &MatchContext, expr: &Expr, left: &str, right
 /// Match `throw new TypeError(...)` — bare or wrapped in a block.
 fn matches_throw_type_error(stmt: &Stmt) -> bool {
     match stmt {
-        Stmt::Throw(throw) => is_new_type_error(&throw.arg),
+        Stmt::Throw(throw) => is_type_error_construction(&throw.arg),
         Stmt::Block(block) if block.stmts.len() == 1 => {
             if let Stmt::Throw(throw) = &block.stmts[0] {
-                is_new_type_error(&throw.arg)
+                is_type_error_construction(&throw.arg)
             } else {
                 false
             }
@@ -964,11 +975,18 @@ fn matches_throw_type_error(stmt: &Stmt) -> bool {
         _ => false,
     }
 }
-fn is_new_type_error(expr: &Expr) -> bool {
-    let Expr::New(new_expr) = expr else {
-        return false;
+/// `new TypeError(...)`, or `TypeError(...)`: minifiers drop `new` because
+/// calling a builtin error constructor constructs it.
+fn is_type_error_construction(expr: &Expr) -> bool {
+    let callee = match expr {
+        Expr::New(new_expr) => new_expr.callee.as_ref(),
+        Expr::Call(call) => match &call.callee {
+            Callee::Expr(callee) => callee.as_ref(),
+            _ => return false,
+        },
+        _ => return false,
     };
-    matches!(new_expr.callee.as_ref(), Expr::Ident(id) if id.sym.as_ref() == "TypeError")
+    matches!(callee, Expr::Ident(id) if id.sym.as_ref() == "TypeError")
 }
 fn is_typeof_polyfill_init(expr: &Expr) -> bool {
     let Expr::Cond(cond) = expr else {
@@ -1478,6 +1496,53 @@ pub(super) fn is_object_without_properties_fn(func: &Function) -> bool {
 }
 /// Detect `_asyncToGenerator`: single param, returns a function that calls
 /// `fn.apply(this, arguments)` and constructs `new Promise(...)`.
+/// Babel `_asyncIterator` / SWC `_async_iterator`: one iterable param, reads
+/// `Symbol.asyncIterator`, invokes the found method with `.call(iterable)`,
+/// and throws `TypeError` when nothing is iterable. TypeScript's
+/// `__asyncValues` shares those signals but also builds a `Promise`-based
+/// adapter in its own body; it is a tslib helper detected by `ts_helpers`, so
+/// a body that mentions `Promise` is rejected here.
+fn is_async_iterator_fn(func: &Function) -> bool {
+    if func.params.len() != 1 {
+        return false;
+    }
+    let Some(body) = &func.body else {
+        return false;
+    };
+    let mut finder = AsyncIteratorFinder::default();
+    body.visit_with(&mut finder);
+    finder.symbol_async_iterator && finder.type_error && finder.method_call && !finder.promise
+}
+#[derive(Default)]
+struct AsyncIteratorFinder {
+    symbol_async_iterator: bool,
+    type_error: bool,
+    method_call: bool,
+    promise: bool,
+}
+impl Visit for AsyncIteratorFinder {
+    fn visit_member_expr(&mut self, member: &swc_core::ecma::ast::MemberExpr) {
+        if is_symbol_member(member, "asyncIterator") {
+            self.symbol_async_iterator = true;
+        }
+        member.visit_children_with(self);
+    }
+    fn visit_ident(&mut self, ident: &Ident) {
+        match ident.sym.as_ref() {
+            "TypeError" => self.type_error = true,
+            "Promise" => self.promise = true,
+            _ => {}
+        }
+    }
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if let Callee::Expr(callee) = &call.callee {
+            if is_member_call(callee, "call") && call.args.len() == 1 {
+                self.method_call = true;
+            }
+        }
+        call.visit_children_with(self);
+    }
+}
 fn is_async_to_generator_fn(func: &Function) -> bool {
     if func.params.len() != 1 {
         return false;
@@ -2319,9 +2384,7 @@ fn inline_sliced_expr_matches_ident(expr: &Expr, target: &Ident) -> bool {
     inline_sliced_ident_matches(id, target)
 }
 fn inline_sliced_ident_matches(left: &Ident, right: &Ident) -> bool {
-    left.sym == right.sym
-        && (left.ctxt == right.ctxt
-            || (left.ctxt == SyntaxContext::empty() && right.ctxt != SyntaxContext::empty()))
+    left.sym == right.sym && left.ctxt == right.ctxt
 }
 fn scan_inline_helper_call_markers(call: &CallExpr, markers: &mut BodyMarkerState) {
     let Callee::Expr(callee) = &call.callee else {
@@ -2849,7 +2912,7 @@ fn is_call_to_ident(expr: &Expr, ident: &Ident) -> bool {
 }
 /// Collect bindings for `_maybeArrayLike` declarations detected by body shape.
 pub(crate) fn collect_maybe_array_like_bindings(module: &Module) -> HashSet<BindingKey> {
-    let mut bindings = HashSet::new();
+    let mut bindings = HashSet::default();
     for item in &module.body {
         match item {
             ModuleItem::Stmt(Stmt::Decl(Decl::Fn(fn_decl)))

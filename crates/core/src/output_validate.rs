@@ -5,7 +5,10 @@
 //! dangling relative references, imports of names the provider does not
 //! export, local exports of missing bindings, duplicate exports or
 //! declarations, unresolved CommonJS runtime bindings in ESM, and writes to
-//! imported or `const` bindings.
+//! imported or `const` bindings. Unresolved identifiers are reported only
+//! when the graph itself proves them wrong: the name is declared at module
+//! scope by exactly one other emitted module, or (with original inputs
+//! supplied) the name is not free anywhere in the input.
 //!
 //! Raw output is deliberately out of scope: `--raw` promises only "no
 //! readability transforms" and carries no module-graph contract. Validate
@@ -15,10 +18,8 @@
 //! (it re-exports an external package or a missing module) suppresses
 //! missing-name findings for its consumers rather than guessing.
 
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-};
+use crate::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use swc_core::common::{sync::Lrc, FileName, Mark, SourceMap, Span, Spanned, GLOBALS};
 use swc_core::ecma::ast::{
@@ -75,6 +76,10 @@ pub enum OutputFindingKind {
     /// An ESM output module still reads or writes the free CommonJS runtime
     /// binding `module` or `exports`.
     EsmCommonJsResidual,
+    /// A free identifier that the emitted graph proves undeclared: exactly one
+    /// other module declares the name at module scope, or the name is not
+    /// free in the supplied original input.
+    UnresolvedReference,
 }
 
 impl OutputFindingKind {
@@ -89,6 +94,7 @@ impl OutputFindingKind {
             OutputFindingKind::AssignToImport => "assign_to_import",
             OutputFindingKind::AssignToConst => "assign_to_const",
             OutputFindingKind::EsmCommonJsResidual => "esm_commonjs_residual",
+            OutputFindingKind::UnresolvedReference => "unresolved_reference",
         }
     }
 }
@@ -99,10 +105,28 @@ impl OutputFindingKind {
 /// `"src/entry.js"`) to their source text. Findings are returned in input
 /// module order, then AST order within a module.
 pub fn validate_output_modules(modules: &[(String, String)]) -> Vec<OutputFinding> {
-    GLOBALS.set(&Default::default(), || validate_inner(modules))
+    validate_output_modules_with_inputs(modules, &[])
 }
 
-fn validate_inner(modules: &[(String, String)]) -> Vec<OutputFinding> {
+/// Validate a set of emitted modules as one graph and, additionally, compare
+/// their free identifiers against the original bundle inputs.
+///
+/// `inputs` maps input filenames to their source text. A free identifier in
+/// an output module is reported as [`OutputFindingKind::UnresolvedReference`]
+/// when no input file uses the same name freely: host globals, `typeof`
+/// probes, and dependency bugs that the input already contains stay silent,
+/// while a name the rewrite pipeline or the splitter left undeclared does
+/// not. An input that fails to parse is reported as a
+/// [`OutputFindingKind::ParseError`] on the input filename. With no inputs
+/// this is [`validate_output_modules`].
+pub fn validate_output_modules_with_inputs(
+    modules: &[(String, String)],
+    inputs: &[(String, String)],
+) -> Vec<OutputFinding> {
+    GLOBALS.set(&Default::default(), || validate_inner(modules, inputs))
+}
+
+fn validate_inner(modules: &[(String, String)], inputs: &[(String, String)]) -> Vec<OutputFinding> {
     let filenames: HashSet<&str> = modules.iter().map(|(name, _)| name.as_str()).collect();
     let source_goals = classify_source_goals(modules, &filenames);
     let mut findings = Vec::new();
@@ -142,7 +166,7 @@ fn validate_inner(modules: &[(String, String)]) -> Vec<OutputFinding> {
                 &info_by_filename,
                 import.target.as_str(),
                 &import.name,
-                &mut HashSet::new(),
+                &mut HashSet::default(),
             );
             let detail = match resolution {
                 ResolvedExport::Ambiguous => Some(format!(
@@ -167,7 +191,336 @@ fn validate_inner(modules: &[(String, String)]) -> Vec<OutputFinding> {
         }
     }
 
+    findings.extend(unresolved_reference_findings(&infos, inputs));
+
     findings
+}
+
+/// Report free identifiers that the emitted graph, or the original input,
+/// proves undeclared. Two independent proofs:
+///
+/// 1. Exactly one *other* emitted module declares the name at module scope.
+///    A split that separated a declaration from its users without adding the
+///    import/export edge produces exactly this shape. Names declared by
+///    several modules are ambiguous (reused minified locals) and skipped.
+///    This is a spelling heuristic, not binding identity, so input evidence
+///    overrides it when available.
+/// 2. With inputs supplied: the name is free in no input file. Whatever was
+///    free in the input (host globals, define constants, dependency bugs) is
+///    a faithful passthrough and suppresses both proofs; a name that is free
+///    only in the output was introduced by the rewrite. An input that fails
+///    to parse disables this proof instead of leaving a partial baseline.
+///
+/// ECMAScript built-ins and module-runtime names (`require`, `define`, ...)
+/// are excluded from both proofs: rewrite rules legitimately introduce
+/// `undefined` or `Object` where the input spelled them differently, and the
+/// runtime names are wakaru's deliberate representation of unconverted
+/// module edges (or are reported by the CommonJS residual check). Well-known
+/// host globals are excluded from the sibling proof only: a polyfill module
+/// that declares `console` at module scope does not make every other
+/// module's `console` a defect.
+fn unresolved_reference_findings(
+    infos: &[ModuleInfo],
+    inputs: &[(String, String)],
+) -> Vec<OutputFinding> {
+    let mut declaring_modules: HashMap<&Atom, Vec<&str>> = HashMap::default();
+    for info in infos {
+        for name in &info.module_scope_names {
+            declaring_modules
+                .entry(name)
+                .or_default()
+                .push(info.filename.as_str());
+        }
+    }
+
+    let mut findings = Vec::new();
+    // A partial baseline proves nothing: if any input fails to parse, report
+    // that and skip the input comparison rather than call names absent from
+    // a file that was never read.
+    let mut input_free_names = (!inputs.is_empty()).then(HashSet::default);
+    for (filename, source) in inputs {
+        match collect_input_free_names(filename, source) {
+            Ok(names) => {
+                if let Some(free_names) = input_free_names.as_mut() {
+                    free_names.extend(names);
+                }
+            }
+            Err(error) => {
+                input_free_names = None;
+                findings.push(OutputFinding {
+                    filename: filename.clone(),
+                    line: error.line,
+                    column: error.column,
+                    kind: OutputFindingKind::ParseError,
+                    message: format!("input {}", error.message),
+                });
+            }
+        }
+    }
+
+    for info in infos {
+        for reference in &info.unresolved_refs {
+            if is_ecmascript_builtin_global(&reference.name)
+                || is_module_runtime_name(&reference.name)
+            {
+                continue;
+            }
+            // Input evidence is authoritative: a name the input already used
+            // freely is a faithful passthrough even when some unrelated
+            // output module happens to declare a local with the same spelling.
+            if input_free_names
+                .as_ref()
+                .is_some_and(|free_names| free_names.contains(&reference.name))
+            {
+                continue;
+            }
+            let siblings: Vec<&str> = declaring_modules
+                .get(&reference.name)
+                .map(|modules| {
+                    modules
+                        .iter()
+                        .copied()
+                        .filter(|module| *module != info.filename.as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let sibling = match siblings.as_slice() {
+                [sibling] if !is_well_known_host_global(&reference.name) => Some(*sibling),
+                _ => None,
+            };
+            let message = if let Some(sibling) = sibling {
+                Some(format!(
+                    "unresolved identifier \"{}\" is declared at module scope only by {sibling}, which this module does not import",
+                    reference.name
+                ))
+            } else if input_free_names.is_some() {
+                Some(format!(
+                    "unresolved identifier \"{}\" is not a free identifier anywhere in the input",
+                    reference.name
+                ))
+            } else {
+                None
+            };
+            if let Some(message) = message {
+                findings.push(OutputFinding {
+                    filename: info.filename.clone(),
+                    line: reference.line,
+                    column: reference.column,
+                    kind: OutputFindingKind::UnresolvedReference,
+                    message,
+                });
+            }
+        }
+    }
+    findings
+}
+
+/// Every identifier the resolver leaves unresolved in an input file,
+/// including `typeof` operands and writes: anything free in the input excuses
+/// the same free name in the output.
+fn collect_input_free_names(
+    filename: &str,
+    source: &str,
+) -> Result<HashSet<Atom>, ValidationParseError> {
+    let ParsedModule { mut module, .. } =
+        parse_for_validation(filename, source, SourceGoal::Ambiguous)?;
+    let unresolved_mark = Mark::new();
+    let top_level_mark = Mark::new();
+    module.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, false));
+    let mut collector = UnresolvedRefCollector {
+        unresolved_mark,
+        skip_typeof_operands: false,
+        references: Vec::new(),
+    };
+    module.visit_with(&mut collector);
+    Ok(collector
+        .references
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect())
+}
+
+/// Free names that emitted modules carry on purpose: CommonJS/AMD runtime
+/// bindings the pipeline keeps for edges it cannot convert (`require`,
+/// `define`), the CommonJS names reported by the residual check, and the
+/// bundler `global` helper's rewrite target.
+fn is_module_runtime_name(name: &Atom) -> bool {
+    matches!(
+        name.as_ref(),
+        "require" | "module" | "exports" | "define" | "global" | "__dirname" | "__filename"
+    )
+}
+
+/// Host globals that polyfill or shim modules commonly declare at module
+/// scope. This is a noise filter for the sibling proof, not an environment
+/// model: an unlisted name yields a false positive that the input comparison
+/// still removes.
+fn is_well_known_host_global(name: &Atom) -> bool {
+    matches!(
+        name.as_ref(),
+        "window"
+            | "self"
+            | "document"
+            | "navigator"
+            | "location"
+            | "history"
+            | "screen"
+            | "console"
+            | "process"
+            | "Buffer"
+            | "setTimeout"
+            | "clearTimeout"
+            | "setInterval"
+            | "clearInterval"
+            | "setImmediate"
+            | "clearImmediate"
+            | "queueMicrotask"
+            | "requestAnimationFrame"
+            | "cancelAnimationFrame"
+            | "requestIdleCallback"
+            | "structuredClone"
+            | "fetch"
+            | "Headers"
+            | "Request"
+            | "Response"
+            | "AbortController"
+            | "AbortSignal"
+            | "URL"
+            | "URLSearchParams"
+            | "TextEncoder"
+            | "TextDecoder"
+            | "Blob"
+            | "File"
+            | "FileReader"
+            | "FormData"
+            | "XMLHttpRequest"
+            | "WebSocket"
+            | "EventSource"
+            | "Worker"
+            | "MessageChannel"
+            | "MessagePort"
+            | "MessageEvent"
+            | "Event"
+            | "EventTarget"
+            | "CustomEvent"
+            | "ErrorEvent"
+            | "PromiseRejectionEvent"
+            | "Node"
+            | "Element"
+            | "HTMLElement"
+            | "SVGElement"
+            | "DocumentFragment"
+            | "Text"
+            | "Comment"
+            | "Range"
+            | "MutationObserver"
+            | "ResizeObserver"
+            | "IntersectionObserver"
+            | "PerformanceObserver"
+            | "performance"
+            | "crypto"
+            | "localStorage"
+            | "sessionStorage"
+            | "indexedDB"
+            | "matchMedia"
+            | "getComputedStyle"
+            | "atob"
+            | "btoa"
+            | "alert"
+            | "confirm"
+            | "prompt"
+            | "Image"
+            | "Audio"
+            | "Option"
+            | "DOMParser"
+            | "XMLSerializer"
+            | "DOMException"
+            | "ReadableStream"
+            | "WritableStream"
+            | "TransformStream"
+            | "CompressionStream"
+            | "DecompressionStream"
+            | "BroadcastChannel"
+            | "SharedWorker"
+            | "ServiceWorker"
+            | "Notification"
+            | "postMessage"
+            | "importScripts"
+            | "WebAssembly"
+            | "Deno"
+            | "Bun"
+    )
+}
+
+/// Value, function, constructor, and namespace properties of the ECMAScript
+/// global object (ES2025), plus the implicit `arguments` binding.
+fn is_ecmascript_builtin_global(name: &Atom) -> bool {
+    matches!(
+        name.as_ref(),
+        "globalThis"
+            | "Infinity"
+            | "NaN"
+            | "undefined"
+            | "arguments"
+            | "eval"
+            | "isFinite"
+            | "isNaN"
+            | "parseFloat"
+            | "parseInt"
+            | "decodeURI"
+            | "decodeURIComponent"
+            | "encodeURI"
+            | "encodeURIComponent"
+            | "escape"
+            | "unescape"
+            | "AggregateError"
+            | "Array"
+            | "ArrayBuffer"
+            | "BigInt"
+            | "BigInt64Array"
+            | "BigUint64Array"
+            | "Boolean"
+            | "DataView"
+            | "Date"
+            | "Error"
+            | "EvalError"
+            | "FinalizationRegistry"
+            | "Float16Array"
+            | "Float32Array"
+            | "Float64Array"
+            | "Function"
+            | "Int8Array"
+            | "Int16Array"
+            | "Int32Array"
+            | "Iterator"
+            | "Map"
+            | "Number"
+            | "Object"
+            | "Promise"
+            | "Proxy"
+            | "RangeError"
+            | "ReferenceError"
+            | "RegExp"
+            | "Set"
+            | "SharedArrayBuffer"
+            | "String"
+            | "Symbol"
+            | "SyntaxError"
+            | "TypeError"
+            | "Uint8Array"
+            | "Uint8ClampedArray"
+            | "Uint16Array"
+            | "Uint32Array"
+            | "URIError"
+            | "WeakMap"
+            | "WeakRef"
+            | "WeakSet"
+            | "Atomics"
+            | "JSON"
+            | "Math"
+            | "Reflect"
+            | "Intl"
+    )
 }
 
 struct ModuleInfo {
@@ -185,6 +538,19 @@ struct ModuleInfo {
     /// a module outside the validated set.
     open_exports: bool,
     named_imports: Vec<NamedImport>,
+    /// Names declared at module scope by `var`/`let`/`const`/`using`,
+    /// function, and class declarations (import bindings excluded).
+    module_scope_names: HashSet<Atom>,
+    /// Free identifier uses, excluding direct `typeof` operands, the
+    /// CommonJS runtime names reported separately, import/export specifiers,
+    /// and intrinsic JSX element names.
+    unresolved_refs: Vec<UnresolvedRef>,
+}
+
+struct UnresolvedRef {
+    name: Atom,
+    line: usize,
+    column: usize,
 }
 
 struct NamedImport {
@@ -334,12 +700,14 @@ fn analyze_module(
     let mut info = ModuleInfo {
         filename: filename.to_string(),
         explicit_exports: Vec::new(),
-        explicit_resolutions: HashMap::new(),
+        explicit_resolutions: HashMap::default(),
         star_targets: Vec::new(),
         open_exports: false,
         named_imports: Vec::new(),
+        module_scope_names: HashSet::default(),
+        unresolved_refs: Vec::new(),
     };
-    let mut import_bindings: HashMap<Id, Atom> = HashMap::new();
+    let mut import_bindings: HashMap<Id, Atom> = HashMap::default();
 
     // ESM resolves a local export of an imported binding to the *source*
     // module's binding, so `import { x } from "./a.js"; export { x };` and
@@ -347,7 +715,7 @@ fn analyze_module(
     // to that indirect resolution up front (exports may precede imports in
     // the body). External and dangling specifiers keep their raw text, which
     // `resolve_export` treats as an unknown provider.
-    let mut import_reexports: HashMap<Id, ExplicitExportResolution> = HashMap::new();
+    let mut import_reexports: HashMap<Id, ExplicitExportResolution> = HashMap::default();
     for item in &module.body {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
             continue;
@@ -561,8 +929,8 @@ fn analyze_module(
         }
     }
 
-    let mut duplicates_seen: HashSet<Atom> = HashSet::new();
-    let mut counted: HashSet<Atom> = HashSet::new();
+    let mut duplicates_seen: HashSet<Atom> = HashSet::default();
+    let mut counted: HashSet<Atom> = HashSet::default();
     for export in &info.explicit_exports {
         if !counted.insert(export.name.clone()) && duplicates_seen.insert(export.name.clone()) {
             findings.push(OutputFinding {
@@ -584,7 +952,7 @@ fn analyze_module(
     }
 
     let mut const_collector = ConstBindingCollector {
-        bindings: HashMap::new(),
+        bindings: HashMap::default(),
     };
     module.visit_with(&mut const_collector);
 
@@ -648,7 +1016,105 @@ fn analyze_module(
         }
     }
 
+    info.module_scope_names = module_scope_declared_names(&module);
+    let mut unresolved_collector = UnresolvedRefCollector {
+        unresolved_mark,
+        skip_typeof_operands: true,
+        references: Vec::new(),
+    };
+    module.visit_with(&mut unresolved_collector);
+    info.unresolved_refs = unresolved_collector
+        .references
+        .into_iter()
+        .filter(|(name, _)| !matches!(name.as_ref(), "module" | "exports"))
+        .map(|(name, span)| {
+            let (line, column) = source_location(&source_map, span);
+            UnresolvedRef { name, line, column }
+        })
+        .collect();
+
     Ok((info, findings))
+}
+
+/// Names bound at module scope by declarations, including hoisted `var`s and
+/// exported declarations. Import bindings are not declarations: a module that
+/// merely imports a name is not where the name lives.
+fn module_scope_declared_names(module: &Module) -> HashSet<Atom> {
+    let mut bindings = Vec::new();
+    for item in &module.body {
+        match item {
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => {
+                record_direct_lexical_decl(&export.decl, &mut bindings);
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(export)) => {
+                let ident = match &export.decl {
+                    DefaultDecl::Fn(function) => function.ident.as_ref(),
+                    DefaultDecl::Class(class) => class.ident.as_ref(),
+                    DefaultDecl::TsInterfaceDecl(_) => None,
+                };
+                if let Some(ident) = ident {
+                    bindings.push(ScopeBinding {
+                        name: ident.sym.clone(),
+                        span: ident.span,
+                        kind: DeclarationKind::Lexical,
+                    });
+                }
+            }
+            ModuleItem::Stmt(Stmt::Decl(decl)) => record_direct_lexical_decl(decl, &mut bindings),
+            _ => {}
+        }
+    }
+    // `var` declarations hoist to module scope from any nested statement,
+    // including exported ones.
+    let mut var_collector = VarBindingCollector::default();
+    module.visit_with(&mut var_collector);
+    bindings.extend(var_collector.bindings);
+    bindings.into_iter().map(|binding| binding.name).collect()
+}
+
+/// Collect free identifier uses by resolver identity. Import declarations and
+/// export specifiers are skipped (they are validated separately), and
+/// lowercase JSX element names are intrinsic tags rather than bindings.
+struct UnresolvedRefCollector {
+    unresolved_mark: Mark,
+    skip_typeof_operands: bool,
+    references: Vec<(Atom, Span)>,
+}
+
+impl Visit for UnresolvedRefCollector {
+    fn visit_ident(&mut self, ident: &Ident) {
+        if ident.ctxt.outer() == self.unresolved_mark {
+            self.references.push((ident.sym.clone(), ident.span));
+        }
+    }
+
+    fn visit_unary_expr(&mut self, unary: &UnaryExpr) {
+        if self.skip_typeof_operands
+            && unary.op == UnaryOp::TypeOf
+            && matches!(strip_parens(&unary.arg), Expr::Ident(_))
+        {
+            return;
+        }
+        unary.visit_children_with(self);
+    }
+
+    fn visit_import_decl(&mut self, _: &swc_core::ecma::ast::ImportDecl) {}
+
+    fn visit_export_specifier(&mut self, _: &swc_core::ecma::ast::ExportSpecifier) {}
+
+    fn visit_jsx_element_name(&mut self, name: &swc_core::ecma::ast::JSXElementName) {
+        if let swc_core::ecma::ast::JSXElementName::Ident(ident) = name {
+            if ident
+                .sym
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_lowercase())
+            {
+                return;
+            }
+        }
+        name.visit_children_with(self);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -976,6 +1442,8 @@ fn export_decl_bindings(decl: &Decl) -> Vec<(Atom, Span)> {
 enum DeclarationKind {
     Lexical,
     Var,
+    Function,
+    Parameter,
 }
 
 struct ScopeBinding {
@@ -994,20 +1462,55 @@ fn duplicate_declaration_findings(
     module: &Module,
     source_map: &SourceMap,
 ) -> Vec<OutputFinding> {
+    declaration_conflicts(module, true)
+        .into_iter()
+        .map(|conflict| {
+            finding_at_span(
+                filename,
+                source_map,
+                conflict.span,
+                OutputFindingKind::DuplicateDeclaration,
+                format!(
+                    "duplicate {} declaration \"{}\"",
+                    conflict.scope, conflict.name
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Producer diagnostics also accept classic scripts. Check lexical conflicts
+/// there without imposing ESM restrictions on repeated functions or parameters.
+/// Use printed names and syntactic scopes: resolver identities on invalid
+/// declarations need not agree, and `var` can cross nested block boundaries.
+pub(crate) fn conflicting_lexical_declaration_names(module: &Module) -> Vec<Atom> {
+    let mut seen = HashSet::default();
+    declaration_conflicts(module, false)
+        .into_iter()
+        .filter_map(|conflict| seen.insert(conflict.name.clone()).then_some(conflict.name))
+        .collect()
+}
+
+struct DeclarationConflict {
+    name: Atom,
+    span: Span,
+    scope: &'static str,
+}
+
+fn declaration_conflicts(module: &Module, esm_early_errors: bool) -> Vec<DeclarationConflict> {
     let mut bindings = direct_module_lexical_bindings(module);
     let mut var_collector = VarBindingCollector::default();
     module.visit_with(&mut var_collector);
     bindings.extend(var_collector.bindings);
 
     let mut visitor = DuplicateDeclarationVisitor {
-        filename,
-        source_map,
-        findings: Vec::new(),
-        reported_locations: HashSet::new(),
+        esm_early_errors,
+        conflicts: Vec::new(),
+        reported_locations: HashSet::default(),
     };
     visitor.check_scope(bindings, "module-scope");
     module.visit_children_with(&mut visitor);
-    visitor.findings
+    visitor.conflicts
 }
 
 fn direct_module_lexical_bindings(module: &Module) -> Vec<ScopeBinding> {
@@ -1069,7 +1572,7 @@ fn record_direct_lexical_decl(decl: &Decl, bindings: &mut Vec<ScopeBinding>) {
         Decl::Fn(function) => bindings.push(ScopeBinding {
             name: function.ident.sym.clone(),
             span: function.ident.span,
-            kind: DeclarationKind::Lexical,
+            kind: DeclarationKind::Function,
         }),
         Decl::Class(class) => bindings.push(ScopeBinding {
             name: class.ident.sym.clone(),
@@ -1167,7 +1670,7 @@ fn function_body_bindings(body: &FunctionBody) -> Vec<ScopeBinding> {
 fn parameter_bindings<'a>(parameters: impl IntoIterator<Item = &'a Pat>) -> Vec<ScopeBinding> {
     let mut bindings = Vec::new();
     for parameter in parameters {
-        record_scope_binding_pat(parameter, DeclarationKind::Lexical, &mut bindings);
+        record_scope_binding_pat(parameter, DeclarationKind::Parameter, &mut bindings);
     }
     bindings
 }
@@ -1187,19 +1690,21 @@ fn direct_function_body_lexical_bindings(body: &FunctionBody) -> Vec<ScopeBindin
     bindings
 }
 
-struct DuplicateDeclarationVisitor<'a> {
-    filename: &'a str,
-    source_map: &'a SourceMap,
-    findings: Vec<OutputFinding>,
+struct DuplicateDeclarationVisitor {
+    esm_early_errors: bool,
+    conflicts: Vec<DeclarationConflict>,
     reported_locations: HashSet<(Atom, u32)>,
 }
 
-impl DuplicateDeclarationVisitor<'_> {
-    fn check_scope(&mut self, mut bindings: Vec<ScopeBinding>, scope: &str) {
+impl DuplicateDeclarationVisitor {
+    fn check_scope(&mut self, mut bindings: Vec<ScopeBinding>, scope: &'static str) {
         bindings.sort_by_key(|binding| binding.span.lo);
-        let mut first_kinds: HashMap<Atom, DeclarationKind> = HashMap::new();
-        let mut reported_names = HashSet::new();
-        for binding in bindings {
+        let mut first_kinds: HashMap<Atom, DeclarationKind> = HashMap::default();
+        let mut reported_names = HashSet::default();
+        for mut binding in bindings {
+            if !self.esm_early_errors && binding.kind == DeclarationKind::Function {
+                binding.kind = DeclarationKind::Var;
+            }
             let Some(first_kind) = first_kinds.get(&binding.name).copied() else {
                 first_kinds.insert(binding.name.clone(), binding.kind);
                 continue;
@@ -1207,7 +1712,11 @@ impl DuplicateDeclarationVisitor<'_> {
             // Repeated `var` declarations denote the same binding and are
             // legal. Every other repeat in this lexical scope is an early
             // error.
-            if first_kind == DeclarationKind::Var && binding.kind == DeclarationKind::Var {
+            if (first_kind == DeclarationKind::Var && binding.kind == DeclarationKind::Var)
+                || (!self.esm_early_errors
+                    && first_kind == DeclarationKind::Parameter
+                    && binding.kind == DeclarationKind::Parameter)
+            {
                 continue;
             }
             if reported_names.insert(binding.name.clone())
@@ -1215,13 +1724,11 @@ impl DuplicateDeclarationVisitor<'_> {
                     .reported_locations
                     .insert((binding.name.clone(), binding.span.lo.0))
             {
-                self.findings.push(finding_at_span(
-                    self.filename,
-                    self.source_map,
-                    binding.span,
-                    OutputFindingKind::DuplicateDeclaration,
-                    format!("duplicate {scope} declaration \"{}\"", binding.name),
-                ));
+                self.conflicts.push(DeclarationConflict {
+                    name: binding.name,
+                    span: binding.span,
+                    scope,
+                });
             }
         }
     }
@@ -1267,7 +1774,7 @@ impl DuplicateDeclarationVisitor<'_> {
     }
 }
 
-impl Visit for DuplicateDeclarationVisitor<'_> {
+impl Visit for DuplicateDeclarationVisitor {
     fn visit_function(&mut self, function: &Function) {
         let mut bindings = parameter_bindings(function.params.iter().map(|param| &param.pat));
         if let Some(body) = &function.body {

@@ -332,7 +332,7 @@ export { relay as logger };
 fn commonjs_named_export_recovery_does_not_capture_global() {
     let source = r#"
 var marker = typeof runtime !== "undefined" && runtime.pid ? runtime.pid : "";
-module.exports = module.exports.default = function() {
+module.exports = function() {
     return marker;
 };
 module.exports.runtime = function() {
@@ -348,6 +348,11 @@ module.exports.runtime = function() {
         },
     )
     .expect("decompile should succeed");
+    assert!(
+        output.code.contains("export { _runtime as runtime }"),
+        "{}",
+        output.code
+    );
     let tdz_warnings: Vec<_> = output
         .warnings
         .iter()
@@ -390,4 +395,100 @@ consume(select);
         "parameter alias recovery captured its default reference: {tdz_warnings:#?}\n--- output ---\n{}",
         output.code
     );
+}
+
+#[test]
+fn commonjs_alias_keeps_the_default_objects_named_property() {
+    let source = r#"
+class Engine {}
+var alias;
+module.exports = alias = Engine;
+module.exports.Engine = Engine;
+globalThis.observed = alias.Engine === Engine;
+"#;
+    let output = decompile(source, DecompileOptions::default()).expect("decompile should succeed");
+    assert!(
+        output.code.contains(".Engine ="),
+        "the property write used through the alias disappeared:\n{}",
+        output.code
+    );
+    assert!(
+        output.code.contains(".Engine ==="),
+        "the alias observation must remain:\n{}",
+        output.code
+    );
+    assert!(
+        !output.code.contains("module.exports"),
+        "the proven CommonJS default should recover:\n{}",
+        output.code
+    );
+}
+
+#[test]
+fn compressed_index_reads_recover_complete_destructuring() {
+    // TypeScript 5.9.3 importHelpers + Terser compress: the element bindings
+    // have been inlined into the return; recovery must restore the full pattern.
+    let input = r#"
+Object.defineProperty(exports,"__esModule",{value:!0}),exports.read=read;
+var tslib_1=require("tslib");
+function read(items){var _a=tslib_1.__read(items,2),a,b;return _a[0]+_a[1]}
+"#;
+    let output = render(input);
+    assert!(!output.contains(".__read(items, 2)"), "{output}");
+    assert!(
+        output.contains("function read([") || output.contains("] = items;"),
+        "{output}"
+    );
+}
+
+#[test]
+fn export_specifier_alias_remains_independently_assignable() {
+    let provider = "const initial = 1; let active = initial; export { active as Current }; export function replace(next) { active = next; } export function readInitial() { return initial; }";
+    let consumer = "import { Current, replace, readInitial } from './provider.js'; use(Current, replace, readInitial);";
+    assert_pipeline_pair_valid(&[("provider.js", provider), ("consumer.js", consumer)]);
+}
+
+#[test]
+fn rest_assignment_does_not_capture_outer_const() {
+    let source = r#"
+import omit from "@babel/runtime/helpers/objectWithoutProperties";
+const picked = 42;
+export function extract(source) {
+    var picked = source.key;
+    source = omit(source, ["key"]);
+    return [picked, source];
+}
+use(picked);
+"#;
+    assert_pipeline_pair_valid(&[("provider.js", source)]);
+}
+
+#[test]
+fn for_of_nested_write_does_not_become_const() {
+    let source = r#"
+export function remap(input) {
+    var out = {};
+    for (var i = 0, keys = Object.keys(input); i < keys.length; i++) {
+        var key = keys[i];
+        out[key = key.toUpperCase()] = input[key];
+    }
+    return out;
+}
+"#;
+    assert_pipeline_pair_valid(&[("provider.js", source)]);
+    let output = render(source);
+    assert!(
+        output.contains("for (let key of Object.keys(input))"),
+        "{output}"
+    );
+}
+
+#[test]
+fn class_temporary_initialization_recovers_direct_export() {
+    // The private-field pass leaves this shape after consuming the WeakMap
+    // initialization in a TypeScript class-expression factory.
+    let source = "let temp; temp = class { #x = 1; getX() { return this.#x; } setX(value) { this.#x = value; } }; export const Foo = temp;";
+    let expected = "export const Foo = class { #x = 1; getX() { return this.#x; } setX(value) { this.#x = value; } };";
+    common::assert_eq_normalized(&render(source), expected);
+    assert_pipeline_pair_valid(&[("provider.js", source)]);
 }

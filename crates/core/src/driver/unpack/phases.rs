@@ -1,8 +1,9 @@
 //! Two-phase multi-module pipeline: fact collection (Phase 1) and output
 //! decompilation with the cross-module late pass (Phase 2).
 
+use std::sync::Arc;
+
 use anyhow::{bail, Result};
-use rayon::prelude::*;
 use swc_core::common::{sync::Lrc, Globals, Mark, SourceMap, SyntaxContext, DUMMY_SP, GLOBALS};
 use swc_core::ecma::ast::{
     AssignExpr, AssignOp, AssignTarget, Expr, ExprStmt, Ident, IdentName, MemberExpr, MemberProp,
@@ -21,7 +22,6 @@ use super::super::types::{
     DecompileOptions, PreparedInputId, PreparedModuleOutput, PreparedModuleProvenance,
     PreparedUnpackOutput, UnpackWarning, UnpackWarningKind,
 };
-use super::super::unpack_cleanup::{dedup_duplicate_exports, prune_stale_local_named_exports};
 use super::super::unpack_cycles::collect_import_cycle_warnings;
 use super::dead_module::{collect_import_report, eliminate_dead_helper_modules, ImportReport};
 use super::filename_recovery::{
@@ -30,6 +30,8 @@ use super::filename_recovery::{
 use super::merge::{
     apply_filename_rewrites, apply_numeric_rewrites, NumericRewritePlan, PreparedUnpackModule,
 };
+use super::schedule::par_map_largest_first;
+use super::source_index::{build_composed_output_sourcemap, InputOrigin};
 use super::webpack_commonjs_runtime::normalize_webpack_commonjs_runtime;
 use super::{recover_late_esm_from_factory_iifes, LateEsmRecoveryOptions};
 use crate::commonjs_default_object_composition::{
@@ -46,16 +48,16 @@ use crate::reexport_consolidation::run_reexport_consolidation;
 use crate::rules::eval_utils::DirectEvalAnalyzer;
 use crate::rules::expr_utils::is_unresolved_ident;
 use crate::rules::{
-    apply_rules, apply_rules_to_recovered_module, contains_local_self_require, DeadImports,
-    ImportDedup, RewriteLevel, RulePipelineOptions, SimplifySequence, UnAssignmentMerging,
-    UnConditionals, UnConditionalsAssignmentOnly, UnImportRename, UnOptionalChaining,
+    apply_rules, apply_rules_to_recovered_module, contains_local_self_require, ImportDedup,
+    RewriteLevel, RulePipelineOptions, SimplifySequence, UnAssignmentMerging, UnConditionals,
+    UnConditionalsAssignmentOnly, UnImportRename, UnOptionalChaining,
 };
 use crate::sourcemap_rename::{apply_sourcemap_renames, parse_sourcemap};
 use crate::synthetic_import_cleanup::downgrade_unused_synthetic_imports;
 use crate::unpacker::{
     arrow_iife_call, module_stmts_have_function_level_special_bindings,
     stmts_have_function_level_return, stmts_have_function_level_special_bindings,
-    DetectedModuleFailure,
+    DetectedModuleFailure, InputOffsets,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -274,13 +276,14 @@ pub(super) fn unpack_multi_module(
         .into_iter()
         .map(PreparedUnpackModule::plain)
         .collect();
-    unpack_multi_module_with_plan(modules, NumericRewritePlan::default(), options)
+    unpack_multi_module_with_plan(modules, NumericRewritePlan::default(), options, &[])
 }
 
 pub(super) fn unpack_multi_module_with_plan(
     mut modules: Vec<PreparedUnpackModule>,
     numeric_rewrite_plan: NumericRewritePlan,
     options: DecompileOptions,
+    origins: &[Option<Arc<InputOrigin>>],
 ) -> Result<PreparedUnpackOutput> {
     if options.sourcemap.is_some() {
         bail!(
@@ -296,13 +299,13 @@ pub(super) fn unpack_multi_module_with_plan(
         .iter()
         .filter(|module| module.reserved_public_path)
         .map(|module| module.module.filename.clone())
-        .collect::<std::collections::HashSet<_>>();
+        .collect::<crate::collections::HashSet<_>>();
 
     // Stash per-module provenance (byte ranges into the original input)
     // keyed by provisional filename. Final provenance is built after dead
     // module elimination and filename recovery, so only surviving modules
     // appear with their final names.
-    let provenance_by_provisional: std::collections::HashMap<
+    let provenance_by_provisional: crate::collections::HashMap<
         String,
         (
             Option<PreparedInputId>,
@@ -385,7 +388,14 @@ pub(super) fn unpack_multi_module_with_plan(
         };
         let (facts, prepared_parts, warning, suggested_filename) = GLOBALS.set(&globals, || {
             let (mut module, unresolved_mark) = match prepared_input {
-                Some(prepared) => prepared,
+                Some((mut module, _detector_mark)) => {
+                    // The detector's contexts describe its own surgery; give
+                    // the rules resolver-derived ones.
+                    let span = tracing::info_span!("phase1: reresolve prepared");
+                    let _enter = span.enter();
+                    let unresolved_mark = crate::unpacker::resolve_prepared_module(&mut module);
+                    (module, unresolved_mark)
+                }
                 None => {
                     let cm: Lrc<SourceMap> = Default::default();
                     let mut module = {
@@ -496,9 +506,23 @@ pub(super) fn unpack_multi_module_with_plan(
                         LateEsmRecoveryOptions::default(),
                     );
                 }
-                let facts = collect_module_facts(&facts_module);
+                let mut facts = collect_module_facts(&facts_module);
+                // Class recovery runs on this pre-late AST. Probing the
+                // late-renamed clone misses IIFEs Phase 2 still converts.
+                facts.import_call_edges = crate::rules::collect_import_call_edges(
+                    &module,
+                    unresolved_mark,
+                    options.level,
+                );
                 (facts, Some((module, unresolved_mark)))
             } else {
+                // Edges read the pre-late AST, as above. Collect them before
+                // recovering in place so this path still skips the clone.
+                let import_call_edges = crate::rules::collect_import_call_edges(
+                    &module,
+                    unresolved_mark,
+                    options.level,
+                );
                 {
                     let span = tracing::info_span!("phase1: fact recovery");
                     let _enter = span.enter();
@@ -510,7 +534,8 @@ pub(super) fn unpack_multi_module_with_plan(
                         LateEsmRecoveryOptions::default(),
                     );
                 }
-                let facts = collect_module_facts(&module);
+                let mut facts = collect_module_facts(&module);
+                facts.import_call_edges = import_call_edges;
                 (facts, None)
             };
             facts.commonjs_default_object = commonjs_default_object;
@@ -536,7 +561,11 @@ pub(super) fn unpack_multi_module_with_plan(
     let phase1: Vec<_> = {
         let span = tracing::info_span!("phase1_collect_facts");
         let _enter = span.enter();
-        modules.par_iter_mut().map(collect_facts).collect()
+        par_map_largest_first(
+            modules.iter_mut().collect(),
+            |module: &&mut PreparedUnpackModule| module.module.code.len(),
+            collect_facts,
+        )
     };
 
     let mut module_facts = ModuleFactsMap::new();
@@ -559,6 +588,7 @@ pub(super) fn unpack_multi_module_with_plan(
 
     let commonjs_default_object_composition_plan =
         CommonJsDefaultObjectCompositionPlan::build(&module_facts);
+    let call_required_plan = crate::rules::CallRequiredPlan::build(&module_facts);
 
     // Cross-module barrier: resolve recovered filenames into a final rename
     // table. Kept separate from the fact map so the pipeline (facts, numeric
@@ -567,7 +597,7 @@ pub(super) fn unpack_multi_module_with_plan(
     let rename_map = if recover_filenames {
         build_rename_map(&rename_entries, &reserved_public_paths)
     } else {
-        std::collections::HashMap::new()
+        crate::collections::HashMap::default()
     };
 
     // Phase 2: output pipeline with late pass. Each module is parsed from
@@ -575,6 +605,7 @@ pub(super) fn unpack_multi_module_with_plan(
     // it continues from the Phase 1 normalized AST after the facts barrier.
     let facts_ref = &module_facts;
     let composition_plan_ref = &commonjs_default_object_composition_plan;
+    let call_required_plan_ref = &call_required_plan;
     let sm_ref = &parsed_sourcemap;
     let rename_ref = &rename_map;
     let phase2_inputs: Vec<_> = modules
@@ -632,18 +663,13 @@ pub(super) fn unpack_multi_module_with_plan(
                 unresolved_mark,
             );
             run_reexport_consolidation(&mut module, facts_ref, Some(&unpacked.module.filename));
-            run_namespace_decomposition(&mut module, facts_ref, Some(&unpacked.module.filename));
+            run_namespace_decomposition(
+                &mut module,
+                facts_ref,
+                Some(&unpacked.module.filename),
+                unresolved_mark,
+            );
             downgrade_unused_synthetic_imports(&mut module);
-            // Preserve specifiers that were already dead at the barrier, then
-            // reuse this visitor after the standalone late cleanup to remove
-            // only specifiers whose last use those rewrites eliminated.
-            let mut final_recovered_import_cleanup = match options.dce_mode {
-                crate::DceMode::Off => None,
-                crate::DceMode::TransformOnly => {
-                    Some(DeadImports::preserve_currently_dead(&module))
-                }
-                crate::DceMode::Full => Some(DeadImports::full()),
-            };
             // Late helper-through-UnReturn range.
             apply_rules_to_recovered_module(
                 &mut module,
@@ -652,17 +678,17 @@ pub(super) fn unpack_multi_module_with_plan(
                     .with_dce_mode(options.dce_mode)
                     .with_rewrite_level(options.level)
                     .with_module_facts(facts_ref)
-                    .with_current_filename(&unpacked.module.filename),
+                    .with_current_filename(&unpacked.module.filename)
+                    .with_call_required_plan(call_required_plan_ref),
             );
             // Later rules can expose sequence expressions. The old unpack
             // path cleaned those by running a second full module pipeline;
             // keep only the syntax cleanup needed after the split.
-            module.visit_mut_with(&mut SimplifySequence::new_with_import_semantics(
+            module.visit_mut_with(&mut SimplifySequence::new_with_level(
                 unresolved_mark,
                 options.level,
-                false,
             ));
-            module.visit_mut_with(&mut UnAssignmentMerging);
+            module.visit_mut_with(&mut UnAssignmentMerging::new(unresolved_mark));
             // UnIife2 can expose webpack export helpers that were hidden in
             // factory wrappers at the Stage 2 barrier. Recover just that ESM
             // shape without restoring the old full second pass.
@@ -675,9 +701,8 @@ pub(super) fn unpack_multi_module_with_plan(
             );
             module.visit_mut_with(&mut UnOptionalChaining::new(unresolved_mark, options.level));
             module.visit_mut_with(&mut UnConditionalsAssignmentOnly);
-            module.visit_mut_with(&mut UnConditionals);
-            prune_stale_local_named_exports(&mut module);
-            dedup_duplicate_exports(&mut module);
+            // Unpack counterpart of the pipeline's UnConditionals2 cleanup pass.
+            module.visit_mut_with(&mut UnConditionals::with_nested_actions());
 
             // Source-map-enhanced passes
             if let Some(sm) = sm_ref {
@@ -686,9 +711,6 @@ pub(super) fn unpack_multi_module_with_plan(
                 module.visit_mut_with(&mut UnImportRename::new(unresolved_mark));
             }
 
-            if let Some(cleanup) = &mut final_recovered_import_cleanup {
-                module.visit_mut_with(cleanup);
-            }
             // A module that still carries a function-level return at module
             // scope after a declined restoration would not parse as ESM.
             // Preserve the extracted body and report the module as failed
@@ -710,6 +732,21 @@ pub(super) fn unpack_multi_module_with_plan(
             drop(rules_span);
 
             let mut diag_warnings = input_parse_warnings;
+            // Import sources are still provisional here, so they resolve
+            // against the same fact keys the plan was built from.
+            for (source, imported) in call_required_plan_ref.mispredicted_calls(
+                facts_ref,
+                &unpacked.module.filename,
+                &module,
+            ) {
+                diag_warnings.push(UnpackWarning::new(
+                    &unpacked.module.filename,
+                    UnpackWarningKind::CrossModuleClassCall,
+                    format!(
+                        "`{imported}` from `{source}` is still invoked with .call/.apply, but it was expected to become super(); the provider may now be a class that cannot be called without `new`"
+                    ),
+                ));
+            }
 
             // Final, isolated remap: rewrite import-source strings that point
             // at modules renamed via recovered filenames. Runs after every
@@ -763,7 +800,21 @@ pub(super) fn unpack_multi_module_with_plan(
                     let _enter = span.enter();
                     print_js_with_srcmap(&module, cm.clone())?
                 };
-                let map_json = build_output_sourcemap(&srcmap_buf, &cm, final_filename)?;
+                let origin = unpacked
+                    .input
+                    .and_then(|input| origins.get(input.index())?.as_deref());
+                let map_json = match origin {
+                    // A module without input offsets (fully synthesized) still
+                    // maps into its origin: every position is left unmapped.
+                    Some(origin) => build_composed_output_sourcemap(
+                        &srcmap_buf,
+                        &cm,
+                        final_filename,
+                        InputOffsets::of(&unpacked.module).unwrap_or(InputOffsets::Printed(&[])),
+                        origin,
+                    )?,
+                    None => build_output_sourcemap(&srcmap_buf, &cm, final_filename)?,
+                };
                 (code, Some(map_json))
             } else {
                 let code = {
@@ -880,15 +931,20 @@ pub(super) fn unpack_multi_module_with_plan(
     let triples: Vec<_> = {
         let span = tracing::info_span!("phase2_decompile_modules");
         let _enter = span.enter();
-        phase2_inputs
-            .into_par_iter()
-            .map(decompile_module)
-            .collect()
+        par_map_largest_first(
+            phase2_inputs,
+            |(unpacked, _, _): &(
+                PreparedUnpackModule,
+                Option<Phase1PreparedModule>,
+                Vec<UnpackWarning>,
+            )| unpacked.module.code.len(),
+            decompile_module,
+        )
     };
 
     // Separate source maps from the tuples before dead-module elimination.
-    let mut srcmap_by_filename: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut srcmap_by_filename: crate::collections::HashMap<String, String> =
+        crate::collections::HashMap::default();
     let triples_for_dead: Vec<(String, String, Vec<UnpackWarning>, Option<ImportReport>)> = triples
         .into_iter()
         .map(|(filename, code, warns, report, srcmap)| {
@@ -917,7 +973,7 @@ pub(super) fn unpack_multi_module_with_plan(
     // Build final provenance from the surviving output modules, mapping
     // provisional filenames to their recovered names.  Dead helper modules
     // that were eliminated above are excluded.
-    let reverse_rename: std::collections::HashMap<&str, &str> = rename_ref
+    let reverse_rename: crate::collections::HashMap<&str, &str> = rename_ref
         .iter()
         .map(|(prov, renamed)| (renamed.as_str(), prov.as_str()))
         .collect();
@@ -1198,55 +1254,29 @@ for (var key in current) globalThis[key] = current[key];"#,
     }
 
     #[test]
-    fn recovered_imports_do_not_gain_source_link_check_semantics() {
-        let output = GLOBALS.set(&Default::default(), || {
-            let cm: Lrc<SourceMap> = Default::default();
-            let mut module = parse_js(
-                r#"import { recovered } from "./module.js"; void recovered;"#,
-                "module.js",
-                cm.clone(),
-            )
-            .expect("fixture should parse");
-            let unresolved_mark = Mark::new();
-            let top_level_mark = Mark::new();
-            module.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, false));
-
-            apply_rules_to_recovered_module(
-                &mut module,
-                unresolved_mark,
-                RulePipelineOptions::default().with_dce_mode(DceMode::TransformOnly),
-            );
-            apply_fixer(&mut module).expect("fixture should fix");
-            print_js(&module, cm).expect("fixture should print")
-        });
-
-        assert_eq!(output, "import \"./module.js\";\n");
-    }
-
-    #[test]
-    fn late_cleanup_removes_newly_dead_recovered_import_specifier() {
+    fn export_of_a_block_nested_var_survives_unpack() {
+        // `var p` inside the block is a module-scope binding, so the export
+        // names a declared local.
         let modules = vec![UnpackedModule {
             id: "entry".to_string(),
             is_entry: true,
-            code: r#"import { recovered } from "./module.js";
-(function() {
-    return void recovered;
-})();
+            code: r#"if (globalThis.flag) {
+    var p = 1;
+}
+export { p as t };
 "#
             .to_string(),
             filename: "entry.js".to_string(),
             ..Default::default()
         }];
 
-        let output = unpack_multi_module(
-            modules,
-            DecompileOptions {
-                dce_mode: DceMode::TransformOnly,
-                ..Default::default()
-            },
-        )
-        .expect("fixture should decompile");
-        assert_eq!(output.modules[0].code, "import \"./module.js\";\n");
+        let output = unpack_multi_module(modules, DecompileOptions::default())
+            .expect("fixture should decompile");
+        let code = &output.modules[0].code;
+        assert!(
+            code.contains("export { p as t };"),
+            "the export should be kept:\n{code}"
+        );
     }
 
     #[test]
@@ -1305,6 +1335,7 @@ for (var key in current) globalThis[key] = current[key];"#,
                 diagnostics: true,
                 ..Default::default()
             },
+            &[],
         )
         .expect("scope split cycle should decompile");
 
@@ -2902,7 +2933,11 @@ module.exports = value;
     }
 
     #[test]
-    fn unpack_prunes_exports_for_inlined_local_aliases() {
+    fn unpack_keeps_exported_builtin_alias_declared() {
+        // `export { create }` names the alias binding, so the alias inliner
+        // leaves the declaration alone instead of removing it and relying on
+        // stale-export pruning to drop the specifier (which would also drop
+        // the export from every consumer's point of view).
         let modules = vec![UnpackedModule {
             id: "helper".to_string(),
             is_entry: false,
@@ -2929,13 +2964,15 @@ export { create, wrap };
         let code = &output.modules[0].code;
 
         assert!(
-            !code.contains("create }") && !code.contains("create,"),
-            "inlined alias should not remain exported:\n{code}"
+            code.contains("= Object.create;"),
+            "exported alias declaration should survive:\n{code}"
         );
         assert!(
-            code.contains("wrap"),
-            "live export should be preserved:\n{code}"
+            code.contains("create") && code.contains("wrap"),
+            "both exports should be preserved:\n{code}"
         );
+        let findings = crate::validate_output_modules(&[("helper.js".to_string(), code.clone())]);
+        assert!(findings.is_empty(), "{findings:#?}");
     }
 
     #[test]

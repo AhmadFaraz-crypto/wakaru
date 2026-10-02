@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::common::BytePos;
 use swc_core::ecma::ast::{
@@ -49,8 +49,8 @@ impl TdzChecker {
         N: for<'a> VisitWith<OrderedScopeChecker<'a>> + VisitWith<LexicalBindingCollector>,
     {
         let mut collector = LexicalBindingCollector {
-            bindings: HashSet::new(),
-            positions: HashMap::new(),
+            bindings: HashSet::default(),
+            positions: HashMap::default(),
         };
         node.visit_with(&mut collector);
         if collector.bindings.is_empty() {
@@ -60,7 +60,7 @@ impl TdzChecker {
         let mut scope_checker = OrderedScopeChecker {
             lexical_bindings: &collector.bindings,
             decl_positions: &collector.positions,
-            declared: HashSet::new(),
+            declared: HashSet::default(),
             violations: Vec::new(),
         };
         node.visit_with(&mut scope_checker);
@@ -73,8 +73,8 @@ impl TdzChecker {
     {
         let params: Vec<&Pat> = params.into_iter().collect();
         let mut collector = LexicalBindingCollector {
-            bindings: HashSet::new(),
-            positions: HashMap::new(),
+            bindings: HashSet::default(),
+            positions: HashMap::default(),
         };
         for param in &params {
             collect_pat_ids_with_pos(
@@ -91,7 +91,7 @@ impl TdzChecker {
         let mut scope_checker = OrderedScopeChecker {
             lexical_bindings: &collector.bindings,
             decl_positions: &collector.positions,
-            declared: HashSet::new(),
+            declared: HashSet::default(),
             violations: Vec::new(),
         };
         for param in params {

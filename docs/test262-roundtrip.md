@@ -47,22 +47,37 @@ on new flags, negative phases, or malformed frontmatter.
 
 ## Commands
 
+These commands compare against the reviewed baselines; CI runs the same
+comparison for every producer. A non-zero exit means an outcome moved or the
+run itself failed:
+
+```powershell
+node scripts\correctness\test262-baseline-matrix.mjs                              # every producer and slice
+node scripts\correctness\test262-baseline-matrix.mjs --producer swc-minify         # one producer
+node scripts\correctness\test262-baseline-matrix.mjs --producer swc-minify --slice operators
+node scripts\correctness\test262-baseline-matrix.mjs --slice module-graph          # module graphs, incl. Babel
+node scripts\correctness\test262-collect-stats.mjs --check                        # cached totals are current
+```
+
+Reviewing and accepting movement (`--accept`, and `--update` for identity
+changes such as a producer bump) is described in [Baselines](#baselines).
+
+### Exploratory runs
+
+`test262-roundtrip.mjs` runs any selection directly. These runs are not
+compared against a baseline, so a non-zero exit only means some selected case
+failed, and it may have failed before your change too. Compare two reports with
+`compare-test262-reports.mjs` to see what moved:
+
 ```powershell
 node scripts\correctness\test262-roundtrip.mjs --limit 500
 node scripts\correctness\test262-roundtrip.mjs --limit all --json target\test262-default.json
-node scripts\correctness\test262-roundtrip.mjs --limit all --summary target\test262-default.md
-node scripts\correctness\test262-roundtrip.mjs --preset classes --pipeline babel-env-terser --limit 100 --summary target\test262-classes-babel.md
 node scripts\correctness\test262-roundtrip.mjs --preset classes --pipeline swc-minify --limit 100 --summary target\test262-classes-swc.md
-node scripts\correctness\test262-roundtrip.mjs --preset classes --pipeline esbuild-minify --limit 100 --summary target\test262-classes-esbuild.md
-node scripts\correctness\test262-roundtrip.mjs --preset classes --limit all --json target\test262-classes.json
-node scripts\correctness\test262-roundtrip.mjs --preset modules --pipeline swc-minify --limit all --case-timeout-ms 2000 --summary target\test262-modules-graph-swc.md
-node scripts\correctness\test262-roundtrip.mjs --preset modules --pipeline esbuild-minify --limit all --case-timeout-ms 2000 --summary target\test262-modules-graph-esbuild.md
-node scripts\correctness\test262-roundtrip.mjs --preset modules --pipeline babel-env-terser --limit all --case-timeout-ms 2000 --summary target\test262-modules-graph-babel.md
 node scripts\correctness\compare-test262-reports.mjs target\before.json target\after.json --details
 node scripts\correctness\test262-roundtrip.mjs --rerun-from target\test262-default.json --rerun-status failed --json target\test262-default-rerun.json
 ```
 
-Defaults:
+Defaults for `test262-roundtrip.mjs`:
 
 - `--pipeline terser-light`
 - legacy equivalent: `--transform terser --terser-profile light`
@@ -277,6 +292,13 @@ Pinned producer packages are installed in separate subdirectories under the
 tool root. Keeping Terser, Babel, SWC, and esbuild isolated prevents npm from
 pruning and reinstalling one producer while another matrix job starts.
 
+Each install uses `npm --before` set to one day after the newest pinned
+package's publish time (the shared rule in `scripts/repro/lib/release-date.mjs`).
+Without it, a pinned `@babel/core` ran with the newest 7.x helpers, plugins,
+and parser, so CI's fresh install could move the Babel baseline without any
+change in the repo. A root installed under another rule, or holding a package
+at a version other than its pin, is reinstalled.
+
 Module graph baselines live under `docs/test262-baselines/module-graph/`:
 these add no-transform and Babel producer coverage to the canonical recursive
 modules slice. SWC and esbuild module graphs are already covered by their
@@ -308,8 +330,11 @@ Treat baseline movement as follows:
 ## Stats
 
 `scripts/correctness/test262-stats.json` caches the current baseline totals so
-other sessions can read them without regenerating all summaries. Update after
-baseline changes:
+other sessions can read them without regenerating all summaries. The passing
+total is also cited in `README.md` and the docs-site Correctness page
+(`docs-site/content/docs/project/correctness.mdx`); `--check` does not verify
+those, so update them by hand in the same commit. Update after baseline
+changes:
 
 ```powershell
 node scripts\correctness\test262-collect-stats.mjs                               # update all

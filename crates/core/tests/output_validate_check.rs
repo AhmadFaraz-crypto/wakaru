@@ -660,6 +660,20 @@ fn duplicate_top_level_lexical_declarations_are_reported() {
 }
 
 #[test]
+fn var_const_conflicts_are_reported_in_either_order() {
+    for source in [
+        "export const value = 1; var value = 2;",
+        "var value = 1; export const value = 2;",
+    ] {
+        assert_eq!(
+            kinds(&[("entry.js", source)]),
+            vec![(OutputFindingKind::DuplicateDeclaration, "entry.js".into())],
+            "{source}",
+        );
+    }
+}
+
+#[test]
 fn repeated_hoisted_var_declarations_are_legal() {
     let findings = kinds(&[(
         "entry.js",
@@ -1164,5 +1178,230 @@ fn name_checks_are_skipped_for_dangling_targets() {
     assert_eq!(
         findings,
         vec![(OutputFindingKind::DanglingRelativeRef, "entry.js".into())]
+    );
+}
+
+#[test]
+fn unresolved_reference_declared_only_by_one_sibling_is_reported() {
+    let findings = validate_output_modules(&modules(&[
+        (
+            "entry.js",
+            r#"
+import { load } from "./chunk.js";
+const lazyNamespace = {};
+export function helper() {}
+load();
+"#,
+        ),
+        (
+            "chunk.js",
+            r#"
+export function load() {
+    helper();
+    return Promise.resolve().then(() => lazyNamespace);
+}
+if (typeof helper === "function") {}
+"#,
+        ),
+    ]));
+
+    assert_eq!(
+        findings
+            .iter()
+            .map(|f| (f.kind, f.filename.as_str(), f.line, f.column))
+            .collect::<Vec<_>>(),
+        vec![
+            (OutputFindingKind::UnresolvedReference, "chunk.js", 3, 5),
+            (OutputFindingKind::UnresolvedReference, "chunk.js", 4, 41),
+        ]
+    );
+    assert_eq!(
+        findings[0].message,
+        "unresolved identifier \"helper\" is declared at module scope only by entry.js, which this module does not import"
+    );
+}
+
+#[test]
+fn unresolved_reference_declared_by_several_modules_is_ambiguous() {
+    // Reused minified locals: `B` is a module-scope name in two modules, so
+    // the free `B` in the third proves nothing without the input.
+    let findings = kinds(&[
+        ("a.js", "const B = 1;\nexport { B };\n"),
+        ("b.js", "function B() {}\nexport default B;\n"),
+        ("c.js", "export default B;\n"),
+    ]);
+    assert_eq!(findings, vec![]);
+}
+
+#[test]
+fn ecmascript_builtins_declared_by_a_polyfill_module_are_not_sibling_matched() {
+    let findings = kinds(&[
+        (
+            "polyfill.js",
+            "var Promise = function Promise() {};\nexport { Promise };\n",
+        ),
+        ("user.js", "export const ready = Promise.resolve(1);\n"),
+    ]);
+    assert_eq!(findings, vec![]);
+}
+
+#[test]
+fn input_free_identifiers_excuse_the_same_free_names_in_output() {
+    let inputs = modules(&[(
+        "bundle.js",
+        r#"
+(() => {
+    var q = typeof Bun !== "undefined" ? Bun.version : null;
+    try { regeneratorRuntime = q; } catch (e) {}
+    console.log(q, void 0);
+})();
+"#,
+    )]);
+    let outputs = modules(&[(
+        "entry.js",
+        r#"
+const q = typeof Bun !== "undefined" ? Bun.version : null;
+try {
+    regeneratorRuntime = q;
+} catch (e) {}
+console.log(q, undefined, <div />);
+export default B;
+"#,
+    )]);
+
+    let findings = wakaru_core::validate_output_modules_with_inputs(&outputs, &inputs);
+    assert_eq!(
+        findings
+            .iter()
+            .map(|f| (f.kind, f.filename.as_str(), f.line, f.column))
+            .collect::<Vec<_>>(),
+        vec![(OutputFindingKind::UnresolvedReference, "entry.js", 7, 16)]
+    );
+    assert_eq!(
+        findings[0].message,
+        "unresolved identifier \"B\" is not a free identifier anywhere in the input"
+    );
+}
+
+#[test]
+fn input_comparison_does_not_duplicate_export_specifier_findings() {
+    let inputs = modules(&[("bundle.js", "console.log(1);\n")]);
+    let outputs = modules(&[("entry.js", "export { missing };\n")]);
+
+    let findings = wakaru_core::validate_output_modules_with_inputs(&outputs, &inputs);
+    assert_eq!(
+        findings.iter().map(|f| f.kind).collect::<Vec<_>>(),
+        vec![OutputFindingKind::MissingLocalExport]
+    );
+}
+
+#[test]
+fn unparsable_input_is_reported_on_the_input_filename() {
+    let inputs = modules(&[("bundle.js", "function (\n")]);
+    let outputs = modules(&[("entry.js", "export const ok = 1;\n")]);
+
+    let findings = wakaru_core::validate_output_modules_with_inputs(&outputs, &inputs);
+    assert_eq!(
+        findings
+            .iter()
+            .map(|f| (f.kind, f.filename.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(OutputFindingKind::ParseError, "bundle.js")]
+    );
+    assert!(findings[0].message.starts_with("input parse failed"));
+}
+
+#[test]
+fn without_inputs_free_host_globals_are_not_reported() {
+    let findings = kinds(&[(
+        "entry.js",
+        "export const isBun = typeof Bun !== \"undefined\" && Bun.version;\n",
+    )]);
+    assert_eq!(findings, vec![]);
+}
+
+#[test]
+fn host_globals_declared_by_a_shim_module_are_not_sibling_matched() {
+    let findings = kinds(&[
+        (
+            "console-shim.js",
+            "var console = { log() {} };\nexport default console;\n",
+        ),
+        ("user.js", "console.log(1);\nexport const done = true;\n"),
+    ]);
+    assert_eq!(findings, vec![]);
+}
+
+#[test]
+fn module_runtime_names_are_not_compared_against_the_input() {
+    // Webpack factories receive `require` and friends as parameters, so the
+    // input never uses them freely; the output keeps them for edges the
+    // pipeline could not convert.
+    let inputs = modules(&[(
+        "bundle.js",
+        "(function(e,t,n){ n.g.x = 1; if (typeof n.amdD === \"function\") n.amdD(); })();\n",
+    )]);
+    let outputs = modules(&[
+        (
+            "module-1.js",
+            r#"
+global.x = 1;
+if (typeof define === "function") define();
+function load() { return require("./module-2.js"); }
+export { load };
+"#,
+        ),
+        ("module-2.js", "export const two = 2;\n"),
+    ]);
+
+    let findings = wakaru_core::validate_output_modules_with_inputs(&outputs, &inputs);
+    assert_eq!(findings, vec![]);
+}
+
+#[test]
+fn input_free_name_suppresses_a_same_spelled_sibling_declaration() {
+    // The input uses `SDK` as an environment global; an unrelated output
+    // module declares its own local `SDK`. Spelling is not binding identity,
+    // and the input evidence wins.
+    let inputs = modules(&[(
+        "bundle.js",
+        "(function () { const SDK = 1; console.log(SDK); })();\nSDK();\n",
+    )]);
+    let outputs = modules(&[
+        (
+            "provider.js",
+            "const SDK = 1;\nconsole.log(SDK);\nexport {};\n",
+        ),
+        ("consumer.js", "SDK();\nexport {};\n"),
+    ]);
+
+    assert_eq!(
+        wakaru_core::validate_output_modules_with_inputs(&outputs, &inputs),
+        vec![]
+    );
+    // Without the input, the sibling heuristic still reports it.
+    assert_eq!(
+        validate_output_modules(&outputs)
+            .iter()
+            .map(|f| (f.kind, f.filename.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(OutputFindingKind::UnresolvedReference, "consumer.js")]
+    );
+}
+
+#[test]
+fn unparsable_input_disables_the_input_comparison() {
+    let inputs = modules(&[("good.js", "console.log(1);\n"), ("bad.js", "function (\n")]);
+    // `Bun` may well be free in bad.js; a partial baseline must not call it
+    // absent.
+    let outputs = modules(&[("entry.js", "export const v = Bun.version;\n")]);
+
+    let findings = wakaru_core::validate_output_modules_with_inputs(&outputs, &inputs);
+    assert_eq!(
+        findings
+            .iter()
+            .map(|f| (f.kind, f.filename.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(OutputFindingKind::ParseError, "bad.js")]
     );
 }

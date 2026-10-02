@@ -6,7 +6,9 @@
 //! proof, so these rewrites are enabled only by detector-owned module metadata
 //! and never run for raw output.
 
-use std::collections::HashSet;
+mod amd_return;
+
+use crate::collections::HashSet;
 
 use swc_core::atoms::Atom;
 use swc_core::common::{Mark, Span, SyntaxContext, DUMMY_SP};
@@ -19,8 +21,7 @@ use swc_core::ecma::ast::{
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use crate::analysis::binding_uses::{BindingUseIndex, UseKind};
-use crate::rules::eval_utils::DirectEvalAnalyzer;
-use crate::rules::rename_utils::collect_module_names;
+use crate::rules::eval_utils::{module_has_with_stmt, DirectEvalAnalyzer};
 use crate::utils::paren::{strip_parens, strip_parens_mut};
 
 pub(super) fn normalize_webpack_commonjs_runtime(
@@ -33,11 +34,21 @@ pub(super) fn normalize_webpack_commonjs_runtime(
     if !enabled {
         return;
     }
+    restore_webpack_exports_iife(module, unresolved_mark);
     if let Some(module_id) = numeric_module_id {
         normalize_webpack_css_runtime(module, unresolved_mark, module_id, legacy_module_i);
     }
-    if !has_supported_module_shell(module) {
+    if restore_variable_factory_call(module, unresolved_mark) {
         return;
+    }
+    if !restore_immediate_factory_export(module, unresolved_mark) {
+        amd_return::restore(module, unresolved_mark);
+    }
+}
+
+fn restore_immediate_factory_export(module: &mut Module, unresolved_mark: Mark) -> bool {
+    if !has_supported_module_shell(module) {
+        return false;
     }
 
     let mut functions = FunctionBindingCollector::default();
@@ -56,7 +67,7 @@ pub(super) fn normalize_webpack_commonjs_runtime(
     };
     candidate.visit_mut_with(&mut normalizer);
     if normalizer.matches != 1 {
-        return;
+        return false;
     }
 
     let mut runtime_references = RuntimeCommonJsReferenceFinder {
@@ -65,7 +76,7 @@ pub(super) fn normalize_webpack_commonjs_runtime(
     };
     candidate.visit_with(&mut runtime_references);
     if runtime_references.found {
-        return;
+        return false;
     }
 
     candidate
@@ -79,6 +90,280 @@ pub(super) fn normalize_webpack_commonjs_runtime(
                 expr: Box::new(Expr::Ident(capture)),
             },
         )));
+    *module = candidate;
+    true
+}
+
+/// Restore a generated UMD factory invocation without evaluating or lifting
+/// its body. The factory is assigned once immediately before its only use.
+/// Runtime arguments/receiver may be dropped only when this anonymous,
+/// synchronous, parameterless function cannot observe them. The result may be
+/// undefined: preserve the guard and webpack's initial empty export object.
+/// Replacing native `Function.prototype.call` relies on `stable_builtins`.
+fn restore_variable_factory_call(module: &mut Module, unresolved_mark: Mark) -> bool {
+    let [ModuleItem::Stmt(Stmt::Decl(Decl::Var(decl))), ModuleItem::Stmt(Stmt::Expr(statement))] =
+        module.body.as_slice()
+    else {
+        return false;
+    };
+    if !matches!(decl.kind, VarDeclKind::Var | VarDeclKind::Let)
+        || decl.decls.len() != 2
+        || decl
+            .decls
+            .iter()
+            .any(|d| d.init.is_some() || !matches!(d.name, Pat::Ident(_)))
+    {
+        return false;
+    }
+    let Expr::Seq(sequence) = strip_parens(&statement.expr) else {
+        return false;
+    };
+    let [init, guarded] = sequence.exprs.as_slice() else {
+        return false;
+    };
+    let capture = fresh_capture_ident(module);
+    let parser = WebpackCommonJsRuntimeNormalizer {
+        unresolved_mark,
+        function_bindings: HashSet::default(),
+        capture: capture.clone(),
+        matches: 0,
+    };
+    let Some(init) = parser.simple_assignment(init) else {
+        return false;
+    };
+    let AssignTarget::Simple(SimpleAssignTarget::Ident(factory)) = &init.left else {
+        return false;
+    };
+    let Expr::Fn(function) = strip_parens(&init.right) else {
+        return false;
+    };
+    if function.ident.is_some()
+        || function.function.is_async
+        || function.function.is_generator
+        || !function.function.params.is_empty()
+    {
+        return false;
+    }
+    let Some(body) = &function.function.body else {
+        return false;
+    };
+    let mut observations = FactoryInvocationObservations::default();
+    body.visit_with(&mut observations);
+    if observations.found || module_has_with_stmt(module) {
+        return false;
+    }
+    let mut eval = DirectEvalAnalyzer::default();
+    module.visit_with(&mut eval);
+    if eval.unknown_direct_eval || !eval.known_direct_eval_sources.is_empty() {
+        return false;
+    }
+    let Expr::Bin(guard) = strip_parens(guarded) else {
+        return false;
+    };
+    if guard.op != BinaryOp::LogicalOr {
+        return false;
+    }
+    let Some(value) = parser.undefined_checked_assignment(&guard.left) else {
+        return false;
+    };
+    let Some(export) = parser.module_exports_assignment(&guard.right) else {
+        return false;
+    };
+    let AssignTarget::Simple(SimpleAssignTarget::Ident(result)) = &value.left else {
+        return false;
+    };
+    if factory.id.to_id() == result.id.to_id()
+        || !matches!(strip_parens(&export.right), Expr::Ident(id) if id.to_id() == result.id.to_id())
+    {
+        return false;
+    }
+    let declarations: HashSet<_> = decl
+        .decls
+        .iter()
+        .filter_map(|d| match &d.name {
+            Pat::Ident(id) => Some(id.id.to_id()),
+            _ => None,
+        })
+        .collect();
+    if !declarations.contains(&factory.id.to_id()) || !declarations.contains(&result.id.to_id()) {
+        return false;
+    }
+    let Expr::Call(call) = strip_parens(&value.right) else {
+        return false;
+    };
+    let Callee::Expr(callee) = &call.callee else {
+        return false;
+    };
+    let Expr::Member(member) = strip_parens(callee) else {
+        return false;
+    };
+    if !matches!(strip_parens(&member.obj), Expr::Ident(id) if id.to_id() == factory.id.to_id())
+        || !static_member_name_is(&member.prop, "call")
+        || call.args.len() != 4
+        || !call
+            .args
+            .iter()
+            .zip(["exports", "require", "exports", "module"])
+            .all(|(arg, name)| {
+                arg.spread.is_none()
+                    && matches!(strip_parens(&arg.expr), Expr::Ident(id)
+                if id.sym.as_ref() == name && id.ctxt.outer() == unresolved_mark)
+            })
+    {
+        return false;
+    }
+    // No reassignment, property mutation, escape, or self-observation through
+    // the variable holding the function. Matching uses resolver identity.
+    let uses = BindingUseIndex::collect(module);
+    let sites = uses.use_sites(&factory.id.to_id());
+    if sites.len() != 2
+        || sites.iter().filter(|s| s.kind == UseKind::Write).count() != 1
+        || sites
+            .iter()
+            .filter(|s| matches!(&s.kind, UseKind::StaticMemberRead(name) if name == "call"))
+            .count()
+            != 1
+    {
+        return false;
+    }
+
+    let mut direct_call = call.clone();
+    direct_call.callee = Callee::Expr(Box::new(Expr::Ident(factory.id.clone())));
+    direct_call.args.clear();
+    let mut value = value.clone();
+    value.right = Box::new(Expr::Call(direct_call));
+    let Expr::Bin(test) = strip_parens(&guard.left) else {
+        return false;
+    };
+    let mut test = test.clone();
+    if parser.is_undefined_expr(&test.left) {
+        test.right = Box::new(Expr::Assign(value));
+    } else {
+        test.left = Box::new(Expr::Assign(value));
+    }
+    let mut guard = guard.clone();
+    guard.left = Box::new(Expr::Bin(test));
+    guard.right = Box::new(parser.capture_assignment(export.span, export.right.clone()));
+    let mut sequence = sequence.clone();
+    *sequence.exprs[1] = Expr::Bin(guard);
+    let mut candidate = module.clone();
+    candidate.body[1] = ModuleItem::Stmt(Stmt::Expr(ExprStmt {
+        span: statement.span,
+        expr: Box::new(Expr::Seq(sequence)),
+    }));
+    let mut runtime = RuntimeCommonJsReferenceFinder {
+        unresolved_mark,
+        found: false,
+    };
+    candidate.visit_with(&mut runtime);
+    if runtime.found {
+        return false;
+    }
+    candidate
+        .body
+        .insert(0, empty_object_declaration(capture.clone()));
+    candidate
+        .body
+        .push(ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(
+            ExportDefaultExpr {
+                span: DUMMY_SP,
+                expr: Box::new(Expr::Ident(capture)),
+            },
+        )));
+    *module = candidate;
+    true
+}
+
+#[derive(Default)]
+struct FactoryInvocationObservations {
+    found: bool,
+}
+
+impl Visit for FactoryInvocationObservations {
+    fn visit_this_expr(&mut self, _: &swc_core::ecma::ast::ThisExpr) {
+        self.found = true;
+    }
+    fn visit_ident(&mut self, id: &Ident) {
+        if id.sym == "arguments" {
+            self.found = true;
+        }
+    }
+    fn visit_meta_prop_expr(&mut self, expr: &swc_core::ecma::ast::MetaPropExpr) {
+        if expr.kind == swc_core::ecma::ast::MetaPropKind::NewTarget {
+            self.found = true;
+        }
+    }
+    // Ordinary nested functions own their invocation context. Arrows and
+    // computed method keys are still visited because they can observe ours.
+    fn visit_function(&mut self, _: &swc_core::ecma::ast::Function) {}
+    fn visit_constructor(&mut self, _: &swc_core::ecma::ast::Constructor) {}
+}
+
+/// A sole synchronous UMD IIFE can receive webpack's initial exports object
+/// without lifting its body or guessing its eventual properties. Require the
+/// argument to be the entire free CommonJS surface so no other code can replace
+/// or observe the runtime object through an unmodeled path.
+fn restore_webpack_exports_iife(module: &mut Module, unresolved_mark: Mark) {
+    if !matches!(module.body.as_slice(), [ModuleItem::Stmt(Stmt::Expr(_))]) {
+        return;
+    }
+    if module_has_with_stmt(module) {
+        return;
+    }
+    let mut eval = DirectEvalAnalyzer::default();
+    module.visit_with(&mut eval);
+    if eval.unknown_direct_eval || !eval.known_direct_eval_sources.is_empty() {
+        return;
+    }
+    let mut candidate = module.clone();
+    let [ModuleItem::Stmt(Stmt::Expr(statement))] = candidate.body.as_mut_slice() else {
+        return;
+    };
+    let mut expression = strip_parens_mut(&mut statement.expr);
+    while let Expr::Unary(unary) = expression {
+        if !matches!(unary.op, UnaryOp::Bang | UnaryOp::Void) {
+            return;
+        }
+        expression = strip_parens_mut(&mut unary.arg);
+    }
+    let Expr::Call(call) = expression else {
+        return;
+    };
+    let Callee::Expr(callee) = &call.callee else {
+        return;
+    };
+    let synchronous = match strip_parens(callee) {
+        Expr::Fn(function) => !function.function.is_async && !function.function.is_generator,
+        Expr::Arrow(arrow) => !arrow.is_async,
+        _ => false,
+    };
+    let [argument] = call.args.as_mut_slice() else {
+        return;
+    };
+    if !synchronous || argument.spread.is_some() {
+        return;
+    }
+    if !matches!(strip_parens(&argument.expr), Expr::Ident(ident)
+        if ident.sym == "exports" && ident.ctxt.outer() == unresolved_mark)
+    {
+        return;
+    }
+    let capture = fresh_named_capture_ident(module, "_webpackExports");
+    *argument.expr = Expr::Ident(capture.clone());
+    let mut runtime = RuntimeCommonJsReferenceFinder {
+        unresolved_mark,
+        found: false,
+    };
+    candidate.visit_with(&mut runtime);
+    if runtime.found {
+        return;
+    }
+    candidate
+        .body
+        .insert(0, empty_object_declaration(capture.clone()));
+    candidate
+        .body
+        .push(module_exports_assignment(capture, unresolved_mark));
     *module = candidate;
 }
 
@@ -125,7 +410,7 @@ fn normalize_webpack_css_runtime(
         if rewrite_css_locals_assignment(&mut locals_candidate, locals.assignment_span, &capture) {
             locals_candidate
                 .body
-                .insert(0, css_default_declaration(capture.clone()));
+                .insert(0, empty_object_declaration(capture.clone()));
             locals_candidate
                 .body
                 .push(module_exports_assignment(capture, unresolved_mark));
@@ -372,7 +657,7 @@ fn module_identity_surface_is_stable(module: &Module, unresolved_mark: Mark) -> 
     let uses = BindingUseIndex::collect(module);
     let mut bindings = UnresolvedModuleBindingCollector {
         unresolved_mark,
-        ids: HashSet::new(),
+        ids: HashSet::default(),
     };
     module.visit_with(&mut bindings);
     bindings.ids.iter().all(|binding| {
@@ -500,7 +785,18 @@ impl VisitMut for CssLocalsAssignmentRewriter<'_> {
 }
 
 fn fresh_named_capture_ident(module: &Module, base: &str) -> Ident {
-    let mut used_names = collect_module_names(module);
+    // Captures may be referenced inside an IIFE. Reserve both nested bindings
+    // and free references so the printed name cannot capture either direction.
+    #[derive(Default)]
+    struct Names(HashSet<Atom>);
+    impl Visit for Names {
+        fn visit_ident(&mut self, ident: &Ident) {
+            self.0.insert(ident.sym.clone());
+        }
+    }
+    let mut names = Names::default();
+    module.visit_with(&mut names);
+    let mut used_names = names.0;
     let base: Atom = base.into();
     let name = if used_names.insert(base.clone()) {
         base
@@ -513,7 +809,7 @@ fn fresh_named_capture_ident(module: &Module, base: &str) -> Ident {
     Ident::new(name, DUMMY_SP, SyntaxContext::empty())
 }
 
-fn css_default_declaration(capture: Ident) -> ModuleItem {
+fn empty_object_declaration(capture: Ident) -> ModuleItem {
     ModuleItem::Stmt(Stmt::Decl(Decl::Var(Box::new(VarDecl {
         span: DUMMY_SP,
         ctxt: SyntaxContext::empty(),
@@ -927,6 +1223,202 @@ mod tests {
 
     fn normalize(source: &str, enabled: bool) -> String {
         normalize_with_module_id(source, enabled, None, false)
+    }
+
+    #[test]
+    fn amd_return_factory_keeps_conditional_initialization_and_undefined() {
+        for method in [
+            "apply(exports, [])",
+            "call(exports, require, exports, module)",
+        ] {
+            let source = format!("var result; (function(host) {{ if (host) {{ var api = choose(); module.exports && (module.exports = api); void 0 === (result = (function() {{ return api; }}).{method}) || (module.exports = result); }} }})(host);");
+            let output = normalize(&source, true);
+            assert!(output.contains("= {}"), "{output}");
+            assert!(output.contains("if (host)"), "{output}");
+            assert!(output.contains("result = api"), "{output}");
+            assert!(output.contains("void 0 ==="), "{output}");
+            assert_eq!(output.matches("module.exports").count(), 1, "{output}");
+            assert!(!output.contains(".call(exports"), "{output}");
+            assert!(!output.contains(".apply(exports"), "{output}");
+        }
+    }
+
+    #[test]
+    fn amd_return_factory_uses_resolver_identity_and_fresh_capture_names() {
+        let source = "var result, _webpackDefault = 7; (function() { var api; void 0 === (result = (function() { return api; }).apply(exports, [])) || (module.exports = result); observe(_webpackDefault); })();";
+        let output = normalize(source, true);
+        assert!(output.contains("var _webpackDefault_1 = {}"), "{output}");
+        assert!(output.contains("observe(_webpackDefault)"), "{output}");
+        assert!(output.contains("result = api"), "{output}");
+        let shadowed = "var result; (function(module, exports) { var api; void 0 === (result = (function() { return api; }).apply(exports, [])) || (module.exports = result); })(object, object.exports);";
+        assert_eq!(normalize(shadowed, true), normalize(shadowed, false));
+        let local_module = "var result; (function() { var api; (function(module) { module.exports = 7; })(object); void 0 === (result = (function() { return api; }).apply(exports, [])) || (module.exports = result); })();";
+        let output = normalize(local_module, true);
+        assert!(output.contains("module.exports = 7"), "{output}");
+        assert!(output.contains("result = api"), "{output}");
+    }
+
+    #[test]
+    fn amd_return_factory_preserves_unaccounted_runtime_uses() {
+        let base = "var result; (function() { var api = function() {}; EXTRA void 0 === (result = (function() { return api; }).apply(exports, [])) || (module.exports = result); }).call(this);";
+        for extra in [
+            "use(module);",
+            "exports.extra = 1;",
+            "module = other;",
+            "later(function() { module.exports = other; });",
+            "later(() => { module.exports = other; });",
+            "eval(code);",
+            "with (object) { effect(); }",
+            "use(this);",
+            "module.exports();",
+            "module.exports`tag`;",
+            "delete module.exports;",
+        ] {
+            let source = base.replace("EXTRA", extra);
+            assert_eq!(
+                normalize(&source, true),
+                normalize(&source, false),
+                "{source}"
+            );
+        }
+        for factory in [
+            "function() { return this; }",
+            "function() { return arguments; }",
+            "function api() { return api; }",
+            "function(x = effect()) { return api; }",
+            "async function() { return api; }",
+            "function*() { return api; }",
+            "function() { effect(); return api; }",
+        ] {
+            let source = base
+                .replace("EXTRA", "")
+                .replace("function() { return api; }", factory);
+            assert_eq!(
+                normalize(&source, true),
+                normalize(&source, false),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_factory_call_keeps_observed_invocation_context() {
+        for body in [
+            "return this;",
+            "return arguments;",
+            "return () => this;",
+            "return () => arguments;",
+            "return new.target;",
+            "return { [this.key]() {} };",
+            "eval('arguments'); return 1;",
+            "eval(code); return 1;",
+            "with (object) { effect(); } return 1;",
+            "factory = replacement; return 1;",
+            "factory.call = replacement; return 1;",
+            "observe(factory); return 1;",
+            "return exports;",
+            "return require('dependency');",
+            "return module;",
+        ] {
+            let source = format!("var factory, result; factory = function() {{ {body} }}, void 0 === (result = factory.call(exports, require, exports, module)) || (module.exports = result);");
+            assert_eq!(
+                normalize(&source, true),
+                normalize(&source, false),
+                "{source}"
+            );
+        }
+        let source = "var factory, result; factory = function() { return 42; }, void 0 === (result = factory.call(exports, require, exports, module)) || (module.exports = result);";
+        for invalid in [
+            source.replace("function()", "async function()"),
+            source.replace("function()", "function*()"),
+            source.replace("function()", "function(arg)"),
+            source.replace("function()", "function named()"),
+            source.replace("require, exports, module", "require, exports, effect()"),
+            source.replace("require, exports, module", "require, ...exports, module"),
+            source.replace("module.exports = result", "module.exports = factory"),
+            source
+                .replace("factory = function", "ready && (factory = function")
+                .replace("return 42; },", "return 42; }),"),
+        ] {
+            assert_eq!(
+                normalize(&invalid, true),
+                normalize(&invalid, false),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_factory_call_preserves_the_undefined_fallback() {
+        let source = "var factory, result; factory = function() { function api() {} api.sum = function() { return arguments.length; }; return api; }, void 0 === (result = factory.call(exports, require, exports, module)) || (module.exports = result);";
+        let output = normalize(source, true);
+        assert!(output.contains("export default"), "{output}");
+        assert!(output.contains("= {}"), "{output}");
+        assert!(output.contains("result = factory()"), "{output}");
+        assert!(output.contains("arguments.length"), "{output}");
+        assert!(!output.contains("module.exports"), "{output}");
+        let output = normalize(&source.replace("return api;", "return undefined;"), true);
+        assert!(output.contains("= {}"), "{output}");
+        assert!(output.contains("void 0 ==="), "{output}");
+    }
+
+    #[test]
+    fn sole_exports_iife_receives_the_runtime_created_object() {
+        for source in [
+            "!function(out) { out.value = 42; }(exports);",
+            "((out) => { out.value = 42; })(exports);",
+            "void function(out) { out.read = function() { return out; }; }(exports);",
+        ] {
+            let output = normalize(source, true);
+            assert!(output.contains("var _webpackExports = {}"), "{output}");
+            assert!(output.contains("(_webpackExports)"), "{output}");
+            assert!(
+                output.contains("module.exports = _webpackExports"),
+                "{output}"
+            );
+            assert!(!normalize(source, false).contains("_webpackExports"));
+        }
+    }
+
+    #[test]
+    fn exports_iife_restoration_requires_the_complete_runtime_surface() {
+        for source in [
+            "function later() { (function(out) { out.value = 42; })(exports); }",
+            "ready && (function(out) { out.value = 42; })(exports);",
+            "(async function(out) { out.value = 42; })(exports);",
+            "(function*(out) { out.value = 42; })(exports);",
+            "(function(out) { module.exports = out; })(exports);",
+            "(function(out) { out.other = exports; })(exports);",
+            "(function(out) { out.value = require('./other.js'); })(exports);",
+            "(function(out) { eval('module.exports = out'); })(exports);",
+            "(function(out) { eval(source); })(exports);",
+            "(function(out) { out.value = 42; })(...exports);",
+            "(function(out) { out.value = 42; })(exports, effect());",
+            "var exports = {}; (function(out) { out.value = 42; })(exports);",
+        ] {
+            assert_eq!(
+                normalize(source, true),
+                normalize(source, false),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn exports_iife_capture_avoids_nested_binding_collisions() {
+        let output = normalize(
+            "(function(out) { var _webpackExports = 42; out.value = _webpackExports; })(exports);",
+            true,
+        );
+        assert!(output.contains("var _webpackExports_1 = {}"), "{output}");
+        assert!(output.contains("var _webpackExports = 42"), "{output}");
+        assert!(output.contains("(_webpackExports_1)"), "{output}");
+        let output = normalize(
+            "(function(out) { out.value = _webpackExports; })(exports);",
+            true,
+        );
+        assert!(output.contains("var _webpackExports_1 = {}"), "{output}");
+        assert!(output.contains("out.value = _webpackExports;"), "{output}");
     }
 
     #[test]
@@ -1360,7 +1852,7 @@ let result;
     }
 
     #[test]
-    fn reassigned_function_return_fails_closed() {
+    fn reassigned_factory_return_keeps_the_undefined_guard() {
         let output = normalize(
             r#"
 !function() {
@@ -1373,7 +1865,10 @@ let result;
 "#,
             true,
         );
-        assert!(output.contains(".apply(exports"), "{output}");
-        assert!(output.contains("module.exports"), "{output}");
+        assert!(output.contains("createValue = maybeValue"), "{output}");
+        assert!(output.contains("result = createValue"), "{output}");
+        assert!(output.contains("void 0 ==="), "{output}");
+        assert!(output.contains("var _webpackDefault = {}"), "{output}");
+        assert!(!output.contains(".apply(exports"), "{output}");
     }
 }

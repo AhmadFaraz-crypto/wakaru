@@ -1,13 +1,9 @@
-use std::collections::HashMap;
+use crate::collections::HashMap;
 
-use swc_core::atoms::Atom;
 use swc_core::common::{sync::Lrc, Mark, SourceMap, GLOBALS};
-use swc_core::ecma::ast::{
-    BindingIdent, ClassDecl, ForInStmt, ForOfStmt, ForStmt, ImportDecl, ImportSpecifier,
-    ModuleItem, ObjectPatProp, Pat, VarDecl, VarDeclKind,
-};
+use swc_core::ecma::ast::ModuleItem;
 use swc_core::ecma::transforms::base::resolver;
-use swc_core::ecma::visit::{Visit, VisitMutWith, VisitWith};
+use swc_core::ecma::visit::VisitMutWith;
 
 use super::io::{parse_js_with_recovery, parse_script_with_recovery, ParseDiagnostic};
 use super::types::{UnpackWarning, UnpackWarningKind};
@@ -32,7 +28,7 @@ pub(super) fn collect_input_parse_warnings(errors: &[ParseDiagnostic]) -> Vec<Un
     // Source locations identify occurrences, not distinct parser conditions.
     // Keep the first-seen signature order while collapsing repeated conditions
     // within one parsed file.
-    let mut group_indexes: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut group_indexes: HashMap<(&str, &str), usize> = HashMap::default();
     let mut groups: Vec<(&ParseDiagnostic, usize)> = Vec::new();
 
     for error in errors {
@@ -69,10 +65,7 @@ pub(super) fn collect_duplicate_declaration_warnings(
     module: &swc_core::ecma::ast::Module,
     filename: &str,
 ) -> Vec<UnpackWarning> {
-    let mut collector = DuplicateDeclarationCollector::default();
-    module.visit_with(&mut collector);
-    collector
-        .duplicates
+    crate::output_validate::conflicting_lexical_declaration_names(module)
         .into_iter()
         .map(|name| {
             UnpackWarning::new(
@@ -82,127 +75,6 @@ pub(super) fn collect_duplicate_declaration_warnings(
             )
         })
         .collect()
-}
-
-#[derive(Default)]
-struct DuplicateDeclarationCollector {
-    seen: HashMap<(Atom, swc_core::common::SyntaxContext), ()>,
-    duplicates: Vec<Atom>,
-}
-
-impl DuplicateDeclarationCollector {
-    fn record_binding(&mut self, binding: &BindingIdent) {
-        let key = (binding.id.sym.clone(), binding.id.ctxt);
-        if self.seen.insert(key, ()).is_some() && !self.duplicates.contains(&binding.id.sym) {
-            self.duplicates.push(binding.id.sym.clone());
-        }
-    }
-
-    fn record_pat(&mut self, pat: &Pat) {
-        match pat {
-            Pat::Ident(binding) => self.record_binding(binding),
-            Pat::Array(array) => {
-                for elem in array.elems.iter().flatten() {
-                    self.record_pat(elem);
-                }
-            }
-            Pat::Object(object) => {
-                for prop in &object.props {
-                    match prop {
-                        ObjectPatProp::KeyValue(kv) => self.record_pat(&kv.value),
-                        ObjectPatProp::Assign(assign) => {
-                            self.record_binding(&assign.key);
-                        }
-                        ObjectPatProp::Rest(rest) => self.record_pat(&rest.arg),
-                    }
-                }
-            }
-            Pat::Rest(rest) => self.record_pat(&rest.arg),
-            Pat::Assign(assign) => self.record_pat(&assign.left),
-            Pat::Expr(_) | Pat::Invalid(_) => {}
-        }
-    }
-}
-
-impl Visit for DuplicateDeclarationCollector {
-    fn visit_class_decl(&mut self, class_decl: &ClassDecl) {
-        self.record_binding(&BindingIdent {
-            id: class_decl.ident.clone(),
-            type_ann: None,
-        });
-        class_decl.class.visit_with(self);
-    }
-
-    fn visit_import_decl(&mut self, import_decl: &ImportDecl) {
-        for specifier in &import_decl.specifiers {
-            match specifier {
-                ImportSpecifier::Named(named) => self.record_binding(&BindingIdent {
-                    id: named.local.clone(),
-                    type_ann: None,
-                }),
-                ImportSpecifier::Default(default) => self.record_binding(&BindingIdent {
-                    id: default.local.clone(),
-                    type_ann: None,
-                }),
-                ImportSpecifier::Namespace(namespace) => self.record_binding(&BindingIdent {
-                    id: namespace.local.clone(),
-                    type_ann: None,
-                }),
-            }
-        }
-    }
-
-    fn visit_var_decl(&mut self, var_decl: &VarDecl) {
-        if var_decl.kind == VarDeclKind::Var {
-            return;
-        }
-        for decl in &var_decl.decls {
-            self.record_pat(&decl.name);
-        }
-        var_decl.visit_children_with(self);
-    }
-
-    fn visit_block_stmt(&mut self, block: &swc_core::ecma::ast::BlockStmt) {
-        let mut child = DuplicateDeclarationCollector::default();
-        block.visit_children_with(&mut child);
-        self.duplicates.extend(child.duplicates);
-    }
-
-    fn visit_function(&mut self, func: &swc_core::ecma::ast::Function) {
-        let mut child = DuplicateDeclarationCollector::default();
-        func.visit_children_with(&mut child);
-        self.duplicates.extend(child.duplicates);
-    }
-
-    fn visit_arrow_expr(&mut self, arrow: &swc_core::ecma::ast::ArrowExpr) {
-        let mut child = DuplicateDeclarationCollector::default();
-        arrow.visit_children_with(&mut child);
-        self.duplicates.extend(child.duplicates);
-    }
-
-    fn visit_class(&mut self, class: &swc_core::ecma::ast::Class) {
-        let mut child = DuplicateDeclarationCollector::default();
-        class.visit_children_with(&mut child);
-        self.duplicates.extend(child.duplicates);
-    }
-
-    fn visit_for_of_stmt(&mut self, stmt: &ForOfStmt) {
-        let mut child = DuplicateDeclarationCollector::default();
-        stmt.visit_children_with(&mut child);
-        self.duplicates.extend(child.duplicates);
-    }
-
-    fn visit_for_in_stmt(&mut self, stmt: &ForInStmt) {
-        let mut child = DuplicateDeclarationCollector::default();
-        stmt.visit_children_with(&mut child);
-        self.duplicates.extend(child.duplicates);
-    }
-
-    fn visit_for_stmt(&mut self, stmt: &ForStmt) {
-        let mut child = DuplicateDeclarationCollector::default();
-        stmt.visit_children_with(&mut child);
-        self.duplicates.extend(child.duplicates);
-    }
 }
 
 /// Validate the text users receive, then resolve that emitted program from
@@ -278,6 +150,53 @@ fn output_parse_warnings(errors: Vec<ParseDiagnostic>, filename: &str) -> Vec<Un
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emitted_var_lexical_conflicts_are_errors_in_either_order() {
+        for source in [
+            "export const value = 1; export var value = 2;",
+            "export var value = 1; export const value = 2;",
+            "let value; if (ok) { var value; }",
+            "{ const value = 1; if (ok) { var value; } }",
+            "function f() { const value = 1; var value; }",
+            "var f = () => { const value = 1; var value; };",
+            "for (let value of values) { var value; }",
+            "switch (tag) { case 0: const value = 1; break; case 1: var value; }",
+            "const { value } = source; var value;",
+            "var value; class value {}",
+        ] {
+            let warnings = collect_output_diagnostics(source, "entry.js");
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.kind == UnpackWarningKind::DuplicateDeclaration),
+                "missed conflict: {source}\n{warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legal_var_redeclarations_and_nested_shadowing_are_not_errors() {
+        for source in [
+            "var value; var value;",
+            "var value; if (ok) { var value; }",
+            "var value; { const value = 1; }",
+            "const value = 1; function f() { var value; }",
+            "function f(value) { var value; }",
+            "function f(value, value) {}",
+            "function value() {} function value() {}",
+            "var value; function value() {}",
+            "const value = class value {};",
+        ] {
+            let warnings = collect_output_diagnostics(source, "entry.js");
+            assert!(
+                !warnings
+                    .iter()
+                    .any(|warning| warning.kind == UnpackWarningKind::DuplicateDeclaration),
+                "false conflict: {source}\n{warnings:?}"
+            );
+        }
+    }
 
     fn parse_diagnostic(line: usize, message: &str) -> ParseDiagnostic {
         ParseDiagnostic {

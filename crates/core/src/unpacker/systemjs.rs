@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::common::{
@@ -14,14 +14,21 @@ use swc_core::ecma::ast::{
     ParenExpr, Pat, Prop, PropName, PropOrSpread, ReturnStmt, SimpleAssignTarget, Stmt, Str,
     UnaryOp, VarDecl, VarDeclarator,
 };
-use swc_core::ecma::codegen::{text_writer::JsWriter, Config, Emitter};
+use swc_core::ecma::codegen::Config;
 use swc_core::ecma::transforms::base::resolver;
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use crate::js_names::{is_reserved_binding_name, is_valid_identifier_name};
-use crate::unpacker::{span_byte_range, BundleFormat, UnpackResult, UnpackedModule};
+use crate::unpacker::{
+    emit_module_with_positions, span_byte_range, BundleFormat, GeneratedSourceMapPoint,
+    InputOffsets, MappedCode, SourcePositions, UnpackResult, UnpackedModule,
+};
 
-pub(super) fn detect_from_module(module: &Module, cm: Lrc<SourceMap>) -> Option<UnpackResult> {
+pub(super) fn detect_from_module(
+    module: &Module,
+    cm: Lrc<SourceMap>,
+    positions: SourcePositions,
+) -> Option<UnpackResult> {
     let mut registers = Vec::new();
 
     for item in &module.body {
@@ -50,11 +57,12 @@ pub(super) fn detect_from_module(module: &Module, cm: Lrc<SourceMap>) -> Option<
     }
 
     let multiple = registers.len() > 1;
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     let mut modules = Vec::new();
     for (idx, register) in registers.into_iter().enumerate() {
         let register_range = span_byte_range(&cm, register.span);
-        if let Some(mut result) = try_unpack_dynamic_export_bundle(&register, cm.clone()) {
+        if let Some(mut result) = try_unpack_dynamic_export_bundle(&register, cm.clone(), positions)
+        {
             // The nested bundle was re-parsed from emitted code, so its
             // spans are meaningless here; attribute the whole register call.
             for module in &mut result.modules {
@@ -65,17 +73,20 @@ pub(super) fn detect_from_module(module: &Module, cm: Lrc<SourceMap>) -> Option<
         }
 
         let filename = filename_for_register(register.name.as_deref(), idx, multiple, &mut seen);
-        let code = emit_system_module(&register, filename.clone(), cm.clone(), multiple)?;
+        let emitted =
+            emit_system_module(&register, filename.clone(), cm.clone(), multiple, positions)?;
         let is_entry = idx == 0;
         modules.push(UnpackedModule {
             id: register.name.unwrap_or_else(|| idx.to_string()),
             is_entry,
-            code,
+            code: emitted.code,
             filename,
             source_ranges: register_range.into_iter().collect(),
             inspection_context_ranges: Vec::new(),
             source_input: String::new(),
-            generated_source_map: Vec::new(),
+            generated_source_map: emitted.points,
+            verbatim_source_offset: emitted.verbatim_source_offset,
+            mapped_in_every_mode: false,
         });
     }
 
@@ -85,14 +96,30 @@ pub(super) fn detect_from_module(module: &Module, cm: Lrc<SourceMap>) -> Option<
 fn try_unpack_dynamic_export_bundle(
     register: &SystemRegister,
     cm: Lrc<SourceMap>,
+    positions: SourcePositions,
 ) -> Option<UnpackResult> {
     let export_sym = param_sym(&register.declare, 0)?;
     let body = register.declare.body.as_ref()?;
     let descriptor = extract_register_descriptor(body)?;
     let execute_body = descriptor.execute.body.as_ref()?;
     let expr = dynamic_export_expr(execute_body, &export_sym)?;
-    let source = emit_expr_module(expr, cm).ok()?;
-    crate::unpacker::try_unpack_bundle(&source).ok().flatten()
+    // Always record the outer hop: prepared inner modules carry points in
+    // every mode, and they must target this input, not the inner text.
+    let inner = emit_expr_module(expr, cm, SourcePositions::Record).ok()?;
+    let mut result =
+        crate::unpacker::try_unpack_bundle_with_positions(&inner.code, positions).ok()??;
+    let outer = InputOffsets::Printed(&inner.points);
+    for module in &mut result.modules {
+        let points = match InputOffsets::of(module) {
+            Some(InputOffsets::Printed(points)) => outer.compose(points),
+            // A verbatim inner slice maps every offset; the printed outer
+            // hop only maps exact points, so the slice cannot be carried.
+            Some(InputOffsets::Verbatim(_)) | None => Vec::new(),
+        };
+        module.generated_source_map = points;
+        module.verbatim_source_offset = None;
+    }
+    Some(result)
 }
 
 fn dynamic_export_expr<'a>(body: &'a FunctionBody, export_sym: &Atom) -> Option<&'a Expr> {
@@ -342,7 +369,8 @@ fn emit_system_module(
     filename: String,
     cm: Lrc<SourceMap>,
     multiple: bool,
-) -> Option<String> {
+    positions: SourcePositions,
+) -> Option<EmittedRegister> {
     // Missing `_export` is optional. A present but unreadable first param
     // (rest / destructure / default) stays fail-closed.
     let export_sym = match register.declare.params.first() {
@@ -411,7 +439,7 @@ fn emit_system_module(
         Some(export_sym) => {
             collect_member_export_binding_names(&lifted_stmts, export_sym, &export_call_spans)
         }
-        None => HashSet::new(),
+        None => HashSet::default(),
     };
     direct_binding_candidates.extend(seen_export_names.into_iter().filter(|name| {
         name.as_ref() != "default"
@@ -425,7 +453,7 @@ fn emit_system_module(
             export_sym,
             &export_call_spans,
         ),
-        None => HashSet::new(),
+        None => HashSet::default(),
     };
     let needs_unresolved_analysis = (!direct_binding_candidates.is_empty()
         && (direct_binding_candidates
@@ -434,12 +462,12 @@ fn emit_system_module(
             || used_names.names.iter().any(|name| name.as_ref() == "eval")))
         || !default_iife_return_idents.is_empty();
     let unresolved_analysis = if needs_unresolved_analysis {
-        analyze_unresolved_names(&lifted_stmts, &HashSet::new())
+        analyze_unresolved_names(&lifted_stmts, &HashSet::default())
     } else {
         UnresolvedNameAnalysis::default()
     };
     let (temp_local_unresolved, temp_local_proof_ready) = if default_iife_return_idents.is_empty() {
-        (HashSet::new(), false)
+        (HashSet::default(), false)
     } else {
         let parsed_export_call_spans = collect_parsed_export_call_spans(
             transformed_stmts,
@@ -508,15 +536,29 @@ fn emit_system_module(
         body: items,
         shebang: None,
     };
-    emit_module(&module, filename, cm).ok()
+    let MappedCode { code, points } = emit_module(&module, filename, cm, positions).ok()?;
+    Some(EmittedRegister {
+        code,
+        points,
+        verbatim_source_offset: None,
+    })
 }
 
-fn original_register_code(register: &SystemRegister, cm: &SourceMap) -> Option<String> {
+struct EmittedRegister {
+    code: String,
+    points: Vec<GeneratedSourceMapPoint>,
+    verbatim_source_offset: Option<u32>,
+}
+
+fn original_register_code(register: &SystemRegister, cm: &SourceMap) -> Option<EmittedRegister> {
     let (start, end) = span_byte_range(cm, register.span)?;
     let file = cm.lookup_byte_offset(register.span.lo).sf;
-    file.src
-        .get(start as usize..end as usize)
-        .map(str::to_string)
+    let code = file.src.get(start as usize..end as usize)?.to_string();
+    Some(EmittedRegister {
+        code,
+        points: Vec::new(),
+        verbatim_source_offset: Some(start),
+    })
 }
 
 struct RegisterDescriptor {
@@ -679,7 +721,7 @@ fn analyze_unresolved_names(
 
         let mut collector = UnresolvedNameCollector {
             unresolved_ctxt: SyntaxContext::empty().apply_mark(unresolved_mark),
-            names: HashSet::new(),
+            names: HashSet::default(),
             has_direct_eval: false,
             skip_export_call_spans: skip_export_call_spans.clone(),
         };
@@ -785,7 +827,7 @@ fn collect_export_call_spans(declare: &Function, export_sym: &Atom) -> HashSet<S
         let mut collector = ExportCallSpanCollector {
             export_sym,
             export_ctxt,
-            spans: HashSet::new(),
+            spans: HashSet::default(),
         };
         probe.visit_with(&mut collector);
         collector.spans
@@ -827,7 +869,7 @@ fn collect_export_name_usage(
     let mut collector = ExportNameUseCollector {
         export_sym,
         export_call_spans,
-        uses: HashMap::new(),
+        uses: HashMap::default(),
         order: Vec::new(),
     };
     for stmt in stmts {
@@ -902,7 +944,7 @@ fn collect_member_export_binding_names(
     let mut collector = MemberExportBindingNameCollector {
         export_sym,
         export_call_spans,
-        names: HashSet::new(),
+        names: HashSet::default(),
     };
     for stmt in stmts {
         stmt.visit_with(&mut collector);
@@ -954,7 +996,7 @@ fn collect_default_iife_member_return_idents(
     let mut collector = DefaultIifeMemberReturnCollector {
         export_sym,
         export_call_spans,
-        names: HashSet::new(),
+        names: HashSet::default(),
     };
     for stmt in stmts {
         stmt.visit_with(&mut collector);
@@ -973,7 +1015,7 @@ fn collect_parsed_export_call_spans(
     let mut collector = ParsedExportCallSpanCollector {
         export_sym,
         export_call_spans,
-        parsed: HashSet::new(),
+        parsed: HashSet::default(),
     };
     for stmt in stmts {
         stmt.visit_with(&mut collector);
@@ -1666,15 +1708,15 @@ impl SystemExecuteTransformer {
             export_sym,
             context_sym,
             exports: Vec::new(),
-            declared_exports: HashSet::new(),
+            declared_exports: HashSet::default(),
             used_names,
             module_bound_names,
             unresolved_names,
             has_direct_eval,
             export_call_spans,
-            temp_local_unresolved: HashSet::new(),
+            temp_local_unresolved: HashSet::default(),
             temp_local_proof_ready: false,
-            mutable_export_bindings: HashMap::new(),
+            mutable_export_bindings: HashMap::default(),
             pending_expr_export_decls: Vec::new(),
             unlowerable_export: false,
             leftover_export_call: false,
@@ -1864,6 +1906,11 @@ impl SystemExecuteTransformer {
             Expr::Seq(seq) => {
                 let mut items = Vec::new();
                 let mut saw_export = false;
+                // Fused `(n = _export("Name", v)).prop =` and `v = y = _export(...)`
+                // are not Call / `ident = _export()` / `_export().prop =`.
+                // visit_mut still rewrites the call and queues `export let`;
+                // dropping these items used to leave a bare assign.
+                let mut kept_pending = false;
                 for expr in &seq.exprs {
                     let export_items = match strip_paren_expr(expr) {
                         Expr::Call(call) => self.take_parsed_export_call(call),
@@ -1872,9 +1919,9 @@ impl SystemExecuteTransformer {
                             .or_else(|| self.take_ident_assign_export(assign)),
                         _ => None,
                     };
-                    if let Some(export_items) = export_items {
-                        items.extend(export_items);
+                    let mut operand_items = if let Some(export_items) = export_items {
                         saw_export = true;
+                        export_items
                     } else {
                         let mut stmt = Stmt::Expr(ExprStmt {
                             span: DUMMY_SP,
@@ -1882,11 +1929,19 @@ impl SystemExecuteTransformer {
                         });
                         stmt.visit_mut_with(self);
                         parenthesize_lifted_stmt_expr(&mut stmt);
-                        items.extend(self.take_pending_expr_export_decls());
-                        items.push(ModuleItem::Stmt(stmt));
+                        vec![ModuleItem::Stmt(stmt)]
+                    };
+                    // A recognized outer export can contain an expression-position
+                    // export. Its declaration must precede the outer item's write,
+                    // not wait for the next unrecognized sequence operand.
+                    let pending = self.take_pending_expr_export_decls();
+                    if !pending.is_empty() {
+                        kept_pending = true;
                     }
+                    items.extend(pending);
+                    items.append(&mut operand_items);
                 }
-                saw_export.then_some(items)
+                (saw_export || kept_pending).then_some(items)
             }
             _ => None,
         }
@@ -3258,27 +3313,27 @@ fn is_valid_ident_name(name: &str) -> bool {
         && chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
 }
 
-fn emit_module(module: &Module, filename: String, cm: Lrc<SourceMap>) -> anyhow::Result<String> {
+fn emit_module(
+    module: &Module,
+    filename: String,
+    cm: Lrc<SourceMap>,
+    positions: SourcePositions,
+) -> anyhow::Result<MappedCode> {
     let _fm = cm.new_source_file(
         swc_core::common::FileName::Custom(filename).into(),
         String::new(),
     );
-    let mut output = Vec::new();
-    {
-        let mut emitter = Emitter {
-            cfg: Config::default()
-                .with_minify(false)
-                .with_target(EsVersion::EsNext),
-            cm: cm.clone(),
-            comments: None,
-            wr: JsWriter::new(cm.clone(), "\n", &mut output, None),
-        };
-        emitter.emit_module(module)?;
-    }
-    String::from_utf8(output).map_err(|e| anyhow::anyhow!("{e}"))
+    let cfg = Config::default()
+        .with_minify(false)
+        .with_target(EsVersion::EsNext);
+    emit_module_with_positions(module, cm, cfg, positions)
 }
 
-fn emit_expr_module(expr: &Expr, cm: Lrc<SourceMap>) -> anyhow::Result<String> {
+fn emit_expr_module(
+    expr: &Expr,
+    cm: Lrc<SourceMap>,
+    positions: SourcePositions,
+) -> anyhow::Result<MappedCode> {
     let module = Module {
         span: DUMMY_SP,
         body: vec![ModuleItem::Stmt(Stmt::Expr(ExprStmt {
@@ -3287,7 +3342,12 @@ fn emit_expr_module(expr: &Expr, cm: Lrc<SourceMap>) -> anyhow::Result<String> {
         }))],
         shebang: None,
     };
-    emit_module(&module, "systemjs-inner-bundle.js".to_string(), cm)
+    emit_module(
+        &module,
+        "systemjs-inner-bundle.js".to_string(),
+        cm,
+        positions,
+    )
 }
 
 #[cfg(test)]
@@ -3297,7 +3357,8 @@ mod tests {
     fn unpack(source: &str) -> UnpackResult {
         let cm: Lrc<SourceMap> = Default::default();
         let module = crate::unpacker::parse_es_module(source, "system.js", cm.clone()).unwrap();
-        detect_from_module(&module, cm).expect("should detect System.register")
+        detect_from_module(&module, cm, crate::unpacker::SourcePositions::Discard)
+            .expect("should detect System.register")
     }
 
     #[test]

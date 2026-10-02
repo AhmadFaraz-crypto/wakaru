@@ -1277,3 +1277,225 @@ fn inlined_esmodule_marker_is_dropped_from_entry() {
         "the inlined esModule marker must be dropped, got:\n{entry}"
     );
 }
+
+fn bundle_with_startup(startup: &str) -> String {
+    format!(
+        r#"
+        (() => {{
+            var modules = {{ 1: (module) => {{ module.exports = 42; }} }}, cache = {{}};
+            function requireModule(id) {{
+                var cached = cache[id];
+                if (cached !== undefined) return cached.exports;
+                var module = cache[id] = {{ exports: {{}} }};
+                modules[id](module, module.exports, requireModule);
+                return module.exports;
+            }}
+            {startup}
+        }})();
+    "#
+    )
+}
+
+#[test]
+fn trailing_user_iife_retains_preceding_entry_statements() {
+    use wakaru_core::driver::test_support::unpack_raw;
+    for prefix in [
+        "const dependency = requireModule(1);",
+        "recordStartup(); const dependency = requireModule(1);",
+        "const app = {}; const dependency = requireModule(1); app.value = dependency;",
+        "requireModule.o = (object, key) => key in object, recordStartup(); const dependency = requireModule(1);",
+    ] {
+        let source = bundle_with_startup(&format!("{prefix} (() => {{ consume(dependency); }})();"));
+        let raw = unpack_raw(&source, &DecompileOptions::default()).expect("webpack bundle should unpack");
+        let entry = entry_of(&raw.modules);
+        assert!(entry.contains("dependency = require(\"./module-1.js\")"), "{entry}");
+        if prefix.contains("recordStartup") { assert!(entry.contains("recordStartup()"), "{entry}"); }
+        if prefix.contains("app") { assert!(entry.contains("app.value"), "{entry}"); }
+        let pairs = expect_unpack(&source, "bundle.js");
+        assert!(entry_of(&pairs).contains("./module-1.js"), "{}", entry_of(&pairs));
+        assert_eq!(validate_output_modules(&pairs), vec![]);
+    }
+}
+
+#[test]
+fn trailing_async_iife_keeps_its_promise_boundary_without_a_prefix() {
+    use wakaru_core::driver::test_support::unpack_raw;
+    for call in [
+        "!async function () { await consume(requireModule(1)); }();",
+        "(async () => { await consume(requireModule(1)); })();",
+    ] {
+        let source = bundle_with_startup(call);
+        let raw = unpack_raw(&source, &DecompileOptions::default())
+            .expect("webpack bundle should unpack");
+        let entry = entry_of(&raw.modules);
+        assert!(
+            entry.contains("async"),
+            "async IIFE must not become TLA: {entry}"
+        );
+        let pairs = expect_unpack(&source, "bundle.js");
+        assert!(entry_of(&pairs).contains("async"), "{}", entry_of(&pairs));
+        assert_eq!(validate_output_modules(&pairs), vec![]);
+    }
+}
+
+#[test]
+fn trailing_generator_iife_keeps_its_dormant_body() {
+    use wakaru_core::driver::test_support::unpack_raw;
+    let source = bundle_with_startup("(function* () { consume(requireModule(1)); })();");
+    let raw =
+        unpack_raw(&source, &DecompileOptions::default()).expect("webpack bundle should unpack");
+    let entry = entry_of(&raw.modules);
+    assert!(
+        entry.contains("function*"),
+        "generator call must not execute its body: {entry}"
+    );
+}
+
+#[test]
+fn trailing_parameterized_iife_keeps_its_arguments() {
+    use wakaru_core::driver::test_support::unpack_raw;
+    let source = bundle_with_startup("((value) => { consume(value); })(requireModule(1));");
+    let raw =
+        unpack_raw(&source, &DecompileOptions::default()).expect("webpack bundle should unpack");
+    let entry = entry_of(&raw.modules);
+    assert!(
+        entry.contains("require(\"./module-1.js\")"),
+        "call arguments must survive: {entry}"
+    );
+    let pairs = expect_unpack(&source, "bundle.js");
+    assert!(
+        entry_of(&pairs).contains("./module-1.js"),
+        "{}",
+        entry_of(&pairs)
+    );
+}
+
+#[test]
+fn trailing_iife_keeps_default_parameters_and_function_self_binding() {
+    use wakaru_core::driver::test_support::unpack_raw;
+    for call in [
+        "((value = requireModule(1)) => { consume(value); })();",
+        "!function entry() { consume(entry, requireModule(1)); }();",
+    ] {
+        let source = bundle_with_startup(call);
+        let raw = unpack_raw(&source, &DecompileOptions::default())
+            .expect("webpack bundle should unpack");
+        let entry = entry_of(&raw.modules);
+        assert!(entry.contains("require(\"./module-1.js\")"), "{entry}");
+        if call.contains("function entry") {
+            assert!(
+                entry.contains("function entry"),
+                "self binding must survive: {entry}"
+            );
+        } else {
+            assert!(
+                entry.contains("value ="),
+                "default initializer must survive: {entry}"
+            );
+        }
+    }
+}
+
+#[test]
+fn async_bootstrap_is_not_unwrapped_into_module_evaluation() {
+    use wakaru_core::driver::test_support::unpack_raw;
+    let source = bundle_with_startup("await consume(requireModule(1));").replacen(
+        "(() => {",
+        "(async () => {",
+        1,
+    );
+    let raw =
+        unpack_raw(&source, &DecompileOptions::default()).expect("raw fallback should succeed");
+    assert_eq!(
+        raw.modules.len(),
+        1,
+        "async bootstrap must retain the original boundary"
+    );
+    assert!(raw.modules[0].1.contains("async"));
+}
+
+#[test]
+fn trailing_iife_unwraps_after_unused_empty_anchor_regardless_of_name() {
+    use wakaru_core::driver::test_support::unpack_raw;
+    for name in ["__webpack_exports__", "r"] {
+        let source = bundle_with_startup(&format!(
+            "var {name} = {{}}; (() => {{ consume(requireModule(1)); }})();"
+        ));
+        let raw = unpack_raw(&source, &DecompileOptions::default()).unwrap();
+        let normal = expect_unpack(&source, "bundle.js");
+        for entry in [entry_of(&raw.modules), entry_of(&normal)] {
+            assert!(entry.contains("./module-1.js"), "{entry}");
+            assert!(
+                !entry.contains("=>"),
+                "dead anchor must not prevent unwrapping: {entry}"
+            );
+        }
+    }
+}
+
+#[test]
+fn trailing_iife_preserves_anchor_used_as_an_application_object() {
+    use wakaru_core::driver::test_support::unpack_raw;
+    for name in ["app", "r", "__webpack_exports__"] {
+        let source = bundle_with_startup(&format!(
+            "var {name} = {{}}; (() => {{ {name}.value = requireModule(1); consume({name}); }})();"
+        ));
+        let raw = unpack_raw(&source, &DecompileOptions::default()).unwrap();
+        let normal = expect_unpack(&source, "bundle.js");
+        for entry in [entry_of(&raw.modules), entry_of(&normal)] {
+            assert!(
+                entry.contains(&format!("{name} = {{}}")),
+                "live anchor must survive: {entry}"
+            );
+            assert!(entry.contains("./module-1.js"), "{entry}");
+        }
+    }
+}
+
+#[test]
+fn trailing_async_iife_keeps_boundary_after_unused_mangled_anchor() {
+    use wakaru_core::driver::test_support::unpack_raw;
+    let source =
+        bundle_with_startup("var r = {}; (async () => { await consume(requireModule(1)); })();");
+    let raw = unpack_raw(&source, &DecompileOptions::default()).unwrap();
+    let normal = expect_unpack(&source, "bundle.js");
+    for entry in [entry_of(&raw.modules), entry_of(&normal)] {
+        assert!(entry.contains("async"), "{entry}");
+    }
+}
+
+#[test]
+fn trailing_iife_export_anchor_requires_exclusive_helper_uses() {
+    use wakaru_core::driver::test_support::unpack_raw;
+    for extra in [
+        "",
+        "consume(__webpack_exports__);",
+        "consume(() => __webpack_exports__);",
+    ] {
+        let source = bundle_with_startup(&format!(
+            r#"
+            requireModule.r = (object) => Object.defineProperty(object, "__esModule", {{ value: true }});
+            requireModule.d = (object, defs) => {{ for (var key in defs) Object.defineProperty(object, key, {{ enumerable: true, get: defs[key] }}); }};
+            var __webpack_exports__ = {{}};
+            (() => {{
+                requireModule.r(__webpack_exports__);
+                requireModule.d(__webpack_exports__, {{ value: () => value }});
+                var value = requireModule(1);
+                {extra}
+            }})();
+        "#
+        ));
+        let raw = unpack_raw(&source, &DecompileOptions::default()).unwrap();
+        let normal = expect_unpack(&source, "bundle.js");
+        if extra.is_empty() {
+            assert!(entry_of(&raw.modules).contains("exports"));
+            assert!(entry_of(&normal).contains("export"));
+            assert!(!entry_of(&normal).contains("__webpack_exports__"));
+        } else {
+            for entry in [entry_of(&raw.modules), entry_of(&normal)] {
+                assert!(entry.contains("__webpack_exports__ = {}"), "{entry}");
+                assert!(!entry.contains("consume(exports)"), "{entry}");
+            }
+        }
+    }
+}

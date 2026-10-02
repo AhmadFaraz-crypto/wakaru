@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::common::util::take::Take;
 use swc_core::common::{Mark, DUMMY_SP};

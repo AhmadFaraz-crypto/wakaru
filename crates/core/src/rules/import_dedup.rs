@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::{Atom, Wtf8Atom};
 use swc_core::common::SyntaxContext;
@@ -50,7 +50,7 @@ fn import_request_key(import: &ImportDecl) -> Option<ImportRequestKey> {
     let with = match &import.with {
         Some(attributes) => {
             let attributes = attributes.as_import_with()?;
-            let mut seen_keys = HashSet::new();
+            let mut seen_keys = HashSet::default();
             let mut normalized = Vec::with_capacity(attributes.values.len());
             for item in attributes.values {
                 if !seen_keys.insert(item.key.sym.clone()) {
@@ -58,6 +58,9 @@ fn import_request_key(import: &ImportDecl) -> Option<ImportRequestKey> {
                 }
                 normalized.push((item.key.sym, item.value.value));
             }
+            // Attribute order is not part of the request identity:
+            // `with { a, b }` and `with { b, a }` name the same module.
+            normalized.sort_by(|(left, _), (right, _)| left.cmp(right));
             Some(normalized)
         }
         None => None,
@@ -111,10 +114,10 @@ fn dedup_imports(module: &mut Module) {
 
     // (module request, ImportKey) → canonical local (sym, ctxt)
     let mut canonical: HashMap<(ImportRequestKey, ImportKey), (Atom, SyntaxContext)> =
-        HashMap::new();
+        HashMap::default();
     let mut renames: Vec<BindingRename> = Vec::new();
     // Set of (module item index, specifier index) for duplicate specifiers.
-    let mut to_remove: HashSet<(usize, usize)> = HashSet::new();
+    let mut to_remove: HashSet<(usize, usize)> = HashSet::default();
 
     for (item_index, item) in module.body.iter().enumerate() {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
@@ -198,8 +201,8 @@ fn dedup_imports(module: &mut Module) {
 /// Namespace imports (`import * as ns`) are kept as separate statements since they
 /// cannot be combined with named/default specifiers.
 fn merge_imports(module: &mut Module) {
-    let mut first_import: HashMap<ImportRequestKey, usize> = HashMap::new();
-    let mut merged_indices: HashSet<usize> = HashSet::new();
+    let mut first_import: HashMap<ImportRequestKey, usize> = HashMap::default();
+    let mut merged_indices: HashSet<usize> = HashSet::default();
 
     let import_indices: Vec<usize> = module
         .body

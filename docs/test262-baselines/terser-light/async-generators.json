@@ -39,8 +39,8 @@
     "runnable": 2963,
     "skipped": 0,
     "unsupported": 44,
-    "rejected": 14,
-    "passed": 2905,
+    "rejected": 7,
+    "passed": 2912,
     "failed": 0
   },
   "outcomes": [
@@ -309,14 +309,6 @@
       "summary": "Error: wakaru exited 1\nError: failed to parse <stdin>: Error { error: (76..81, TS1109) }; <stdin>:1:5: InvalidIdentInStrict(\"yield\")"
     },
     {
-      "path": "test/language/statements/for-await-of/async-func-decl-dstr-array-elem-trlg-iter-elision-iter-nrml-close-null.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "aa08e5a99f59af25a71616797864230a678524d73f69f41305c4d505b4a0dd5e",
-      "summary": "Error: sloppy: expected success, got runtime Error: Test262Error: Expected SameValue(«1», «2») to be true"
-    },
-    {
       "path": "test/language/statements/for-await-of/async-func-decl-dstr-array-rest-nested-array-yield-ident-valid.js",
       "variant": "case",
       "status": "unsupported",
@@ -379,54 +371,6 @@
       "kind": "sloppy-only-strict-ident",
       "fingerprint": "d1fce056e0e506c8a82a4bb72e7d61441401c793138fc0b3051e3cf503463a4b",
       "summary": "Error: wakaru exited 1\nError: failed to parse <stdin>: Error { error: (80..85, TS1109) }; <stdin>:1:5: InvalidIdentInStrict(\"yield\")"
-    },
-    {
-      "path": "test/language/statements/for-await-of/async-gen-decl-dstr-array-elem-trlg-iter-elision-iter-nrml-close-err.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "433b0c57faae4f0499c8fe63d5143a4c6d9bf14201bdc51b9ccb621853e52229",
-      "summary": "Error: sloppy: expected success, got runtime Error: Test262Error: Expected SameValue(«1», «2») to be true"
-    },
-    {
-      "path": "test/language/statements/for-await-of/async-gen-decl-dstr-array-elem-trlg-iter-elision-iter-nrml-close-null.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "7c517c25bc9c8a7beea5579364be32abb541b58bed5db6330cd1068964e91e2f",
-      "summary": "Error: sloppy: expected success, got runtime Error: Test262Error: Expected SameValue(«1», «2») to be true"
-    },
-    {
-      "path": "test/language/statements/for-await-of/async-gen-decl-dstr-array-elem-trlg-iter-elision-iter-nrml-close-skip.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "5a039e379f6028b067f72addd754f89bf752765c6d7a576a873ec8ef4b0ef7cb",
-      "summary": "Error: sloppy: expected success, got runtime Error: TypeError: Iterator result undefined is not an object"
-    },
-    {
-      "path": "test/language/statements/for-await-of/async-gen-decl-dstr-array-elem-trlg-iter-elision-iter-nrml-close.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "f0ca9095123f30146d2dbcd973b22291ea82c4562053ef52c9762d09d3e92921",
-      "summary": "Error: sloppy: expected success, got runtime Error: Test262Error: Expected SameValue(«1», «2») to be true"
-    },
-    {
-      "path": "test/language/statements/for-await-of/async-gen-decl-dstr-array-elision-iter-nrml-close-skip.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "57566e4a181df6af83c98e3e7539e5ac63a06ed8c113331505369c879dcde703",
-      "summary": "Error: sloppy: expected success, got runtime Error: Test262Error: Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "test/language/statements/for-await-of/async-gen-decl-dstr-array-elision-iter-nrml-close.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "ad25e5ac304e51e046147b2547541366bc02d27a4431f1480e57c277daf1c72d",
-      "summary": "Error: sloppy: expected success, got runtime Error: Test262Error: Expected SameValue(«0», «1») to be true"
     },
     {
       "path": "test/language/statements/for-await-of/let-block-with-newline.js",

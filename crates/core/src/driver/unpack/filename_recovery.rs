@@ -19,7 +19,7 @@
 //! system, numeric rewrites, and namespace decomposition all keep operating on
 //! provisional filenames; only the last step before emit swaps names.
 
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::common::Mark;
 use swc_core::ecma::ast::{
@@ -119,7 +119,7 @@ pub(super) fn build_rename_map(
     reserved_paths: &HashSet<String>,
 ) -> HashMap<String, String> {
     let provisional: HashSet<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
-    let mut target_count: HashMap<String, usize> = HashMap::new();
+    let mut target_count: HashMap<String, usize> = HashMap::default();
     let mut candidates: Vec<(String, String)> = Vec::new();
     for (provisional_name, suggested) in entries {
         if reserved_paths
@@ -148,7 +148,7 @@ pub(super) fn build_rename_map(
         candidates.push((provisional_name.clone(), recovered));
     }
 
-    let mut map = HashMap::new();
+    let mut map = HashMap::default();
     for (provisional_name, recovered) in candidates {
         if target_count.get(&recovered).copied().unwrap_or(0) > 1 {
             continue;
@@ -372,7 +372,7 @@ mod tests {
             ("a.js".to_string(), Some("Widget.jsx".to_string())),
             ("b.js".to_string(), None),
         ];
-        let map = build_rename_map(&entries, &HashSet::new());
+        let map = build_rename_map(&entries, &HashSet::default());
         assert_eq!(map.get("a.js").map(String::as_str), Some("Widget.jsx"));
         assert_eq!(map.len(), 1);
     }
@@ -389,7 +389,7 @@ mod tests {
                 Some("Widget.jsx".to_string()),
             ),
         ];
-        let reserved = HashSet::from(["index-<hash>.js".to_string()]);
+        let reserved = HashSet::from_iter(["index-<hash>.js".to_string()]);
         let map = build_rename_map(&entries, &reserved);
 
         assert!(!map.contains_key("index-<hash>.js"));
@@ -406,7 +406,7 @@ mod tests {
             ("b.js".to_string(), Some("Shared.jsx".to_string())),
         ];
         assert!(
-            build_rename_map(&entries, &HashSet::new()).is_empty(),
+            build_rename_map(&entries, &HashSet::default()).is_empty(),
             "ambiguous recovered names should be dropped to keep references unambiguous"
         );
     }
@@ -418,19 +418,19 @@ mod tests {
             ("a.js".to_string(), Some("b.js".to_string())),
             ("b.js".to_string(), None),
         ];
-        assert!(build_rename_map(&entries, &HashSet::new()).is_empty());
+        assert!(build_rename_map(&entries, &HashSet::default()).is_empty());
     }
 
     #[test]
     fn rename_map_skips_unsafe_recovered_paths() {
         let entries = vec![("a.js".to_string(), Some("../escape.js".to_string()))];
-        assert!(build_rename_map(&entries, &HashSet::new()).is_empty());
+        assert!(build_rename_map(&entries, &HashSet::default()).is_empty());
     }
 
     #[test]
     fn rename_map_skips_noop_recovery() {
         let entries = vec![("a.js".to_string(), Some("a.js".to_string()))];
-        assert!(build_rename_map(&entries, &HashSet::new()).is_empty());
+        assert!(build_rename_map(&entries, &HashSet::default()).is_empty());
     }
 
     #[test]
@@ -458,7 +458,7 @@ mod tests {
             let unresolved_mark = Mark::new();
             let top_level_mark = Mark::new();
             module.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, false));
-            let rename_map = HashMap::from([("a.js".to_string(), "Widget.jsx".to_string())]);
+            let rename_map = HashMap::from_iter([("a.js".to_string(), "Widget.jsx".to_string())]);
             rewrite_import_sources(&mut module, "consumer.js", &rename_map, unresolved_mark);
             print_js(&module, cm).expect("module should print")
         })
@@ -509,7 +509,7 @@ import { internal } from "./chunk_internal.js";
             let unresolved_mark = Mark::new();
             let top_level_mark = Mark::new();
             module.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, false));
-            let rename_map = HashMap::from([
+            let rename_map = HashMap::from_iter([
                 (
                     "chunk_feature.js".to_string(),
                     "assets/index/chunk_feature.js".to_string(),

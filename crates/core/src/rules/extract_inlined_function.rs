@@ -1,5 +1,5 @@
+use crate::collections::{HashMap, HashSet};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use swc_core::atoms::Atom;
@@ -12,6 +12,7 @@ use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use crate::js_names::to_valid_identifier_name;
 
+use super::decl_utils::fresh_binding_ident;
 use super::eval_utils::is_direct_eval_call;
 use super::rename_utils::BindingId;
 use super::RewriteLevel;
@@ -193,7 +194,7 @@ fn extract_iife(expr: &Expr, target_name: &str, names: &mut HashSet<Atom>) -> Op
     let helper_name = fresh_helper_name(target_name, names);
     names.insert(helper_name.clone());
 
-    let helper_ident = Ident::new_no_ctxt(helper_name, DUMMY_SP);
+    let helper_ident = fresh_binding_ident(helper_name, DUMMY_SP);
     let binding_id = (helper_ident.sym.clone(), helper_ident.ctxt);
     let helper_expr = function.into_expr();
     let helper_stmt = const_decl_stmt(helper_ident.clone(), helper_expr);

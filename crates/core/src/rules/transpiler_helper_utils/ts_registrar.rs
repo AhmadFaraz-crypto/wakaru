@@ -7,7 +7,7 @@
 //! prove that a binding is such a registrar so `facts::collect_module_facts`
 //! can attribute registered helper exports.
 
-use std::collections::HashSet;
+use crate::collections::HashSet;
 
 use swc_core::ecma::ast::{
     ArrowExpr, ArrowFunctionBody, AssignExpr, AssignOp, AssignTarget, Callee, Expr, Function,
@@ -66,7 +66,7 @@ pub(crate) fn collect_ts_helper_export_registrars(module: &Module) -> HashSet<Bi
     }
 
     let mut collector = RegistrarCollector {
-        registrars: HashSet::new(),
+        registrars: HashSet::default(),
     };
     module.visit_with(&mut collector);
     collector.registrars
@@ -131,13 +131,13 @@ fn callback_registrars_from_callable_call(
     call: &swc_core::ecma::ast::CallExpr,
 ) -> HashSet<BindingKey> {
     let Callee::Expr(callee) = &call.callee else {
-        return HashSet::new();
+        return HashSet::default();
     };
     let Some(params) = callable_param_keys(strip_parens(callee.as_ref())) else {
-        return HashSet::new();
+        return HashSet::default();
     };
 
-    let mut registrars = HashSet::new();
+    let mut registrars = HashSet::default();
     for (index, arg) in call.args.iter().enumerate() {
         if arg.spread.is_some() {
             continue;
@@ -244,7 +244,7 @@ fn expr_passes_registrar_to_param(expr: &Expr, param: &BindingKey) -> bool {
     let Expr::Call(call) = strip_parens(expr) else {
         return false;
     };
-    call_passes_registrar_to_param(call, param, &HashSet::new())
+    call_passes_registrar_to_param(call, param, &HashSet::default())
 }
 
 fn call_passes_registrar_to_param(
@@ -339,7 +339,7 @@ fn collect_ts_helper_export_registrar_factories(stmts: &[Stmt]) -> HashSet<Bindi
     }
 
     let mut collector = FactoryCollector {
-        factories: HashSet::new(),
+        factories: HashSet::default(),
     };
     stmts.visit_with(&mut collector);
     collector.factories

@@ -33,8 +33,8 @@
     "runnable": 1034,
     "skipped": 0,
     "unsupported": 28,
-    "rejected": 54,
-    "passed": 952,
+    "rejected": 36,
+    "passed": 970,
     "failed": 0
   },
   "outcomes": [
@@ -69,78 +69,6 @@
       "kind": "sloppy-only-strict-ident",
       "fingerprint": "3b5b66a086b0b5dcafd23d55631b563bf6c8e50ec3fb05f63a853cb17f95a8f6",
       "summary": "Error: wakaru exited 1\nError: failed to parse <stdin>: Error { error: (62..67, TS1109) }; <stdin>:1:5: InvalidIdentInStrict(\"yield\")"
-    },
-    {
-      "path": "test/language/expressions/assignment/dstr/array-elem-trlg-iter-elision-iter-abpt.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "46e8fd01a169b9b77d6f7dae519fab67fbaaebf47720b38f73209b9ef372fc06",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected a Test262Error but got a TypeError"
-    },
-    {
-      "path": "test/language/expressions/assignment/dstr/array-elem-trlg-iter-elision-iter-nrml-close-err.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "f48a5264a8fafb4ed5ae5666ef5178d4968ddc39a1ba5206968d8b9b907d074b",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«1», «2») to be true"
-    },
-    {
-      "path": "test/language/expressions/assignment/dstr/array-elem-trlg-iter-elision-iter-nrml-close-skip.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "c61b45ccebcbd008bebad1bb11623b3e57677e685ed5fa97e32e4768219c5c56",
-      "summary": "Error: sloppy: expected success, got runtime TypeError: Iterator result undefined is not an object"
-    },
-    {
-      "path": "test/language/expressions/assignment/dstr/array-elem-trlg-iter-elision-iter-nrml-close.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "2cd1bcaa6ae79f7df9a9c58edd7f6baf869e723a7f6076395bd8fd68e75b249a",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«1», «2») to be true"
-    },
-    {
-      "path": "test/language/expressions/assignment/dstr/array-elision-iter-abpt.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "fe045f7ae3f1d76d3db67a308e34670a164392a2af221a992390261c37a3f043",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected a Test262Error but got a TypeError"
-    },
-    {
-      "path": "test/language/expressions/assignment/dstr/array-elision-iter-nrml-close-err.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "e120050c3a82c15d59ecbf35f9200bd0c38fbc80e74e870d27102c4be7f8be2e",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "test/language/expressions/assignment/dstr/array-elision-iter-nrml-close-skip.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "75433a5e44936ea7c48d2ad9d2ef1bc1c2827370324a2edf6a40b8cbdc519fce",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "test/language/expressions/assignment/dstr/array-elision-iter-nrml-close.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "af4e6d40ad5b7d791e2542009fe4c4185cd08b527855140c4a347321d83b928c",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "test/language/expressions/assignment/dstr/array-iteration.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "02e86a1c84e311674c40e097908b59f33b8f873f0bf7ec1fb0c05108e94ff262",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«0», «2») to be true"
     },
     {
       "path": "test/language/expressions/assignment/dstr/array-rest-nested-array-yield-ident-valid.js",
@@ -533,78 +461,6 @@
       "kind": "sloppy-only-strict-ident",
       "fingerprint": "3595db12e4c80104139807d477c060364b8e4ffea75f7b153bdfee306d756b57",
       "summary": "Error: wakaru exited 1\nError: failed to parse <stdin>: Error { error: (48..53, TS1109) }; <stdin>:1:5: InvalidIdentInStrict(\"yield\")"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-elem-trlg-iter-elision-iter-abpt.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "ca46667d44efc16f3325f57dca78f4124643ae266bcbc32ad4ff15a3c921690e",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected a Test262Error but got a TypeError"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-elem-trlg-iter-elision-iter-nrml-close-err.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "c61f2a7fb9546364c409d826840744aba66bf1965f434ce1e17ec55ef06b50b5",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«1», «2») to be true"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-elem-trlg-iter-elision-iter-nrml-close-skip.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "6d0b3c6e0aee89b9712087def6b3dd4c9491f1acffe5319e9f297cd7e0250815",
-      "summary": "Error: sloppy: expected success, got runtime TypeError: Iterator result undefined is not an object"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-elem-trlg-iter-elision-iter-nrml-close.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "e70935d23f7c37c1481d2adf9842527303fa83b3023b1c097a67aa59e972745c",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«1», «2») to be true"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-elision-iter-abpt.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "b26f0b8018618012ccfe19367c80bacd46c09b4e26a23bade3c47537c4f57670",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected a Test262Error but got a TypeError"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-elision-iter-nrml-close-err.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "63760c0468afa73c8fc7d27275e1007abf9353626b8939d7a5abf969d0ba8070",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-elision-iter-nrml-close-skip.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "ff82154cde4a2067288fb97dbda0cc01995cfa360e05caebdde7cf87710e10d5",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-elision-iter-nrml-close.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "da8b880422ed1d406a4d7d737282f4aac4ba9e4b46b54217c68a05722b031e93",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "test/language/statements/for-of/dstr/array-iteration.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "d99ff353e3a9b011c89c4e323d3f5930942edcbbac0a74664c61cfcb5c6215ca",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«0», «2») to be true"
     },
     {
       "path": "test/language/statements/for-of/dstr/array-rest-nested-array-yield-ident-valid.js",

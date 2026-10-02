@@ -12,6 +12,7 @@ import {
 import { dirname, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { runNodeJsonArraySync } from "../lib/tool-process.mjs";
 import { ensureNodeTool } from "../lib/runner.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
@@ -365,10 +366,7 @@ function validateVueSfcFiles(files, outputDir) {
   }
 
   const toolDir = ensureNodeTool("vue-public-corpus-sfc-3.5.35", ["@vue/compiler-sfc@3.5.35"]);
-  const helper = join(toolDir, "validate-sfc.mjs");
-  writeFileSync(
-    helper,
-    `
+  const helperSource = `
 import fs from "node:fs";
 import { parse, compileTemplate } from "@vue/compiler-sfc";
 
@@ -414,15 +412,12 @@ const rows = files.map((file, index) => {
 });
 
 process.stdout.write(JSON.stringify(rows));
-`,
-  );
+`;
 
-  const result = runCapture("node", [helper], {
+  const rows = runNodeJsonArraySync(helperSource, files, {
     cwd: toolDir,
-    input: JSON.stringify(files),
     label: "validate recovered vue sfc",
   });
-  const rows = JSON.parse(result.stdout);
   return {
     total: rows.length,
     parse_ok: rows.filter((row) => row.parse_ok).length,

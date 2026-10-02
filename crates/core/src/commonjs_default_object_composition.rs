@@ -20,7 +20,7 @@
 //! surfaces, dynamic sources, and inexact consumer bodies therefore remain
 //! honest CommonJS residuals.
 
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::common::{Mark, Spanned, SyntaxContext, DUMMY_SP};
@@ -72,7 +72,7 @@ impl CommonJsDefaultObjectCompositionPlan {
             .collect::<Vec<_>>();
         pending.sort_by(|left, right| left.0.cmp(&right.0));
 
-        let mut sources_by_module = HashMap::new();
+        let mut sources_by_module = HashMap::default();
         loop {
             let newly_recoverable = pending
                 .iter()
@@ -133,7 +133,7 @@ pub(crate) fn run_commonjs_default_object_composition(
     module.visit_with(&mut names);
     let mut used_names = names.names;
     let target = fresh_ident("_defaultObject", &mut used_names);
-    let mut source_locals = HashMap::<Atom, Ident>::new();
+    let mut source_locals = HashMap::<Atom, Ident>::default();
     let mut imports = Vec::new();
     for source in expected_sources {
         if source_locals.contains_key(source) {

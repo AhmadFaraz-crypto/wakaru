@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::Atom;
 use swc_core::common::{
@@ -93,7 +93,7 @@ pub(super) fn detect_from_module_prepared(
     cm: Lrc<SourceMap>,
 ) -> Option<DetectedBundle> {
     let mut definitions = Vec::new();
-    let mut prefix_counts = HashMap::<String, usize>::new();
+    let mut prefix_counts = HashMap::<String, usize>::default();
 
     for item in &module.body {
         let Some(call) = expression_call(item) else {
@@ -139,7 +139,7 @@ pub(super) fn detect_from_module_prepared(
         .filter(|id| known_ids.contains(*id))
         .count();
 
-    let mut seen_ids = HashSet::new();
+    let mut seen_ids = HashSet::default();
     descriptors.retain(|descriptor| seen_ids.insert(descriptor.id.clone()));
 
     let filenames = assign_filenames(&descriptors, &entry_ids, entry_count);
@@ -161,6 +161,8 @@ pub(super) fn detect_from_module_prepared(
             inspection_context_ranges: Vec::new(),
             source_input: String::new(),
             generated_source_map: Vec::new(),
+            verbatim_source_offset: None,
+            mapped_in_every_mode: false,
         });
         prepared.push(Some(prepared_module));
     }
@@ -177,8 +179,8 @@ fn assign_filenames(
     entry_ids: &HashSet<MetroModuleId>,
     entry_count: usize,
 ) -> HashMap<MetroModuleId, String> {
-    let mut filenames = HashMap::with_capacity(descriptors.len());
-    let mut seen = HashSet::new();
+    let mut filenames = HashMap::with_capacity_and_hasher(descriptors.len(), Default::default());
+    let mut seen = HashSet::default();
 
     // Reserve canonical entry names before ordinary string IDs such as
     // `entry.js`, then make every remaining collision explicit and stable.
@@ -251,7 +253,7 @@ fn parse_module_definition(call: &CallExpr) -> Option<MetroModuleDescriptor<'_>>
     });
     let dependencies = match call.args.get(2) {
         Some(arg) => parse_dependency_map(&arg.expr)?,
-        None => HashMap::new(),
+        None => HashMap::default(),
     };
     Some(MetroModuleDescriptor {
         id,
@@ -331,7 +333,7 @@ fn parse_dependency_map(expr: &Expr) -> Option<HashMap<usize, Option<MetroModule
             })
             .collect(),
         Expr::Object(object) => {
-            let mut dependencies = HashMap::new();
+            let mut dependencies = HashMap::default();
             for prop in &object.props {
                 let PropOrSpread::Prop(prop) = prop else {
                     return None;
@@ -346,7 +348,7 @@ fn parse_dependency_map(expr: &Expr) -> Option<HashMap<usize, Option<MetroModule
             }
             Some(dependencies)
         }
-        Expr::Ident(ident) if ident.sym == *"undefined" => Some(HashMap::new()),
+        Expr::Ident(ident) if ident.sym == *"undefined" => Some(HashMap::default()),
         _ => None,
     }
 }

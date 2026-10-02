@@ -1,23 +1,26 @@
-use std::collections::{HashMap, HashSet};
+use crate::collections::{HashMap, HashSet};
 
 use swc_core::atoms::{Atom, Wtf8Atom};
+use swc_core::common::util::take::Take;
 use swc_core::common::{Mark, SyntaxContext, DUMMY_SP};
 use swc_core::ecma::ast::{
-    ArrowExpr, AssignExpr, AssignOp, BindingIdent, BlockStmt, Bool, CallExpr, Callee, Decl, Expr,
-    ExprOrSpread, FunctionBody, Ident, ImportDecl, ImportSpecifier, JSXAttr, JSXAttrName,
-    JSXAttrOrSpread, JSXAttrValue, JSXClosingElement, JSXClosingFragment, JSXElement,
-    JSXElementChild, JSXElementName, JSXExpr, JSXExprContainer, JSXFragment, JSXMemberExpr,
-    JSXNamespacedName, JSXObject, JSXOpeningElement, JSXOpeningFragment, JSXSpreadChild, JSXText,
-    KeyValueProp, Lit, MemberExpr, MemberProp, Module, ModuleDecl, ModuleExportName, ModuleItem,
-    NewExpr, Number, ObjectLit, OptCall, Param, Pat, Prop, PropName, PropOrSpread, SpreadElement,
-    Stmt, Str, TaggedTpl, VarDecl, VarDeclKind, VarDeclarator,
+    ArrowExpr, ArrowFunctionBody, AssignExpr, AssignOp, BindingIdent, BlockStmt, Bool, CallExpr,
+    Callee, Class, Decl, Expr, ExprOrSpread, Function, FunctionBody, Ident, ImportDecl,
+    ImportSpecifier, JSXAttr, JSXAttrName, JSXAttrOrSpread, JSXAttrValue, JSXClosingElement,
+    JSXClosingFragment, JSXElement, JSXElementChild, JSXElementName, JSXExpr, JSXExprContainer,
+    JSXFragment, JSXMemberExpr, JSXNamespacedName, JSXObject, JSXOpeningElement,
+    JSXOpeningFragment, JSXSpreadChild, JSXText, KeyValueProp, Lit, MemberExpr, MemberProp, Module,
+    ModuleDecl, ModuleExportName, ModuleItem, NewExpr, Number, ObjectLit, OptCall, Param, Pat,
+    Prop, PropName, PropOrSpread, ReturnStmt, SpreadElement, Stmt, Str, TaggedTpl, VarDecl,
+    VarDeclKind, VarDeclarator,
 };
+use swc_core::ecma::utils::find_pat_ids;
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use crate::analysis::binding_uses::BindingUseIndex;
 use crate::js_names::to_valid_identifier_name;
 
-use super::decl_utils::BindingId;
+use super::decl_utils::{fresh_binding_ident, BindingId};
 use super::rename_utils::{
     collect_exported_binding_ids_from_items, rename_bindings, starts_with_lowercase, BindingRename,
 };
@@ -43,6 +46,11 @@ pub struct UnJsx {
     unresolved_mark: Mark,
     level: RewriteLevel,
     pending_stmts: Vec<Vec<Stmt>>,
+    /// The function depth each `pending_stmts` frame was opened at. An alias
+    /// may only be hoisted into a frame of the current depth: a frame of an
+    /// enclosing function runs in a different scope and at a different time.
+    frame_depths: Vec<usize>,
+    function_depth: usize,
     used_names: Vec<HashSet<Atom>>,
     string_consts: Vec<HashMap<BindingId, Str>>,
     import_pragmas: HashMap<BindingId, &'static str>,
@@ -59,9 +67,11 @@ impl UnJsx {
             unresolved_mark,
             level,
             pending_stmts: Vec::new(),
+            frame_depths: Vec::new(),
+            function_depth: 0,
             used_names: Vec::new(),
             string_consts: Vec::new(),
-            import_pragmas: HashMap::new(),
+            import_pragmas: HashMap::default(),
             converted_classic_pragma: false,
         }
     }
@@ -143,9 +153,9 @@ impl UnJsx {
         let old = std::mem::take(items);
         let mut rewritten = Vec::with_capacity(old.len());
         for mut item in old {
-            self.pending_stmts.push(Vec::new());
+            self.push_pending_frame();
             item.visit_mut_with(self);
-            let pending = self.pending_stmts.pop().unwrap();
+            let pending = self.pop_pending_frame();
             rewritten.extend(pending.into_iter().map(ModuleItem::Stmt));
             rewritten.push(item);
         }
@@ -159,9 +169,13 @@ impl UnJsx {
         }
     }
 
-    fn process_stmts(&mut self, stmts: &mut Vec<Stmt>) {
-        let (renames, name_registry) =
-            collect_stmt_renames(stmts, self.unresolved_mark, &self.import_pragmas);
+    fn process_stmts(&mut self, stmts: &mut Vec<Stmt>, list_is_function_scope: bool) {
+        let (renames, name_registry) = collect_stmt_renames(
+            stmts,
+            self.unresolved_mark,
+            &self.import_pragmas,
+            list_is_function_scope,
+        );
         rename_bindings(stmts, &renames);
 
         self.used_names.push(name_registry);
@@ -171,9 +185,9 @@ impl UnJsx {
         let old = std::mem::take(stmts);
         let mut rewritten = Vec::with_capacity(old.len());
         for mut stmt in old {
-            self.pending_stmts.push(Vec::new());
+            self.push_pending_frame();
             stmt.visit_mut_with(self);
-            let pending = self.pending_stmts.pop().unwrap();
+            let pending = self.pop_pending_frame();
             rewritten.extend(pending);
             rewritten.push(stmt);
         }
@@ -201,7 +215,9 @@ impl UnJsx {
 
         let mut tag = self.to_jsx_element_name(type_expr);
         if let Some(inlined) = self.inline_const_string_tag(type_expr) {
-            tag = self.to_jsx_element_name(&Expr::Lit(Lit::Str(inlined)));
+            tag = self
+                .to_jsx_element_name(&Expr::Lit(Lit::Str(inlined)))
+                .or(tag);
         }
 
         if tag.is_none() {
@@ -214,8 +230,9 @@ impl UnJsx {
                 } else {
                     "Component"
                 };
-                let alias = self.create_component_alias(type_expr, base);
-                tag = Some(JSXElementName::Ident(alias));
+                tag = self
+                    .create_component_alias(type_expr, base)
+                    .map(JSXElementName::Ident);
             }
         }
 
@@ -308,9 +325,26 @@ impl UnJsx {
         None
     }
 
-    fn create_component_alias(&mut self, expr: &Expr, base: &str) -> Ident {
+    fn push_pending_frame(&mut self) {
+        self.pending_stmts.push(Vec::new());
+        self.frame_depths.push(self.function_depth);
+    }
+
+    fn pop_pending_frame(&mut self) -> Vec<Stmt> {
+        self.frame_depths.pop();
+        self.pending_stmts.pop().unwrap()
+    }
+
+    /// `None` when no statement list of the current function can take the
+    /// alias declaration: the expression sits in a parameter default, a class
+    /// field initializer, or another position outside any statement list of
+    /// its own function.
+    fn create_component_alias(&mut self, expr: &Expr, base: &str) -> Option<Ident> {
+        if self.frame_depths.last() != Some(&self.function_depth) {
+            return None;
+        }
         let name = self.generate_name(base.to_string());
-        let ident = Ident::new(name.clone().into(), DUMMY_SP, SyntaxContext::empty());
+        let ident = fresh_binding_ident(name.clone().into(), DUMMY_SP);
         if let Some(pending) = self.pending_stmts.last_mut() {
             pending.push(Stmt::Decl(Decl::Var(Box::new(VarDecl {
                 span: DUMMY_SP,
@@ -328,7 +362,7 @@ impl UnJsx {
                 }],
             }))));
         }
-        ident
+        Some(ident)
     }
 
     fn generate_name(&mut self, base: String) -> String {
@@ -353,7 +387,11 @@ impl UnJsx {
 
     fn to_jsx_element_name(&self, expr: &Expr) -> Option<JSXElementName> {
         match expr {
-            Expr::Lit(Lit::Str(s)) => jsx_name_from_string(s),
+            Expr::Lit(Lit::Str(s)) => jsx_name_from_string(s, self.unresolved_mark),
+            Expr::Tpl(_) => {
+                let value = no_substitution_template_str(expr)?;
+                jsx_name_from_string(&value, self.unresolved_mark)
+            }
             Expr::Ident(ident) => Some(JSXElementName::Ident(ident.clone())),
             Expr::Member(member) => self.member_expr_to_jsx_name(member),
             _ => None,
@@ -600,7 +638,7 @@ impl VisitMut for UnJsx {
             return;
         }
         if stmts_have_jsx_content(&block.stmts, &self.import_pragmas) {
-            self.process_stmts(&mut block.stmts);
+            self.process_stmts(&mut block.stmts, false);
         } else {
             block.visit_mut_children_with(self);
         }
@@ -614,10 +652,49 @@ impl VisitMut for UnJsx {
             return;
         }
         if stmts_have_jsx_content(&body.stmts, &self.import_pragmas) {
-            self.process_stmts(&mut body.stmts);
+            self.process_stmts(&mut body.stmts, true);
         } else {
             body.visit_mut_children_with(self);
         }
+    }
+
+    fn visit_mut_function(&mut self, function: &mut Function) {
+        self.function_depth += 1;
+        function.visit_mut_children_with(self);
+        self.function_depth -= 1;
+    }
+
+    fn visit_mut_class(&mut self, class: &mut Class) {
+        self.function_depth += 1;
+        class.visit_mut_children_with(self);
+        self.function_depth -= 1;
+    }
+
+    fn visit_mut_arrow_expr(&mut self, arrow: &mut ArrowExpr) {
+        self.function_depth += 1;
+        arrow.params.visit_mut_with(self);
+        match arrow.body.as_mut() {
+            ArrowFunctionBody::FunctionBody(body) => body.visit_mut_with(self),
+            ArrowFunctionBody::Expr(expr) => {
+                // An expression body has no statement list; open one for it
+                // and, if an alias lands there, turn the body into a block so
+                // the alias is evaluated on every call, in the arrow's scope.
+                self.push_pending_frame();
+                expr.visit_mut_with(self);
+                let mut stmts = self.pop_pending_frame();
+                if !stmts.is_empty() {
+                    stmts.push(Stmt::Return(ReturnStmt {
+                        span: DUMMY_SP,
+                        arg: Some(expr.take()),
+                    }));
+                    *arrow.body = ArrowFunctionBody::FunctionBody(FunctionBody {
+                        span: DUMMY_SP,
+                        stmts,
+                    });
+                }
+            }
+        }
+        self.function_depth -= 1;
     }
 
     fn visit_mut_member_expr(&mut self, member: &mut MemberExpr) {
@@ -800,11 +877,16 @@ impl Visit for ConstStringCollector {
             let Some(init) = &decl.init else {
                 continue;
             };
-            let Expr::Lit(Lit::Str(value)) = init.as_ref() else {
-                continue;
+            let value = match init.as_ref() {
+                Expr::Lit(Lit::Str(value)) => value.clone(),
+                Expr::Tpl(_) => match no_substitution_template_str(init) {
+                    Some(value) => value,
+                    None => continue,
+                },
+                _ => continue,
             };
             self.values
-                .insert((binding.id.sym.clone(), binding.id.ctxt), value.clone());
+                .insert((binding.id.sym.clone(), binding.id.ctxt), value);
         }
     }
 }
@@ -834,7 +916,7 @@ fn collect_string_consts_from_stmts(stmts: &[Stmt]) -> HashMap<BindingId, Str> {
 }
 
 fn collect_import_pragmas(items: &[ModuleItem]) -> HashMap<BindingId, &'static str> {
-    let mut map = HashMap::new();
+    let mut map = HashMap::default();
     for item in items {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item else {
             continue;
@@ -867,26 +949,169 @@ fn collect_import_pragmas(items: &[ModuleItem]) -> HashMap<BindingId, &'static s
     map
 }
 
-fn has_display_name_candidates<'a>(stmts: impl Iterator<Item = &'a Stmt>) -> bool {
-    stmts.into_iter().any(|stmt| {
-        let Stmt::Expr(expr_stmt) = stmt else {
-            return false;
-        };
-        let Expr::Assign(assign) = expr_stmt.expr.as_ref() else {
-            return false;
-        };
-        if assign.op != AssignOp::Assign {
-            return false;
+/// `x.displayName = "Name"` assignments that belong to a statement list's
+/// scope: direct statements plus those nested in `try`, `if`, loop, and
+/// labeled bodies. The scan stops at function and class boundaries because a
+/// binding named there is renamed when that body is processed.
+#[derive(Default)]
+struct DisplayNameAssignScan {
+    candidates: Vec<(Ident, Str)>,
+}
+
+impl Visit for DisplayNameAssignScan {
+    fn visit_function(&mut self, _: &swc_core::ecma::ast::Function) {}
+
+    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+
+    fn visit_class(&mut self, _: &swc_core::ecma::ast::Class) {}
+
+    fn visit_stmt(&mut self, stmt: &Stmt) {
+        if let Some(candidate) = display_name_assignment(stmt) {
+            self.candidates.push(candidate);
         }
-        let swc_core::ecma::ast::AssignTarget::Simple(
-            swc_core::ecma::ast::SimpleAssignTarget::Member(member),
-        ) = &assign.left
-        else {
-            return false;
-        };
-        matches!(&member.prop, MemberProp::Ident(prop) if prop.sym.as_ref() == "displayName")
-            && matches!(member.obj.as_ref(), Expr::Ident(obj) if obj.sym.len() <= 2)
-    })
+        stmt.visit_children_with(self);
+    }
+}
+
+fn display_name_assignment(stmt: &Stmt) -> Option<(Ident, Str)> {
+    let Stmt::Expr(expr_stmt) = stmt else {
+        return None;
+    };
+    let Expr::Assign(AssignExpr {
+        op: AssignOp::Assign,
+        left,
+        right,
+        ..
+    }) = expr_stmt.expr.as_ref()
+    else {
+        return None;
+    };
+    let swc_core::ecma::ast::AssignTarget::Simple(simple) = left else {
+        return None;
+    };
+    let swc_core::ecma::ast::SimpleAssignTarget::Member(member) = simple else {
+        return None;
+    };
+    let Expr::Ident(object) = member.obj.as_ref() else {
+        return None;
+    };
+    let MemberProp::Ident(prop) = &member.prop else {
+        return None;
+    };
+    if prop.sym != *"displayName" || object.sym.len() > 2 {
+        return None;
+    }
+    let Expr::Lit(Lit::Str(display_name)) = right.as_ref() else {
+        return None;
+    };
+    Some((object.clone(), display_name.clone()))
+}
+
+fn collect_display_name_candidates_in_module_items(items: &[ModuleItem]) -> Vec<(Ident, Str)> {
+    let mut scan = DisplayNameAssignScan::default();
+    items.visit_with(&mut scan);
+    scan.candidates
+}
+
+fn collect_display_name_candidates_in_stmts(stmts: &[Stmt]) -> Vec<(Ident, Str)> {
+    let mut scan = DisplayNameAssignScan::default();
+    stmts.visit_with(&mut scan);
+    scan.candidates
+}
+
+/// Bindings a statement list may rename without leaving a reference behind:
+/// every reference to them sits inside the list. Block-scoped declarations
+/// (`let`, `const`, `class`) qualify at any depth; `var`, function
+/// declarations, and parameters hoist to the nearest function, so at the
+/// list's own level they qualify only when the list is a function body or the
+/// module.
+struct RenamableBindingCollector {
+    ids: HashSet<BindingId>,
+    function_depth: usize,
+    list_is_function_scope: bool,
+}
+
+impl RenamableBindingCollector {
+    fn hoisted_bindings_stay_inside(&self) -> bool {
+        self.list_is_function_scope || self.function_depth > 0
+    }
+
+    fn add_pat(&mut self, pat: &Pat) {
+        let ids: Vec<BindingId> = find_pat_ids(pat);
+        self.ids.extend(ids);
+    }
+}
+
+impl Visit for RenamableBindingCollector {
+    fn visit_var_decl(&mut self, decl: &VarDecl) {
+        if decl.kind != VarDeclKind::Var || self.hoisted_bindings_stay_inside() {
+            for declarator in &decl.decls {
+                self.add_pat(&declarator.name);
+            }
+        }
+        decl.visit_children_with(self);
+    }
+
+    fn visit_fn_decl(&mut self, decl: &swc_core::ecma::ast::FnDecl) {
+        if self.hoisted_bindings_stay_inside() {
+            self.ids.insert((decl.ident.sym.clone(), decl.ident.ctxt));
+        }
+        decl.visit_children_with(self);
+    }
+
+    fn visit_class_decl(&mut self, decl: &swc_core::ecma::ast::ClassDecl) {
+        self.ids.insert((decl.ident.sym.clone(), decl.ident.ctxt));
+        decl.visit_children_with(self);
+    }
+
+    fn visit_import_decl(&mut self, decl: &ImportDecl) {
+        for specifier in &decl.specifiers {
+            let local = match specifier {
+                ImportSpecifier::Named(named) => &named.local,
+                ImportSpecifier::Default(default) => &default.local,
+                ImportSpecifier::Namespace(namespace) => &namespace.local,
+            };
+            self.ids.insert((local.sym.clone(), local.ctxt));
+        }
+    }
+
+    fn visit_catch_clause(&mut self, clause: &swc_core::ecma::ast::CatchClause) {
+        if let Some(param) = &clause.param {
+            self.add_pat(param);
+        }
+        clause.visit_children_with(self);
+    }
+
+    fn visit_function(&mut self, function: &swc_core::ecma::ast::Function) {
+        self.function_depth += 1;
+        for param in &function.params {
+            self.add_pat(&param.pat);
+        }
+        function.visit_children_with(self);
+        self.function_depth -= 1;
+    }
+
+    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+        self.function_depth += 1;
+        for param in &arrow.params {
+            self.add_pat(param);
+        }
+        arrow.visit_children_with(self);
+        self.function_depth -= 1;
+    }
+}
+
+fn collect_renamable_binding_ids(
+    stmts: &[Stmt],
+    list_is_function_scope: bool,
+) -> HashSet<BindingId> {
+    let mut collector = RenamableBindingCollector {
+        ids: HashSet::default(),
+        function_depth: 0,
+        list_is_function_scope,
+    };
+    stmts.visit_with(&mut collector);
+    collector.ids
 }
 
 fn has_lowercase_jsx_component_calls(
@@ -976,23 +1201,13 @@ fn collect_module_renames(
     unresolved_mark: Mark,
     import_pragmas: &HashMap<BindingId, &'static str>,
 ) -> (Vec<BindingRename>, HashSet<Atom>) {
-    let has_display = has_display_name_candidates(items.iter().filter_map(|i| {
-        if let ModuleItem::Stmt(s) = i {
-            Some(s)
-        } else {
-            None
-        }
-    }));
+    let display_candidates = collect_display_name_candidates_in_module_items(items);
     let has_lc = has_lowercase_jsx_component_calls(items, import_pragmas, unresolved_mark);
-    if !has_display && !has_lc {
+    if display_candidates.is_empty() && !has_lc {
         return (Vec::new(), collect_names_in_module_items(items));
     }
     let mut name_registry = collect_names_in_module_items(items);
-    let mut renames = if has_display {
-        collect_display_name_renames_from_module_items(items, &mut name_registry)
-    } else {
-        Vec::new()
-    };
+    let mut renames = display_name_renames(display_candidates, &mut name_registry);
     if has_lc {
         renames.extend(collect_lowercase_component_renames_from_module_items(
             items,
@@ -1010,18 +1225,15 @@ fn collect_stmt_renames(
     stmts: &[Stmt],
     unresolved_mark: Mark,
     import_pragmas: &HashMap<BindingId, &'static str>,
+    list_is_function_scope: bool,
 ) -> (Vec<BindingRename>, HashSet<Atom>) {
-    let has_display = has_display_name_candidates(stmts.iter());
+    let display_candidates = collect_display_name_candidates_in_stmts(stmts);
     let has_lc = has_lowercase_jsx_component_calls_stmts(stmts, import_pragmas, unresolved_mark);
-    if !has_display && !has_lc {
+    if display_candidates.is_empty() && !has_lc {
         return (Vec::new(), collect_names_in_stmts(stmts));
     }
     let mut name_registry = collect_names_in_stmts(stmts);
-    let mut renames = if has_display {
-        collect_display_name_renames_from_stmts(stmts, &mut name_registry)
-    } else {
-        Vec::new()
-    };
+    let mut renames = display_name_renames(display_candidates, &mut name_registry);
     if has_lc {
         renames.extend(collect_lowercase_component_renames_from_stmts(
             stmts,
@@ -1030,77 +1242,35 @@ fn collect_stmt_renames(
             import_pragmas,
         ));
     }
+    // The renamer only walks this list. A binding declared outside it (a
+    // parameter, or a `let` of the enclosing body when this list is a nested
+    // block) would keep its old name at the declaration and every other use.
+    let renamable = collect_renamable_binding_ids(stmts, list_is_function_scope);
+    renames.retain(|rename| renamable.contains(&rename.old));
     (renames, name_registry)
 }
 
-fn collect_display_name_renames_from_module_items(
-    items: &[ModuleItem],
+fn display_name_renames(
+    candidates: Vec<(Ident, Str)>,
     used_names: &mut HashSet<Atom>,
 ) -> Vec<BindingRename> {
     let mut renames = Vec::new();
-    for item in items {
-        let ModuleItem::Stmt(stmt) = item else {
+    let mut seen = HashSet::default();
+    for (object, display_name) in candidates {
+        let old: BindingId = (object.sym.clone(), object.ctxt);
+        if !seen.insert(old.clone()) {
             continue;
-        };
-        collect_display_name_renames_from_stmt(stmt, used_names, &mut renames);
+        }
+        let new_name = generate_unique_name(
+            used_names,
+            to_valid_identifier_name(&pascalize(&wtf8_to_string(&display_name.value))),
+        );
+        renames.push(BindingRename {
+            old,
+            new: new_name.into(),
+        });
     }
     renames
-}
-
-fn collect_display_name_renames_from_stmts(
-    stmts: &[Stmt],
-    used_names: &mut HashSet<Atom>,
-) -> Vec<BindingRename> {
-    let mut renames = Vec::new();
-    for stmt in stmts {
-        collect_display_name_renames_from_stmt(stmt, used_names, &mut renames);
-    }
-    renames
-}
-
-fn collect_display_name_renames_from_stmt(
-    stmt: &Stmt,
-    used_names: &mut HashSet<Atom>,
-    renames: &mut Vec<BindingRename>,
-) {
-    let Stmt::Expr(expr_stmt) = stmt else {
-        return;
-    };
-    let Expr::Assign(AssignExpr {
-        op: AssignOp::Assign,
-        left,
-        right,
-        ..
-    }) = expr_stmt.expr.as_ref()
-    else {
-        return;
-    };
-    let swc_core::ecma::ast::AssignTarget::Simple(simple) = left else {
-        return;
-    };
-    let swc_core::ecma::ast::SimpleAssignTarget::Member(member) = simple else {
-        return;
-    };
-    let Expr::Ident(object) = member.obj.as_ref() else {
-        return;
-    };
-    let MemberProp::Ident(prop) = &member.prop else {
-        return;
-    };
-    if prop.sym != *"displayName" || object.sym.len() > 2 {
-        return;
-    }
-    let Expr::Lit(Lit::Str(display_name)) = right.as_ref() else {
-        return;
-    };
-    let new_name = generate_unique_name(
-        used_names,
-        to_valid_identifier_name(&pascalize(&wtf8_to_string(&display_name.value))),
-    );
-    renames.push(BindingRename {
-        old: (object.sym.clone(), object.ctxt),
-        new: new_name.into(),
-    });
 }
 
 fn collect_lowercase_component_renames_from_module_items(
@@ -1398,24 +1568,63 @@ fn get_pragma(
 fn is_capitalization_invalid(expr: &Expr) -> bool {
     match expr {
         Expr::Lit(Lit::Str(s)) => !starts_with_lowercase(&wtf8_to_string(&s.value)),
+        Expr::Tpl(_) => no_substitution_template_str(expr)
+            .is_some_and(|s| !starts_with_lowercase(&wtf8_to_string(&s.value))),
         Expr::Ident(ident) => starts_with_lowercase(ident.sym.as_ref()),
         _ => false,
     }
 }
 
-fn jsx_name_from_string(value: &Str) -> Option<JSXElementName> {
+/// A template literal with no substitutions is a string tag spelled with
+/// backticks (`` createElement(`div`, …) ``): the tag is that one cooked
+/// segment. A template with substitutions, or one whose segment has no cooked
+/// value (an invalid escape), is not a string.
+fn no_substitution_template_str(expr: &Expr) -> Option<Str> {
+    let Expr::Tpl(tpl) = expr else {
+        return None;
+    };
+    if !tpl.exprs.is_empty() || tpl.quasis.len() != 1 {
+        return None;
+    }
+    let cooked = tpl.quasis[0].cooked.as_ref()?;
+    Some(Str {
+        span: tpl.span,
+        value: cooked.clone(),
+        raw: None,
+    })
+}
+
+/// The resolver gives a lowercase element name the unresolved mark (it is an
+/// intrinsic tag, not a binding); a name built from a string follows suit.
+fn jsx_name_from_string(value: &Str, unresolved_mark: Mark) -> Option<JSXElementName> {
     let value_string = wtf8_to_string(&value.value);
+    // String tags must remain intrinsic names after printing. In particular,
+    // a dot would turn the tag into a component member expression in JSX.
+    if !starts_with_lowercase(&value_string) {
+        return None;
+    }
     if let Some((ns, name)) = value_string.split_once(':') {
+        if !is_valid_jsx_identifier(ns) || !is_valid_jsx_identifier(name) {
+            return None;
+        }
         return Some(JSXElementName::JSXNamespacedName(JSXNamespacedName {
             span: DUMMY_SP,
             ns: ns.into(),
             name: name.into(),
         }));
     }
+    if !is_valid_jsx_identifier(&value_string) {
+        return None;
+    }
+    let ctxt = if value_string.starts_with(|c: char| c.is_ascii_lowercase()) {
+        SyntaxContext::empty().apply_mark(unresolved_mark)
+    } else {
+        SyntaxContext::empty()
+    };
     Some(JSXElementName::Ident(Ident::new(
         value_string.into(),
         DUMMY_SP,
-        SyntaxContext::empty(),
+        ctxt,
     )))
 }
 
@@ -1509,11 +1718,22 @@ fn can_string_be_attr_literal(value: &Str) -> bool {
         .as_ref()
         .map(|raw| raw.as_ref())
         .unwrap_or_default();
-    !raw.contains('\\') && !wtf8_to_string(&value.value).contains('"')
+    !raw.contains('\\')
+        && value
+            .value
+            .as_str()
+            .is_some_and(|value| !value.contains('"'))
 }
 
 fn string_child(value: &Str) -> Option<JSXElementChild> {
-    let text = wtf8_to_string(&value.value);
+    // A lone surrogate has no UTF-8 form, so it cannot become JSX text
+    // without changing the string; keep the literal in a container.
+    let Some(text) = value.value.as_str().map(ToOwned::to_owned) else {
+        return Some(JSXElementChild::JSXExprContainer(JSXExprContainer {
+            span: DUMMY_SP,
+            expr: JSXExpr::Expr(Box::new(Expr::Lit(Lit::Str(value.clone())))),
+        }));
+    };
     if text.is_empty() {
         return Some(JSXElementChild::JSXExprContainer(JSXExprContainer {
             span: DUMMY_SP,
@@ -1708,4 +1928,54 @@ fn wtf8_to_string(value: &Wtf8Atom) -> String {
         .as_str()
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| value.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use swc_core::common::{sync::Lrc, Globals, Mark, SourceMap, GLOBALS};
+    use swc_core::ecma::transforms::base::resolver;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct TagNames(Vec<Ident>);
+
+    impl Visit for TagNames {
+        fn visit_jsx_element_name(&mut self, name: &JSXElementName) {
+            if let JSXElementName::Ident(ident) = name {
+                self.0.push(ident.clone());
+            }
+        }
+    }
+
+    #[test]
+    fn intrinsic_tag_built_from_a_string_carries_the_unresolved_mark() {
+        GLOBALS.set(&Globals::new(), || {
+            let cm: Lrc<SourceMap> = Default::default();
+            let source = r#"
+import React from "react";
+const el = React.createElement("div", null, "hi");
+"#;
+            let mut module = crate::unpacker::parse_es_module(source, "fixture.js", cm)
+                .expect("fixture should parse");
+            let unresolved_mark = Mark::new();
+            module.visit_mut_with(&mut resolver(unresolved_mark, Mark::new(), false));
+
+            module.visit_mut_with(&mut UnJsx::new(unresolved_mark));
+
+            let mut tags = TagNames::default();
+            module.visit_with(&mut tags);
+            // Opening and closing tag both carry the name.
+            assert_eq!(
+                tags.0.len(),
+                2,
+                "expected one JSX element, got {:?}",
+                tags.0
+            );
+            for div in &tags.0 {
+                assert_eq!(div.sym.as_ref(), "div");
+                assert_eq!(div.ctxt.outer(), unresolved_mark);
+            }
+        });
+    }
 }

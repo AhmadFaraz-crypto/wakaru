@@ -814,3 +814,77 @@ console.log(o.Component);
     let output = render(input);
     insta::assert_snapshot!(output);
 }
+
+#[test]
+fn typescript_parenthesized_interop_test_restores_default_import() {
+    let input = include_str!("fixtures/tslib-interop/generated/default.js");
+    let focused = common::render_rule(input, |_| wakaru_core::rules::UnInteropRequireDefault);
+    assert!(!focused.contains("__importDefault(require("), "{focused}");
+    let output = render(input);
+    assert!(!output.contains("__importDefault"), "{output}");
+    assert!(output.contains("from \"./provider\""), "{output}");
+}
+
+#[test]
+fn helper_module_keeps_its_exported_declaration() {
+    // The Babel runtime's `interopRequireDefault` helper module itself: the
+    // helper function is the module's export, not an unwrapped call site.
+    let input = r#"
+function q(m) {
+    return m && m.__esModule ? m : {
+        default: m
+    };
+}
+module.exports = q, module.exports.__esModule = !0, module.exports.default = module.exports;
+"#;
+    let focused = common::render_rule(input, |_| wakaru_core::rules::UnInteropRequireDefault);
+    assert!(focused.contains("function q(m)"), "{focused}");
+    assert!(focused.contains("module.exports = q"), "{focused}");
+
+    let output = render(input);
+    assert!(output.contains("function q(m)"), "{output}");
+    assert!(output.contains("export default q;"), "{output}");
+}
+
+#[test]
+fn referenced_helper_declaration_survives_call_unwrapping() {
+    let input = r#"
+function _interopRequireDefault(obj) {
+    return obj && obj.__esModule ? obj : { default: obj };
+}
+var _a = _interopRequireDefault(require("a"));
+console.log(_a.default);
+exports.helper = _interopRequireDefault;
+"#;
+    let output = render(input);
+    assert!(
+        output.contains("function _interopRequireDefault(obj)"),
+        "{output}"
+    );
+    assert!(output.contains("import _a from \"a\";"), "{output}");
+    assert!(output.contains("console.log(_a);"), "{output}");
+    assert!(
+        output.contains("export { _interopRequireDefault as helper };"),
+        "{output}"
+    );
+}
+
+#[test]
+fn aliased_helper_declaration_is_not_removed() {
+    let input = r#"
+var _interopRequireDefault = require("@babel/runtime/helpers/interopRequireDefault");
+var _a = _interopRequireDefault(require("a"));
+var interop = _interopRequireDefault;
+console.log(_a.default, interop);
+"#;
+    let focused = common::render_rule(input, |_| wakaru_core::rules::UnInteropRequireDefault);
+    assert!(
+        focused.contains("require(\"@babel/runtime/helpers/interopRequireDefault\")"),
+        "{focused}"
+    );
+    assert!(
+        focused.contains("var interop = _interopRequireDefault;"),
+        "{focused}"
+    );
+    assert!(focused.contains("var _a = require(\"a\");"), "{focused}");
+}

@@ -36,19 +36,11 @@
     "runnable": 1396,
     "skipped": 0,
     "unsupported": 19,
-    "rejected": 8,
-    "passed": 1369,
+    "rejected": 4,
+    "passed": 1373,
     "failed": 0
   },
   "outcomes": [
-    {
-      "path": "test/language/expressions/arrow-function/dstr/ary-ptrn-elem-ary-elision-init.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "b315aea4e446b617ddfe6e4b5e6f7bd65f3fdbcb0eaa2ef90ee7ec9d6dc59439",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«0», «1») to be true"
-    },
     {
       "path": "test/language/expressions/arrow-function/dstr/ary-ptrn-elision-step-err.js",
       "variant": "case",
@@ -63,30 +55,6 @@
       "status": "rejected",
       "kind": "swc-array-binding-elision",
       "fingerprint": "c33ddfcef69aef93b1548f56a8ed48031b28211e9b80ad68db7f5adf1ee1349e",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "test/language/expressions/arrow-function/dstr/dflt-ary-ptrn-elem-ary-elision-init.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "e2cbc045af3d4df7a88fb4404fd6c75a467951d87ef8f2a4920279ac31d3835c",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "test/language/expressions/arrow-function/dstr/dflt-ary-ptrn-elision-step-err.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "0c9864ece2535f2f7e4c6732ecbc2d62f65c058be714788cbfe8ec5964eaf8bf",
-      "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected a Test262Error to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "test/language/expressions/arrow-function/dstr/dflt-ary-ptrn-elision.js",
-      "variant": "case",
-      "status": "rejected",
-      "kind": "swc-array-binding-elision",
-      "fingerprint": "1f04e055358dee9e401cd4c79eaf747fa520a21c340750357c0c92c491a3b663",
       "summary": "Error: sloppy: expected success, got runtime Test262Error: Expected SameValue(«0», «1») to be true"
     },
     {
