@@ -2123,7 +2123,7 @@ if (O && "documentMode" in document) {
 }
 const er = O && "TextEvent" in window && !Zn;
 const tr = O && (!Jn || Zn && Zn > 8 && Zn <= 11);
-const nr = String.fromCharCode(32);
+const nr = " ";
 const rr = {
     beforeInput: {
         phasedRegistrationNames: {
