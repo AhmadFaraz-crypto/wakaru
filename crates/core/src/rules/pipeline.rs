@@ -159,6 +159,10 @@ macro_rules! define_rule_registry {
     };
 }
 
+fn run_un_eval_packer(module: &mut Module, ctx: RuleRunContext<'_>) {
+    un_eval_packer::run(module, ctx.unresolved_mark);
+}
+
 runner!(run_un_computed_properties, |ctx| {
     UnComputedProperties::new(ctx.rewrite_level)
 });
@@ -548,6 +552,10 @@ fn run_dead_imports(module: &mut Module, ctx: RuleRunContext<'_>) {
 runner!(run_un_return, |ctx| UnReturn::new(ctx.unresolved_mark));
 
 define_rule_registry! {
+    // Runs first: decodes Dean Edwards `packer` output into real source before
+    // any other rule inspects the AST, since the packed form hides the entire
+    // program inside an `eval` string.
+    ("UnEvalPacker", Syntax, run_un_eval_packer, always_enabled),
     // Must precede SimplifySequence: Babel's loose computed-properties output
     // is a comma expression, and splitting it into statements destroys the
     // object-building shape this rule folds back into a literal.
