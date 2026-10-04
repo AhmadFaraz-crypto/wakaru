@@ -159,6 +159,10 @@ macro_rules! define_rule_registry {
     };
 }
 
+fn run_un_eval_atob(module: &mut Module, ctx: RuleRunContext<'_>) {
+    un_eval_atob::run(module, ctx.unresolved_mark);
+}
+
 runner!(run_un_computed_properties, |ctx| {
     UnComputedProperties::new(ctx.rewrite_level)
 });
@@ -548,6 +552,9 @@ fn run_dead_imports(module: &mut Module, ctx: RuleRunContext<'_>) {
 runner!(run_un_return, |ctx| UnReturn::new(ctx.unresolved_mark));
 
 define_rule_registry! {
+    // Runs first: decodes eval(atob("...")) base64 payloads into real source
+    // before any other rule inspects the AST.
+    ("UnEvalAtob", Syntax, run_un_eval_atob, always_enabled),
     // Must precede SimplifySequence: Babel's loose computed-properties output
     // is a comma expression, and splitting it into statements destroys the
     // object-building shape this rule folds back into a literal.

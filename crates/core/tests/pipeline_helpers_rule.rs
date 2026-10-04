@@ -299,11 +299,14 @@ fn rule_names_contains_key_rules() {
         names.contains(&"ArrowReturn2"),
         "missing ArrowReturn2 (second pass)"
     );
-    // UnComputedProperties runs first: it folds Babel's loose
+    // UnEvalAtob runs first: it decodes eval(atob("...")) payloads into real
+    // source before any other rule inspects the AST.
+    assert_eq!(names[0], "UnEvalAtob");
+    // UnComputedProperties runs next: it folds Babel's loose
     // computed-properties sequence back into an object literal, which
     // SimplifySequence would otherwise split into statements.
-    assert_eq!(names[0], "UnComputedProperties");
-    assert_eq!(names[1], "SimplifySequence");
+    assert_eq!(names[1], "UnComputedProperties");
+    assert_eq!(names[2], "SimplifySequence");
     // Last element should be the late full conditional cleanup.
     assert_eq!(names[names.len() - 1], "UnConditionals2");
 }
@@ -459,6 +462,7 @@ fn trace_can_include_unchanged_rules() {
     assert_eq!(
         events.iter().map(|event| event.rule).collect::<Vec<_>>(),
         vec![
+            "UnEvalAtob",
             "UnComputedProperties",
             "SimplifySequence",
             "FlipComparisons"
@@ -481,6 +485,7 @@ fn trace_includes_unchanged_remove_void_when_requested() {
     assert_eq!(
         events.iter().map(|event| event.rule).collect::<Vec<_>>(),
         vec![
+            "UnEvalAtob",
             "UnComputedProperties",
             "SimplifySequence",
             "FlipComparisons",
