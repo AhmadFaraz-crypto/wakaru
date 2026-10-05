@@ -442,6 +442,7 @@ fn run_un_prototype_class(module: &mut Module, ctx: RuleRunContext<'_>) {
     module.visit_mut_with(&mut UnPrototypeClass::with_pins(pin_exports));
 }
 runner!(run_exponent, |ctx| Exponent::new(ctx.unresolved_mark));
+runner!(run_un_self_ternary, UnSelfTernary);
 runner!(run_arg_rest, |ctx| ArgRest::new(ctx.rewrite_level));
 runner!(run_un_rest_array_copy, |ctx| UnRestArrayCopy::new(
     ctx.unresolved_mark
@@ -701,6 +702,7 @@ define_rule_registry! {
         "UnPrototypeClass"
     ]),
     ("Exponent", Modernization, run_exponent, always_enabled),
+    ("UnSelfTernary", Modernization, run_un_self_ternary, always_enabled),
     ("ArgRest", Modernization, run_arg_rest, always_enabled),
     ("UnRestArrayCopy", Modernization, run_un_rest_array_copy, always_enabled),
     ("ArrowFunction", Modernization, run_arrow_function, standard_or_above),
