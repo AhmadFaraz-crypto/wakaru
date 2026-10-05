@@ -191,6 +191,10 @@ runner!(run_un_typeof, UnTypeof);
 runner!(run_un_numeric_literal, UnNumericLiteral);
 runner!(run_un_string_escape, UnStringEscape);
 runner!(run_un_bracket_notation, UnBracketNotation);
+fn run_un_export_star(module: &mut Module, ctx: RuleRunContext<'_>) {
+    un_export_star::run(module, ctx.unresolved_mark);
+}
+
 fn run_un_interop_require_default(module: &mut Module, ctx: RuleRunContext<'_>) {
     let local_helpers = ctx.local_helpers(module);
     UnInteropRequireDefault::run_with_helpers(module, local_helpers.as_ref());
@@ -613,6 +617,9 @@ define_rule_registry! {
         "UnAssignmentMerging",
         "UnVariableMergingDeclsOnly",
         "UnWebpackInterop"
+    ]),
+    ("UnExportStar", Helpers, run_un_export_star, always_enabled, requires: [
+        "UnEsm"
     ]),
     ("UnObjectSpread2", Helpers, run_un_object_spread_late, always_enabled, requires: [
         "UnEsm"
