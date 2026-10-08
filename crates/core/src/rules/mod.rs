@@ -76,6 +76,7 @@ mod un_rest_array_copy;
 mod un_return;
 mod un_sliced_to_array;
 mod un_spread_array_literal;
+mod un_string_array;
 mod un_string_escape;
 mod un_template_literal;
 mod un_to_array;

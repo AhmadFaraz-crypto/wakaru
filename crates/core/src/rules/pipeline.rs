@@ -159,6 +159,10 @@ macro_rules! define_rule_registry {
     };
 }
 
+fn run_un_string_array(module: &mut Module, ctx: RuleRunContext<'_>) {
+    un_string_array::run(module, ctx.unresolved_mark);
+}
+
 runner!(run_un_computed_properties, |ctx| {
     UnComputedProperties::new(ctx.rewrite_level)
 });
@@ -548,6 +552,9 @@ fn run_dead_imports(module: &mut Module, ctx: RuleRunContext<'_>) {
 runner!(run_un_return, |ctx| UnReturn::new(ctx.unresolved_mark));
 
 define_rule_registry! {
+    // Inline a constant string-lookup array into its indexed reads, revealing
+    // the real strings before UnBracketNotation turns computed keys into dots.
+    ("UnStringArray", Syntax, run_un_string_array, always_enabled),
     // Must precede SimplifySequence: Babel's loose computed-properties output
     // is a comma expression, and splitting it into statements destroys the
     // object-building shape this rule folds back into a literal.
