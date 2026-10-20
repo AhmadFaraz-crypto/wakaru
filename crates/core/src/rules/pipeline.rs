@@ -189,6 +189,7 @@ runner!(run_un_indirect_call, |ctx| UnIndirectCall::new(
 ));
 runner!(run_un_typeof, UnTypeof);
 runner!(run_un_numeric_literal, UnNumericLiteral);
+runner!(run_fold_constant_expr, FoldConstantExpr);
 runner!(run_un_string_escape, UnStringEscape);
 runner!(run_un_bracket_notation, UnBracketNotation);
 fn run_un_interop_require_default(module: &mut Module, ctx: RuleRunContext<'_>) {
@@ -563,6 +564,7 @@ define_rule_registry! {
     ("UnInfinity", Syntax, run_un_infinity, always_enabled),
     ("UnIndirectCall", Syntax, run_un_indirect_call, always_enabled),
     ("UnTypeof", Syntax, run_un_typeof, always_enabled),
+    ("FoldConstantExpr", Syntax, run_fold_constant_expr, always_enabled),
     ("UnNumericLiteral", Syntax, run_un_numeric_literal, always_enabled),
     ("UnStringEscape", Syntax, run_un_string_escape, always_enabled),
     ("UnBracketNotation", Syntax, run_un_bracket_notation, always_enabled),
