@@ -285,6 +285,7 @@ fn run_un_typeof_polyfill(module: &mut Module, ctx: RuleRunContext<'_>) {
     UnTypeofPolyfill::run_with_helpers(module, local_helpers.as_ref());
 }
 runner!(run_un_curly_braces, UnCurlyBraces);
+runner!(run_un_else_after_return, UnElseAfterReturn);
 runner!(run_un_esmodule_flag, |ctx| UnEsmoduleFlag::new(
     ctx.unresolved_mark
 ));
@@ -754,6 +755,9 @@ define_rule_registry! {
     ("MergeDeclarationInit", Cleanup, run_merge_declaration_init, standard_or_above, requires: [
         "SmartInline"
     ]),
+    // Flatten `if (c) { return } else { ... }` into a straight-line fall-through
+    // once conditionals are otherwise normalized.
+    ("UnElseAfterReturn", Cleanup, run_un_else_after_return, always_enabled),
     ("SmartRename", Cleanup, run_smart_rename, standard_or_above, requires: [
         "SmartInline"
     ]),
